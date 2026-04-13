@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+*.whl
+
+# Virtualenv / uv
+.venv/
+venv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Ruff / mypy
+.ruff_cache/
+.mypy_cache/
+
+# Session Manager runtime data (project-local)
+.session-manager/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+*.md
