@@ -31,11 +31,17 @@ import sys
 import termios
 import tty
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import pexpect
 
-from session_manager.wrapper.handoff_formatter import format_handoff_injection
+from session_manager.storage import SessionStore
+from session_manager.wrapper.handoff_formatter import (
+    format_handoff_injection,
+    format_init_injection,
+    format_register_injection,
+)
 from session_manager.wrapper.socket_server import WrapperSocketServer
 
 # figures.pointer "❯" (UTF-8 E2 9D AF) followed by chalk.inverse "\x1b[7m"
@@ -80,9 +86,15 @@ class _PendingAction:
 
 
 class SessionManagerWrapper:
-    def __init__(self, socket_path: str, claude_args: list[str]) -> None:
+    def __init__(
+        self,
+        socket_path: str,
+        claude_args: list[str],
+        project_path: str | None = None,
+    ) -> None:
         self.socket_path = socket_path
         self.claude_args = list(claude_args)
+        self.project_path = project_path or os.getcwd()
 
         self.child: pexpect.spawn | None = None
         self.pty_fd: int = -1
@@ -114,6 +126,14 @@ class SessionManagerWrapper:
         self._initial_session_name: str | None = self._parse_initial_session_name(
             self.claude_args
         )
+
+        # One-shot bootstrap flags. Computed once at construction so the
+        # disk read isn't repeated on every prompt detection. Cleared after
+        # injection so subsequent prompts don't re-trigger them.
+        # 일회성 부트스트랩 플래그. 매 프롬프트 감지마다 디스크를 읽지
+        # 않도록 생성 시 한 번 결정하고, 주입 후 해제해 재트리거 방지.
+        self._pending_init: bool = self._compute_pending_init()
+        self._pending_register: bool = self._compute_pending_register()
 
     def start(self) -> None:
         """
@@ -291,12 +311,13 @@ class SessionManagerWrapper:
 
     def _handle_prompt_detected(self) -> None:
         pending = self._pending_action
-        if pending is None:
+        if pending is not None:
+            if pending.action_type == "switch":
+                self._advance_switch(pending)
+            elif pending.action_type == "new":
+                self._advance_new(pending)
             return
-        if pending.action_type == "switch":
-            self._advance_switch(pending)
-        elif pending.action_type == "new":
-            self._advance_new(pending)
+        self._maybe_inject_bootstrap()
 
     def _handle_user_line(self, line: bytes) -> None:
         return
@@ -451,6 +472,44 @@ class SessionManagerWrapper:
             if arg.startswith("--resume="):
                 return arg[len("--resume=") :]
         return None
+
+    def _compute_pending_init(self) -> bool:
+        return not Path(
+            self.project_path, ".session-manager", "project-context.md"
+        ).exists()
+
+    def _compute_pending_register(self) -> bool:
+        if self._initial_session_name is not None:
+            return False
+        store = SessionStore(self.project_path)
+        return not store.list_sessions()
+
+    def _maybe_inject_bootstrap(self) -> None:
+        """
+        Inject the init / session_register prompt(s) once on the first
+        prompt of a fresh project or unregistered session.
+
+        새 프로젝트 또는 미등록 세션의 첫 프롬프트에서 init / session_register
+        지시를 한 번 주입한다. 두 플래그가 모두 켜져 있으면 한 번에 합쳐
+        주입한다.
+        """
+        parts: list[str] = []
+        if self._pending_init:
+            parts.append(format_init_injection())
+            self._pending_init = False
+        if self._pending_register:
+            parts.append(format_register_injection())
+            self._pending_register = False
+        if not parts:
+            return
+        # Filter the raw injection out of the user's view. The LLM's
+        # subsequent tool-call response remains visible after we flip back.
+        # raw 주입 텍스트는 사용자에게 보이지 않게 가린다. 패스스루로 복귀한
+        # 뒤의 LLM 도구 호출 응답은 사용자에게 정상 표시된다.
+        self.mode = "filtering"
+        self._inject_text("\n".join(parts) + "\n")
+        self.mode = "passthrough"
+        self._drain_input_queue()
 
     def _advance_new(self, pending: _PendingAction) -> None:
         if pending.stage == "await_rename_or_exit_prompt":
