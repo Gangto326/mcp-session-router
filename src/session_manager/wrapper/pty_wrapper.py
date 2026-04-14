@@ -104,18 +104,46 @@ class SessionManagerWrapper:
 
         self._pending_action: _PendingAction | None = None
 
+        # Initial current_session_name handed back during the MCP handshake,
+        # decided from CLI args:
+        # - `--resume foo` → "foo"
+        # - `--continue`   → None (Claude Code resolves internally)
+        # - no args        → None (fresh session)
+        # MCP가 핸드셰이크에서 받아갈 초기 current_session_name. CLI 인자에서
+        # 결정한다.
+        self._initial_session_name: str | None = self._parse_initial_session_name(
+            self.claude_args
+        )
+
     def start(self) -> None:
         """
         Spawn Claude Code on a PTY and run the I/O loop until it exits.
 
         Claude Code를 PTY에 띄우고 종료될 때까지 I/O 루프를 실행한다.
+        NEW 액션으로 자식이 종료된 경우 새 자식을 spawn해 흐름을 이어간다.
         """
-        # Listen on the Unix socket before spawning the child so the MCP
-        # process can connect at any point after we hand off control.
-        # 자식 spawn 전에 Unix 소켓을 listen 상태로 만들어, 이후 어느 시점에
-        # MCP가 접속해도 받을 수 있도록 한다.
+        # The socket and terminal state live for the wrapper's whole
+        # lifetime — they outlast individual child processes when NEW
+        # respawns Claude Code.
+        # 소켓과 터미널 상태는 래퍼 전체 lifetime 동안 유지된다 — NEW로
+        # Claude Code가 재시작되더라도 동일하게 살아있다.
         self.socket_server.start()
+        self._enter_raw_mode()
+        self._install_winch_handler()
 
+        try:
+            self._spawn_child()
+            self._sync_winsize()
+            self._io_loop()
+            while self._should_respawn_for_new():
+                self._spawn_child()
+                self._sync_winsize()
+                self._io_loop()
+        finally:
+            self._restore_terminal()
+            self.socket_server.stop()
+
+    def _spawn_child(self) -> None:
         self.child = pexpect.spawn(
             "claude",
             self.claude_args,
@@ -123,16 +151,27 @@ class SessionManagerWrapper:
             echo=False,
         )
         self.pty_fd = self.child.fileno()
+        # Reset per-child detection state so the previous session's tail
+        # bytes can't trigger a false prompt on the new child.
+        # 자식별 감지 상태 초기화 — 이전 세션의 잔여 바이트가 새 자식의
+        # 첫 프롬프트 감지를 오염시키지 않도록.
+        self.output_buffer = b""
 
-        self._enter_raw_mode()
-        self._install_winch_handler()
-        self._sync_winsize()
+    def _should_respawn_for_new(self) -> bool:
+        """
+        Decide whether to spawn another child after the current one exits.
 
-        try:
-            self._io_loop()
-        finally:
-            self._restore_terminal()
-            self.socket_server.stop()
+        현재 자식 종료 후 새 자식을 spawn할지 결정한다. NEW 흐름이 자식
+        종료 단계에 도달한 경우에만 True를 반환하고, 동시에 stage를
+        핸드셰이크 대기로 전진시킨다.
+        """
+        pending = self._pending_action
+        if pending is None or pending.action_type != "new":
+            return False
+        if pending.stage != "await_child_exit":
+            return False
+        pending.stage = "await_handshake"
+        return True
 
     # ------------------------------------------------------------------ I/O loop
     # I/O 루프 ------------------------------------------------------------------
@@ -265,6 +304,10 @@ class SessionManagerWrapper:
     def _handle_mcp_signal(self, message: dict) -> None:
         if not isinstance(message, dict):
             return
+        msg_type = message.get("type")
+        if msg_type == "handshake_request":
+            self._handle_handshake_request()
+            return
         action = message.get("action")
         if action == "switch":
             target = message.get("target")
@@ -376,6 +419,39 @@ class SessionManagerWrapper:
             new_session_name=new_session_name,
         )
 
+    def _handle_handshake_request(self) -> None:
+        """
+        Reply to MCP's handshake. NEW respawns return new_session_name;
+        all other startups return whatever was decided from CLI args.
+
+        MCP의 핸드셰이크 요청에 응답한다. NEW로 인한 재시작 흐름이라면
+        새 세션 이름을 돌려주고, 그 외 일반 시작에서는 CLI 인자에서
+        결정된 값(또는 None)을 돌려준다.
+        """
+        pending = self._pending_action
+        if (
+            pending is not None
+            and pending.action_type == "new"
+            and pending.stage == "await_handshake"
+        ):
+            self.socket_server.send(
+                {"current_session_name": pending.new_session_name}
+            )
+            pending.stage = "await_new_session_prompt"
+            return
+        self.socket_server.send(
+            {"current_session_name": self._initial_session_name}
+        )
+
+    @staticmethod
+    def _parse_initial_session_name(args: list[str]) -> str | None:
+        for i, arg in enumerate(args):
+            if arg == "--resume" and i + 1 < len(args):
+                return args[i + 1]
+            if arg.startswith("--resume="):
+                return arg[len("--resume=") :]
+        return None
+
     def _advance_new(self, pending: _PendingAction) -> None:
         if pending.stage == "await_rename_or_exit_prompt":
             # First prompt after the LLM finished its turn. Start filtering
@@ -398,8 +474,21 @@ class SessionManagerWrapper:
             # /rename 처리 완료, 이제 현재 세션 종료.
             self._inject_text("/exit\n")
             pending.stage = "await_child_exit"
-        # await_child_exit 이후의 자식 재spawn·핸드셰이크·handoff 주입은
-        # 다음 단위에서 도입한다. 이 시점에는 자식 종료를 기다리기만 한다.
+        elif pending.stage == "await_new_session_prompt":
+            # New child has spawned, MCP handshake completed, and the first
+            # prompt of the fresh session is up. Inject the handoff plus the
+            # user's prompt, then return the user terminal to passthrough.
+            # 새 자식이 spawn되고 MCP 핸드셰이크가 끝난 뒤 새 세션의 첫
+            # 프롬프트가 떴다. handoff와 사용자 프롬프트를 주입한 후 사용자
+            # 터미널을 패스스루로 복귀.
+            text = format_handoff_injection(pending.handoff, pending.user_prompt)
+            self._inject_text(text + "\n")
+            self.mode = "passthrough"
+            self._drain_input_queue()
+            self._pending_action = None
+        # `await_child_exit`와 `await_handshake` 단계에서는 프롬프트 감지로
+        # 진행하지 않는다 — 자식 종료(outer loop)와 소켓 핸드셰이크(별도
+        # 메시지 경로)가 각각 stage를 전진시킨다.
 
     # ------------------------------------------------------ Buffer management
     # 버퍼 관리 -----------------------------------------------------------------
