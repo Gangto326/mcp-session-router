@@ -74,6 +74,9 @@ class _PendingAction:
     handoff: dict[str, Any]
     user_prompt: str
     stage: str
+    # NEW 전용. SWITCH일 때는 기본값 그대로.
+    rename_current: str | None = None
+    new_session_name: str = ""
 
 
 class SessionManagerWrapper:
@@ -253,6 +256,8 @@ class SessionManagerWrapper:
             return
         if pending.action_type == "switch":
             self._advance_switch(pending)
+        elif pending.action_type == "new":
+            self._advance_new(pending)
 
     def _handle_user_line(self, line: bytes) -> None:
         return
@@ -269,6 +274,17 @@ class SessionManagerWrapper:
             user_prompt_val = handoff.get("user_prompt", "")
             user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
             self._handle_switch(target, handoff, user_prompt)
+        elif action == "new":
+            rename_current = message.get("rename_current")
+            new_session_name = message.get("new_session_name")
+            handoff = message.get("handoff") or {}
+            if not isinstance(new_session_name, str) or not isinstance(handoff, dict):
+                return
+            if rename_current is not None and not isinstance(rename_current, str):
+                return
+            user_prompt_val = handoff.get("user_prompt", "")
+            user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
+            self._handle_new(rename_current, new_session_name, handoff, user_prompt)
 
     # ----------------------------------------------------------- Action handlers
     # 세션 액션 처리 ------------------------------------------------------------
@@ -331,6 +347,59 @@ class SessionManagerWrapper:
         cleaned = self.input_queue.replace(b"\n", b" ")
         os.write(self.pty_fd, cleaned)
         self.input_queue = b""
+
+    def _handle_new(
+        self,
+        rename_current: str | None,
+        new_session_name: str,
+        handoff: dict[str, Any],
+        user_prompt: str,
+    ) -> None:
+        """
+        Register a NEW action; advanced on subsequent prompt detections.
+
+        NEW 액션을 등록한다. 실제 진행은 이후 프롬프트 감지 이벤트마다
+        단계적으로 일어난다.
+        """
+        # Same JSON-vs-text de-duplication as SWITCH: keep user_prompt out
+        # of the JSON body since it appears as plain text below.
+        # SWITCH와 동일하게 JSON 본문에서는 user_prompt 제거 — 아래쪽
+        # 평문 본문과 중복으로 노출되지 않도록.
+        handoff_clean = {k: v for k, v in handoff.items() if k != "user_prompt"}
+        self._pending_action = _PendingAction(
+            action_type="new",
+            target="",
+            handoff=handoff_clean,
+            user_prompt=user_prompt,
+            stage="await_rename_or_exit_prompt",
+            rename_current=rename_current,
+            new_session_name=new_session_name,
+        )
+
+    def _advance_new(self, pending: _PendingAction) -> None:
+        if pending.stage == "await_rename_or_exit_prompt":
+            # First prompt after the LLM finished its turn. Start filtering
+            # so neither /rename nor /exit is visible to the user. If the
+            # current session has a name, rename it first (so it persists
+            # under that name in `claude --resume` history); otherwise jump
+            # straight to /exit.
+            # LLM 응답이 끝난 직후의 첫 프롬프트. 필터링을 켜서 /rename·/exit이
+            # 사용자에게 보이지 않게 한다. 현재 세션에 이름이 있으면 먼저
+            # /rename 으로 보존하고, 이름이 없으면 바로 /exit.
+            self.mode = "filtering"
+            if pending.rename_current is not None:
+                self._inject_text(f"/rename {pending.rename_current}\n")
+                pending.stage = "await_exit_prompt"
+            else:
+                self._inject_text("/exit\n")
+                pending.stage = "await_child_exit"
+        elif pending.stage == "await_exit_prompt":
+            # /rename has been processed; now exit the current session.
+            # /rename 처리 완료, 이제 현재 세션 종료.
+            self._inject_text("/exit\n")
+            pending.stage = "await_child_exit"
+        # await_child_exit 이후의 자식 재spawn·핸드셰이크·handoff 주입은
+        # 다음 단위에서 도입한다. 이 시점에는 자식 종료를 기다리기만 한다.
 
     # ------------------------------------------------------ Buffer management
     # 버퍼 관리 -----------------------------------------------------------------
