@@ -30,10 +30,12 @@ import signal
 import sys
 import termios
 import tty
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import pexpect
 
+from session_manager.wrapper.handoff_formatter import format_handoff_injection
 from session_manager.wrapper.socket_server import WrapperSocketServer
 
 # figures.pointer "❯" (UTF-8 E2 9D AF) followed by chalk.inverse "\x1b[7m"
@@ -58,6 +60,22 @@ OUTPUT_BUFFER_TAIL_KEEP = 256
 Mode = Literal["passthrough", "filtering"]
 
 
+@dataclass
+class _PendingAction:
+    """
+    Tracks an in-progress SWITCH or NEW action across multiple prompt events.
+
+    여러 번의 프롬프트 감지 이벤트에 걸쳐 진행되는 SWITCH/NEW 액션 상태를
+    보관한다. stage 값은 다음 프롬프트에서 어떤 단계로 진입할지 결정한다.
+    """
+
+    action_type: Literal["switch", "new"]
+    target: str
+    handoff: dict[str, Any]
+    user_prompt: str
+    stage: str
+
+
 class SessionManagerWrapper:
     def __init__(self, socket_path: str, claude_args: list[str]) -> None:
         self.socket_path = socket_path
@@ -80,6 +98,8 @@ class SessionManagerWrapper:
             socket_path=socket_path,
             on_message=self._handle_mcp_signal,
         )
+
+        self._pending_action: _PendingAction | None = None
 
     def start(self) -> None:
         """
@@ -167,8 +187,14 @@ class SessionManagerWrapper:
 
         self.output_buffer += chunk
         if self._detect_prompt(self.output_buffer):
+            # Clear after a successful detection so the same prompt isn't
+            # matched again as more output trickles in.
+            # 감지 직후 버퍼를 비워, 같은 프롬프트가 후속 chunk에서 다시
+            # 매칭되는 것을 막는다.
+            self.output_buffer = b""
             self._handle_prompt_detected()
-        self._truncate_output_buffer()
+        else:
+            self._truncate_output_buffer()
 
         if self.mode == "passthrough":
             os.write(self._stdout_fd, chunk)
@@ -222,13 +248,89 @@ class SessionManagerWrapper:
     # 확장 지점 -------------------------------------------------------------------
 
     def _handle_prompt_detected(self) -> None:
-        return
+        pending = self._pending_action
+        if pending is None:
+            return
+        if pending.action_type == "switch":
+            self._advance_switch(pending)
 
     def _handle_user_line(self, line: bytes) -> None:
         return
 
     def _handle_mcp_signal(self, message: dict) -> None:
-        return
+        if not isinstance(message, dict):
+            return
+        action = message.get("action")
+        if action == "switch":
+            target = message.get("target")
+            handoff = message.get("handoff") or {}
+            if not isinstance(target, str) or not isinstance(handoff, dict):
+                return
+            user_prompt_val = handoff.get("user_prompt", "")
+            user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
+            self._handle_switch(target, handoff, user_prompt)
+
+    # ----------------------------------------------------------- Action handlers
+    # 세션 액션 처리 ------------------------------------------------------------
+
+    def _handle_switch(
+        self,
+        target: str,
+        handoff: dict[str, Any],
+        user_prompt: str,
+    ) -> None:
+        """
+        Register a SWITCH action; advanced on subsequent prompt detections.
+
+        SWITCH 액션을 등록한다. 실제 진행은 이후 프롬프트 감지 이벤트마다
+        단계적으로 일어난다.
+        """
+        # Strip user_prompt from the JSON body so it isn't shown twice
+        # (once inside [handoff], once as the prompt text below).
+        # JSON 본문에서 user_prompt를 제거 — [handoff] 블록과 그 아래 본문에
+        # 같은 텍스트가 두 번 노출되지 않도록 한다.
+        handoff_clean = {k: v for k, v in handoff.items() if k != "user_prompt"}
+        self._pending_action = _PendingAction(
+            action_type="switch",
+            target=target,
+            handoff=handoff_clean,
+            user_prompt=user_prompt,
+            stage="await_resume_prompt",
+        )
+
+    def _advance_switch(self, pending: _PendingAction) -> None:
+        if pending.stage == "await_resume_prompt":
+            # First prompt after the LLM finished its turn — start filtering
+            # so the user doesn't see the raw `/resume` injection, then
+            # inject it.
+            # LLM 응답이 끝난 직후의 첫 프롬프트 — 필터링을 켜서 raw `/resume`
+            # 주입이 사용자에게 보이지 않게 한 뒤 주입.
+            self.mode = "filtering"
+            self._inject_text(f"/resume {pending.target}\n")
+            pending.stage = "await_handoff_prompt"
+        elif pending.stage == "await_handoff_prompt":
+            # Second prompt — the resumed session is ready for input. Inject
+            # the handoff block plus the user's prompt, then return to
+            # passthrough so the user sees the new session's response.
+            # 두 번째 프롬프트 — 복귀 세션이 입력 받을 준비 완료. handoff
+            # 블록과 사용자 프롬프트를 주입하고 패스스루로 복귀해 새 세션의
+            # 응답이 사용자에게 보이게 한다.
+            text = format_handoff_injection(pending.handoff, pending.user_prompt)
+            self._inject_text(text + "\n")
+            self.mode = "passthrough"
+            self._drain_input_queue()
+            self._pending_action = None
+
+    def _drain_input_queue(self) -> None:
+        if not self.input_queue:
+            return
+        # Replace newlines with spaces so a buffered Enter doesn't auto-submit
+        # text the user typed during filtering; let them press Enter explicitly.
+        # 필터링 중 사용자가 친 입력의 개행을 공백으로 치환 — 쌓인 Enter가
+        # 자동으로 submit되지 않도록 하고, 사용자가 다시 눌러 보내게 한다.
+        cleaned = self.input_queue.replace(b"\n", b" ")
+        os.write(self.pty_fd, cleaned)
+        self.input_queue = b""
 
     # ------------------------------------------------------ Buffer management
     # 버퍼 관리 -----------------------------------------------------------------
