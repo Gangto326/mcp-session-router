@@ -34,6 +34,8 @@ from typing import Any, Literal
 
 import pexpect
 
+from session_manager.wrapper.socket_server import WrapperSocketServer
+
 # figures.pointer "❯" (UTF-8 E2 9D AF) followed by chalk.inverse "\x1b[7m"
 # is what ink-text-input renders for the prompt cursor. Verified against
 # the Claude Code binary (strings shows both \u276F and inverse: [7, 27]).
@@ -74,12 +76,23 @@ class SessionManagerWrapper:
         self._original_stdin_attrs: list[Any] | None = None
         self._previous_winch_handler: Any = None
 
+        self.socket_server = WrapperSocketServer(
+            socket_path=socket_path,
+            on_message=self._handle_mcp_signal,
+        )
+
     def start(self) -> None:
         """
         Spawn Claude Code on a PTY and run the I/O loop until it exits.
 
         Claude Code를 PTY에 띄우고 종료될 때까지 I/O 루프를 실행한다.
         """
+        # Listen on the Unix socket before spawning the child so the MCP
+        # process can connect at any point after we hand off control.
+        # 자식 spawn 전에 Unix 소켓을 listen 상태로 만들어, 이후 어느 시점에
+        # MCP가 접속해도 받을 수 있도록 한다.
+        self.socket_server.start()
+
         self.child = pexpect.spawn(
             "claude",
             self.claude_args,
@@ -96,6 +109,7 @@ class SessionManagerWrapper:
             self._io_loop()
         finally:
             self._restore_terminal()
+            self.socket_server.stop()
 
     # ------------------------------------------------------------------ I/O loop
     # I/O 루프 ------------------------------------------------------------------
@@ -103,12 +117,22 @@ class SessionManagerWrapper:
     def _io_loop(self) -> None:
         assert self.child is not None
         while self.child.isalive():
+            # Build the watch list each tick: socket fds appear/disappear
+            # as MCP connects and disconnects.
+            # 매 틱마다 watch 대상을 새로 구성. 소켓 fd는 MCP의 연결·해제에
+            # 따라 등장하거나 사라진다.
+            watch_fds: list[int] = [self.pty_fd, self._stdin_fd]
+            listen_fd = self.socket_server.listen_fileno
+            client_fd = self.socket_server.client_fileno
+            if listen_fd >= 0:
+                watch_fds.append(listen_fd)
+            if client_fd >= 0:
+                watch_fds.append(client_fd)
+
             try:
                 # 100 ms timeout polls child liveness without burning CPU.
                 # 100ms 타임아웃으로 자식 생존 여부를 폴링 (CPU 낭비 방지).
-                readable, _, _ = select.select(
-                    [self.pty_fd, self._stdin_fd], [], [], 0.1
-                )
+                readable, _, _ = select.select(watch_fds, [], [], 0.1)
             except InterruptedError:
                 # A signal (e.g. SIGWINCH) interrupted select; just retry.
                 # 시그널(예: SIGWINCH)로 select가 중단된 경우 단순 재시도.
@@ -122,6 +146,12 @@ class SessionManagerWrapper:
 
             if self._stdin_fd in readable:
                 self._handle_stdin_readable()
+
+            if listen_fd >= 0 and listen_fd in readable:
+                self.socket_server.handle_listen_readable()
+
+            if client_fd >= 0 and client_fd in readable:
+                self.socket_server.handle_client_readable()
 
         self._drain_pty()
 
