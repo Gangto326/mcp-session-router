@@ -66,6 +66,13 @@ OUTPUT_BUFFER_TAIL_KEEP = 256
 Mode = Literal["passthrough", "filtering"]
 
 
+def _safe_fileno(stream: Any) -> int:
+    try:
+        return stream.fileno()
+    except (OSError, AttributeError, ValueError):
+        return -1
+
+
 @dataclass
 class _PendingAction:
     """
@@ -104,8 +111,10 @@ class SessionManagerWrapper:
         self.input_queue: bytes = b""
         self.stdin_line_buffer: bytes = b""
 
-        self._stdin_fd: int = sys.stdin.fileno()
-        self._stdout_fd: int = sys.stdout.fileno()
+        # 테스트 환경이나 stdin/stdout 이 redirect 된 경우 fileno() 가 실패할 수
+        # 있으므로 안전하게 -1 로 폴백. 실런타임에서는 isatty/-1 검사로 가드.
+        self._stdin_fd: int = _safe_fileno(sys.stdin)
+        self._stdout_fd: int = _safe_fileno(sys.stdout)
         self._original_stdin_attrs: list[Any] | None = None
         self._previous_winch_handler: Any = None
 
