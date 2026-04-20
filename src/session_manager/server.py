@@ -357,6 +357,51 @@ def update_static(
     return {"updated_at": static.updated_at}
 
 
+@mcp_server.tool()
+def init_project(content: str, ctx: Context) -> dict:
+    """
+    Create project-context.md if it does not exist yet.
+
+    project-context.md가 아직 없을 때 새로 생성한다. 프로젝트 구조와
+    의존성을 설명하는 문서로, 세션 전환 시 새 LLM이 맥락을 파악하는 데 쓰인다.
+    이미 존재하면 덮어쓰지 않고 기존 내용을 그대로 반환한다.
+    """
+    app = _get_app_ctx(ctx)
+    if app.project_context_store.exists():
+        return {
+            "created": False,
+            "content": app.project_context_store.read(),
+        }
+    app.project_context_store.write(content)
+    return {"created": True}
+
+
+@mcp_server.tool()
+def reinit_project(content: str, ctx: Context) -> dict:
+    """
+    Overwrite project-context.md with fresh content.
+
+    project-context.md를 처음부터 다시 작성한다. 사용자가 명시적으로
+    프로젝트 맥락 문서를 새로 쓰고 싶을 때 호출한다.
+    """
+    app = _get_app_ctx(ctx)
+    app.project_context_store.write(content)
+    return {"reinitialized": True}
+
+
+@mcp_server.tool()
+def update_project_context(content: str, ctx: Context) -> dict:
+    """
+    Replace project-context.md with updated content.
+
+    project-context.md를 새 내용으로 교체한다. 프로젝트 구조나 의존성이
+    변경되었을 때 호출하여 문서를 최신 상태로 유지한다.
+    """
+    app = _get_app_ctx(ctx)
+    app.project_context_store.write(content)
+    return {"updated": True}
+
+
 def main() -> None:
     """
     Entry point invoked by Claude Code when spawning this MCP server.
