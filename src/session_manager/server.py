@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from session_manager.state import SessionManagerState
 from session_manager.storage import FieldStore, ProjectContextStore, SessionStore
@@ -115,8 +115,40 @@ mcp_server = FastMCP(
     lifespan=app_lifespan,
 )
 
-# Tool handlers will be registered in subsequent commits (3-2 ~ 3-8).
-# 도구 핸들러는 후속 커밋(3-2 ~ 3-8)에서 등록된다.
+def _get_app_ctx(ctx: Context) -> AppContext:
+    """Extract AppContext from the MCP request context.
+
+    MCP 요청 컨텍스트에서 AppContext를 꺼낸다.
+    """
+    return ctx.request_context.lifespan_context  # type: ignore[return-value]
+
+
+# ------------------------------------------------------------------ tools
+# 도구 등록 -------------------------------------------------------------------
+
+
+@mcp_server.tool()
+def check_session(ctx: Context) -> dict:
+    """Return the current session and a list of all registered sessions.
+
+    현재 세션 이름과 등록된 전체 세션 목록을 반환한다.
+    서브 에이전트가 사용자의 메시지를 어느 세션으로 보낼지 판단할 때 사용한다.
+    """
+    app = _get_app_ctx(ctx)
+    sessions = app.session_store.list_sessions()
+    return {
+        "current": app.state.get_current_session(),
+        "sessions": [
+            {
+                "name": s.name,
+                "title": s.title,
+                "summary": s.summary,
+                "last_accessed": s.last_accessed,
+                "status": s.status.value,
+            }
+            for s in sessions
+        ],
+    }
 
 
 def main() -> None:
