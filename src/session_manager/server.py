@@ -231,6 +231,58 @@ def session_switch(
     return {"switched_to": target}
 
 
+@mcp_server.tool()
+def session_create(
+    new_session_name: str,
+    title: str,
+    handoff_summary: str,
+    user_prompt: str,
+    ctx: Context,
+) -> dict:
+    """
+    Create a brand-new session and restart Claude Code into it.
+
+    새 세션을 만들어 Claude Code를 재시작시킨다. 서브 에이전트가 사용자의
+    메시지가 기존 세션 어디에도 해당하지 않는다고 판단했을 때 호출한다.
+    현재 세션을 마무리하고 래퍼에 NEW 신호를 보낸다.
+    """
+    app = _get_app_ctx(ctx)
+    current_name = app.state.get_current_session()
+
+    # Update the outgoing session's metadata (if registered).
+    # 나가는 세션의 메타데이터를 갱신한다 (등록된 경우에만).
+    rename_current: str | None = None
+    if current_name is not None:
+        current = app.session_store.load_session_by_name(current_name)
+        if current is not None:
+            current.summary = handoff_summary
+            current.touch()
+            app.session_store.save_session(current)
+            rename_current = current_name
+
+    # Send NEW signal to the wrapper.
+    # 래퍼에 NEW 신호를 전송한다.
+    handoff = {
+        "from": current_name,
+        "message": handoff_summary,
+        "instructions": _HANDOFF_INSTRUCTIONS,
+        "new_session_title": title,
+    }
+    app.socket_client.send_signal({
+        "action": "new",
+        "rename_current": rename_current,
+        "new_session_name": new_session_name,
+        "handoff": handoff,
+        "user_prompt": user_prompt,
+    })
+
+    app.state.set_current_session(new_session_name)
+    return {
+        "created": new_session_name,
+        "rename_current": rename_current,
+    }
+
+
 def main() -> None:
     """
     Entry point invoked by Claude Code when spawning this MCP server.
