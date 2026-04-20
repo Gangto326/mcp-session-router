@@ -28,7 +28,11 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from session_manager.models.session import SessionMetadata, TransitionRecord
+from session_manager.models.session import (
+    SessionMetadata,
+    SessionStatus,
+    TransitionRecord,
+)
 from session_manager.state import SessionManagerState
 from session_manager.storage import FieldStore, ProjectContextStore, SessionStore
 from session_manager.wrapper.socket_client import WrapperSocketClient
@@ -281,6 +285,44 @@ def session_create(
         "created": new_session_name,
         "rename_current": rename_current,
     }
+
+
+# NOTE: No natural trigger exists in the current usage flow.  The
+# original plan was to intercept /exit via stdin and call this tool
+# before the session actually ends, but stdin interception is suspended
+# due to low matching reliability.  /clear does NOT trigger this either
+# — it only resets LLM context while the session ID and MCP server
+# stay alive, so summaries may go stale after /clear.  Kept for future
+# use when an alternative trigger (e.g. UserPromptSubmit hook) is
+# confirmed.
+#
+# NOTE: 현재 사용 플로우에서 자연스러운 호출 시점이 없다.  원래는
+# stdin에서 /exit을 가로채 이 도구를 먼저 호출할 계획이었으나, 매칭
+# 신뢰도 부족으로 가로채기 자체가 보류됨.  /clear 시에도 호출되지
+# 않음 — /clear는 LLM 컨텍스트만 리셋하고 세션 ID와 MCP 서버는
+# 유지되므로, /clear 후 summary가 오염됨.  대체 트리거
+# (예: UserPromptSubmit hook) 확정 시 활용 예정.
+@mcp_server.tool()
+def session_end(summary: str, ctx: Context) -> dict:
+    """
+    Archive the current session with a final summary.
+
+    현재 세션을 종료한다. 최종 요약을 저장하고 상태를 ARCHIVED로 변경하여,
+    이후 세션 매칭 대상에서 제외되도록 한다.
+    """
+    app = _get_app_ctx(ctx)
+    current_name = app.state.get_current_session()
+
+    if current_name is not None:
+        current = app.session_store.load_session_by_name(current_name)
+        if current is not None:
+            current.summary = summary
+            current.status = SessionStatus.ARCHIVED
+            current.touch()
+            app.session_store.save_session(current)
+
+    app.state.set_current_session(None)
+    return {"ended": current_name}
 
 
 def main() -> None:
