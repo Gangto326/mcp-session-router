@@ -28,6 +28,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from session_manager.models.session import SessionMetadata
 from session_manager.state import SessionManagerState
 from session_manager.storage import FieldStore, ProjectContextStore, SessionStore
 from session_manager.wrapper.socket_client import WrapperSocketClient
@@ -148,6 +149,23 @@ def check_session(ctx: Context) -> dict:
             }
             for s in sessions
         ],
+    }
+
+
+@mcp_server.tool()
+def session_register(name: str, title: str, ctx: Context, summary: str | None = None) -> dict:
+    """Register a new session with the given name and title.
+
+    새 세션을 등록한다. 첫 대화 시작(부트스트랩)이나 새 세션 생성 직후에
+    호출되어, 세션에 이름·제목을 부여하고 현재 세션으로 설정한다.
+    """
+    app = _get_app_ctx(ctx)
+    session = SessionMetadata.new(name=name, title=title, summary=summary)
+    app.session_store.save_session(session)
+    app.state.set_current_session(name)
+    return {
+        "registered": name,
+        "session_id": session.session_id,
     }
 
 
