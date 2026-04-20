@@ -325,6 +325,38 @@ def session_end(summary: str, ctx: Context) -> dict:
     return {"ended": current_name}
 
 
+@mcp_server.tool()
+def update_static(
+    ctx: Context,
+    project_context: str | None = None,
+    conventions: str | None = None,
+    project_map: dict[str, str] | None = None,
+    variables: dict | None = None,
+) -> dict:
+    """
+    Partially update the project-wide shared static field.
+
+    프로젝트 전역 공유 정보(환경, 컨벤션, 변수 등)를 부분 갱신한다.
+    제공된 필드만 덮어쓰고 나머지는 기존 값을 유지한다. 어떤 세션에서든
+    갱신하면 다른 세션에서 최신 값을 읽을 수 있다.
+    """
+    app = _get_app_ctx(ctx)
+    static = app.field_store.load_static()
+
+    if project_context is not None:
+        static.project_context = project_context
+    if conventions is not None:
+        static.conventions = conventions
+    if project_map is not None:
+        static.project_map = project_map
+    if variables is not None:
+        static.variables = variables
+
+    static.touch()
+    app.field_store.save_static(static)
+    return {"updated_at": static.updated_at}
+
+
 def main() -> None:
     """
     Entry point invoked by Claude Code when spawning this MCP server.
