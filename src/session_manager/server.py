@@ -125,8 +125,43 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         client.close()
 
 
+_SERVER_INSTRUCTIONS = """\
+You manage multiple conversation sessions within a single Claude Code process.
+
+## Context Switch Detection
+When the user's message concerns a different topic/code area from the current \
+session, spawn a sub-agent with this prompt:
+  "User prompt: '{prompt}'. Current session: {name}. \
+Call check_session to get the session list. Compare each summary against \
+the prompt. Respond as ACTION:SESSION_NAME:REASON. \
+ACTION = STAY | SWITCH | NEW | ASK_USER."
+Then:
+- STAY: process normally.
+- SWITCH: confirm with user, then switch.
+- NEW: confirm with user, then create a new session.
+- ASK_USER: present candidates and let user choose.
+If context clearly matches the current session, skip the sub-agent.
+
+## Handoff Block
+When input contains [handoff]...[/handoff]:
+1. Parse the JSON inside. Follow the instructions list (read the listed files).
+2. Read the message field for previous session context.
+3. Text after [/handoff] is the user's actual prompt.
+
+## Auto-Init
+When input contains [자동 초기화], the wrapper detected that bootstrapping \
+is needed. Follow each instruction in the message before handling the user's \
+request.
+
+## Summary Format
+When switching or ending a session, write a 2-3 sentence summary: \
+where (files/areas touched), what (work performed), status \
+(done / in-progress / remaining). Update the title if it has evolved.\
+"""
+
 mcp_server = FastMCP(
     "session-manager",
+    instructions=_SERVER_INSTRUCTIONS,
     lifespan=app_lifespan,
 )
 
