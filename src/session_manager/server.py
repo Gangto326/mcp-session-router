@@ -28,6 +28,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from session_manager.lifecycle import cleanup_expired_sessions, get_cleanup_period_days
 from session_manager.models.session import (
     SessionMetadata,
     SessionStatus,
@@ -101,6 +102,13 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         logger.warning(
             "SESSION_MANAGER_SOCKET not set — running without wrapper connection"
         )
+
+    # Clean up expired sessions at startup.
+    # 서버 시작 시 만료된 세션을 정리한다.
+    period = get_cleanup_period_days()
+    deleted = cleanup_expired_sessions(session_store, period)
+    if deleted:
+        logger.info("Startup cleanup: removed %d expired session(s)", len(deleted))
 
     ctx = AppContext(
         state=state,
@@ -251,6 +259,14 @@ def session_create(
     현재 세션을 마무리하고 래퍼에 NEW 신호를 보낸다.
     """
     app = _get_app_ctx(ctx)
+
+    # Clean up expired sessions when creating a new one.
+    # 새 세션 생성 시 만료된 세션을 정리한다.
+    period = get_cleanup_period_days()
+    deleted = cleanup_expired_sessions(app.session_store, period)
+    if deleted:
+        logger.info("Pre-create cleanup: removed %d expired session(s)", len(deleted))
+
     current_name = app.state.get_current_session()
 
     # Update the outgoing session's metadata (if registered).
