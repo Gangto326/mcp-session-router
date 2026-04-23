@@ -7,13 +7,10 @@ PTY 래퍼의 내부 로직 단위 테스트. PTY 의존 메서드는 monkeypatc
 
 from __future__ import annotations
 
-import datetime
 from pathlib import Path
 
 import pytest
 
-from session_manager.models import SessionMetadata, SessionStatus
-from session_manager.storage import SessionStore
 from session_manager.wrapper.pty_wrapper import (
     INVERSE_VIDEO_START,
     OUTPUT_BUFFER_CAP,
@@ -147,58 +144,6 @@ class TestParseInitialSessionName:
         )
 
 
-class TestComputePending:
-    def test_pending_init_true_when_file_missing(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        assert wrapper._compute_pending_init() is True
-
-    def test_pending_init_false_when_file_exists(
-        self, wrapper: SessionManagerWrapper, tmp_path: Path
-    ) -> None:
-        sm_dir = tmp_path / ".session-manager"
-        sm_dir.mkdir()
-        (sm_dir / "project-context.md").write_text("# project")
-        assert wrapper._compute_pending_init() is False
-
-    def test_pending_register_true_when_no_initial_and_no_sessions(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        assert wrapper._compute_pending_register() is True
-
-    def test_pending_register_false_when_initial_set(self, tmp_path: Path) -> None:
-        wrapper = SessionManagerWrapper(
-            socket_path=str(tmp_path / "x.sock"),
-            claude_args=["--resume", "foo"],
-            project_path=str(tmp_path),
-        )
-        assert wrapper._compute_pending_register() is False
-
-    def test_pending_register_false_when_sessions_exist(
-        self, tmp_path: Path
-    ) -> None:
-        store = SessionStore(str(tmp_path))
-        now = datetime.datetime.now(datetime.UTC).isoformat()
-        store.save_session(
-            SessionMetadata(
-                session_id="abc-123",
-                name="foo",
-                title="t",
-                summary=None,
-                created_at=now,
-                last_accessed=now,
-                transitions=[],
-                status=SessionStatus.ACTIVE,
-            )
-        )
-        wrapper = SessionManagerWrapper(
-            socket_path=str(tmp_path / "x.sock"),
-            claude_args=[],
-            project_path=str(tmp_path),
-        )
-        assert wrapper._compute_pending_register() is False
-
-
 class TestDrainInputQueue:
     def test_replaces_newlines_with_spaces(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
@@ -247,7 +192,7 @@ class TestSwitchFlow:
         assert "user_prompt" not in pending.handoff
         assert pending.handoff == {"from": "foo"}
 
-    def test_advance_switch_stage_one_filters_and_injects_resume(
+    def test_advance_switch_stage_one_injects_resume_text_only(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         injected = _capture_injects(wrapper, monkeypatch)
@@ -261,14 +206,29 @@ class TestSwitchFlow:
         wrapper._pending_action = pending
         wrapper._advance_switch(pending)
         assert wrapper.mode == "filtering"
-        assert injected == [b"/resume bar\n"]
+        assert injected == [b"/resume bar"]
+        assert pending.stage == "await_resume_submit"
+
+    def test_advance_switch_stage_two_submits_resume(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        submitted = _capture_injects(wrapper, monkeypatch)
+        pending = _PendingAction(
+            action_type="switch",
+            target="bar",
+            handoff={},
+            user_prompt="hi",
+            stage="await_resume_submit",
+        )
+        wrapper._pending_action = pending
+        wrapper._advance_switch(pending)
+        assert submitted == [b"\r"]
         assert pending.stage == "await_handoff_prompt"
 
-    def test_advance_switch_stage_two_injects_handoff_and_unfilters(
+    def test_advance_switch_stage_three_injects_handoff_text_only(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         injected = _capture_injects(wrapper, monkeypatch)
-        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
         pending = _PendingAction(
             action_type="switch",
             target="bar",
@@ -279,12 +239,29 @@ class TestSwitchFlow:
         wrapper._pending_action = pending
         wrapper.mode = "filtering"
         wrapper._advance_switch(pending)
-        assert wrapper.mode == "passthrough"
-        assert wrapper._pending_action is None
         assert len(injected) == 1
         text = injected[0].decode("utf-8")
         assert text.startswith("[handoff]\n")
-        assert text.endswith("user req\n")
+        assert text.endswith("user req")
+        assert pending.stage == "await_handoff_submit"
+
+    def test_advance_switch_stage_four_submits_and_unfilters(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _capture_injects(wrapper, monkeypatch)
+        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
+        pending = _PendingAction(
+            action_type="switch",
+            target="bar",
+            handoff={},
+            user_prompt="hi",
+            stage="await_handoff_submit",
+        )
+        wrapper._pending_action = pending
+        wrapper.mode = "filtering"
+        wrapper._advance_switch(pending)
+        assert wrapper.mode == "passthrough"
+        assert wrapper._pending_action is None
 
 
 class TestNewFlow:
@@ -304,7 +281,7 @@ class TestNewFlow:
         assert pending.new_session_name == "new"
         assert pending.stage == "await_rename_or_exit_prompt"
 
-    def test_handle_new_with_null_rename_skips_rename(
+    def test_handle_new_with_null_rename_injects_exit_text_only(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         injected = _capture_injects(wrapper, monkeypatch)
@@ -315,11 +292,11 @@ class TestNewFlow:
             user_prompt="x",
         )
         wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
-        assert injected == [b"/exit\n"]
+        assert injected == [b"/exit"]
         assert wrapper._pending_action is not None
-        assert wrapper._pending_action.stage == "await_child_exit"
+        assert wrapper._pending_action.stage == "await_exit_submit"
 
-    def test_advance_new_with_rename_then_exit(
+    def test_advance_new_with_rename_then_submit_then_exit(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         injected = _capture_injects(wrapper, monkeypatch)
@@ -329,19 +306,30 @@ class TestNewFlow:
             handoff={},
             user_prompt="x",
         )
+        # Stage 1: inject /rename text
         wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
-        assert injected == [b"/rename cur\n"]
+        assert injected == [b"/rename cur"]
+        assert wrapper._pending_action.stage == "await_rename_submit"  # type: ignore[union-attr]
+
+        # Stage 2: submit /rename
+        wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
+        assert injected == [b"/rename cur", b"\r"]
         assert wrapper._pending_action.stage == "await_exit_prompt"  # type: ignore[union-attr]
 
+        # Stage 3: inject /exit text
         wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
-        assert injected == [b"/rename cur\n", b"/exit\n"]
+        assert injected == [b"/rename cur", b"\r", b"/exit"]
+        assert wrapper._pending_action.stage == "await_exit_submit"  # type: ignore[union-attr]
+
+        # Stage 4: submit /exit
+        wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
+        assert injected == [b"/rename cur", b"\r", b"/exit", b"\r"]
         assert wrapper._pending_action.stage == "await_child_exit"  # type: ignore[union-attr]
 
-    def test_advance_new_handoff_after_handshake(
+    def test_advance_new_handoff_injects_text_only(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         injected = _capture_injects(wrapper, monkeypatch)
-        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
         pending = _PendingAction(
             action_type="new",
             target="",
@@ -353,10 +341,29 @@ class TestNewFlow:
         wrapper._pending_action = pending
         wrapper.mode = "filtering"
         wrapper._advance_new(pending)
-        assert wrapper.mode == "passthrough"
-        assert wrapper._pending_action is None
+        assert wrapper.mode == "filtering"
+        assert pending.stage == "await_new_handoff_submit"
         assert len(injected) == 1
         assert injected[0].decode("utf-8").startswith("[handoff]\n")
+
+    def test_advance_new_handoff_submit_unfilters(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _capture_injects(wrapper, monkeypatch)
+        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
+        pending = _PendingAction(
+            action_type="new",
+            target="",
+            handoff={},
+            user_prompt="x",
+            stage="await_new_handoff_submit",
+            new_session_name="new",
+        )
+        wrapper._pending_action = pending
+        wrapper.mode = "filtering"
+        wrapper._advance_new(pending)
+        assert wrapper.mode == "passthrough"
+        assert wrapper._pending_action is None
 
 
 class TestHandshake:
@@ -447,41 +454,3 @@ class TestMcpSignalRouting:
         assert wrapper._pending_action is None
 
 
-class TestBootstrapInjection:
-    def test_inject_both_when_both_pending(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        injected = _capture_injects(wrapper, monkeypatch)
-        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
-        wrapper._pending_init = True
-        wrapper._pending_register = True
-        wrapper._maybe_inject_bootstrap()
-
-        assert wrapper._pending_init is False
-        assert wrapper._pending_register is False
-        assert wrapper.mode == "passthrough"
-        assert len(injected) == 1
-        text = injected[0].decode("utf-8")
-        assert "init_project" in text
-        assert "session_register" in text
-
-    def test_inject_only_init(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        injected = _capture_injects(wrapper, monkeypatch)
-        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
-        wrapper._pending_init = True
-        wrapper._pending_register = False
-        wrapper._maybe_inject_bootstrap()
-        text = injected[0].decode("utf-8")
-        assert "init_project" in text
-        assert "session_register" not in text
-
-    def test_no_inject_when_neither_pending(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        injected = _capture_injects(wrapper, monkeypatch)
-        wrapper._pending_init = False
-        wrapper._pending_register = False
-        wrapper._maybe_inject_bootstrap()
-        assert injected == []

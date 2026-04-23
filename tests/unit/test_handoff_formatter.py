@@ -1,18 +1,14 @@
 """
-Unit tests for the handoff/init/register injection formatters.
+Unit tests for the handoff injection formatter.
 
-handoff/init/register 주입 텍스트 포맷터 단위 테스트.
+handoff 주입 텍스트 포맷터 단위 테스트.
 """
 
 from __future__ import annotations
 
 import json
 
-from session_manager.wrapper.handoff_formatter import (
-    format_handoff_injection,
-    format_init_injection,
-    format_register_injection,
-)
+from session_manager.wrapper.handoff_formatter import format_handoff_injection
 
 
 class TestFormatHandoffInjection:
@@ -51,18 +47,3 @@ class TestFormatHandoffInjection:
         handoff = {"a": 1}
         result = format_handoff_injection(handoff, "x")
         assert '  "a": 1' in result
-
-
-class TestFormatInitInjection:
-    def test_contains_required_keywords(self) -> None:
-        result = format_init_injection()
-        assert "[자동 초기화]" in result
-        assert "init_project" in result
-        assert "project-context.md" in result
-
-
-class TestFormatRegisterInjection:
-    def test_contains_required_keywords(self) -> None:
-        result = format_register_injection()
-        assert "[자동 초기화]" in result
-        assert "session_register" in result

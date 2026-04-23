@@ -31,17 +31,11 @@ import sys
 import termios
 import tty
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Literal
 
 import pexpect
 
-from session_manager.storage import SessionStore
-from session_manager.wrapper.handoff_formatter import (
-    format_handoff_injection,
-    format_init_injection,
-    format_register_injection,
-)
+from session_manager.wrapper.handoff_formatter import format_handoff_injection
 from session_manager.wrapper.socket_server import WrapperSocketServer
 
 # figures.pointer "❯" (UTF-8 E2 9D AF) followed by chalk.inverse "\x1b[7m"
@@ -136,13 +130,6 @@ class SessionManagerWrapper:
             self.claude_args
         )
 
-        # One-shot bootstrap flags. Computed once at construction so the
-        # disk read isn't repeated on every prompt detection. Cleared after
-        # injection so subsequent prompts don't re-trigger them.
-        # 일회성 부트스트랩 플래그. 매 프롬프트 감지마다 디스크를 읽지
-        # 않도록 생성 시 한 번 결정하고, 주입 후 해제해 재트리거 방지.
-        self._pending_init: bool = self._compute_pending_init()
-        self._pending_register: bool = self._compute_pending_register()
 
     def start(self) -> None:
         """
@@ -315,6 +302,13 @@ class SessionManagerWrapper:
     def _inject_text(self, text: str) -> None:
         os.write(self.pty_fd, text.encode("utf-8"))
 
+    def _submit(self) -> None:
+        """Send a standalone \\r so Ink recognises it as Return.
+
+        Ink의 parseKeypress가 Return으로 인식하도록 \\r을 단독 전송한다.
+        """
+        self._inject_text("\r")
+
     # ------------------------------------------------------------ Extension hooks
     # 확장 지점 -------------------------------------------------------------------
 
@@ -325,8 +319,6 @@ class SessionManagerWrapper:
                 self._advance_switch(pending)
             elif pending.action_type == "new":
                 self._advance_new(pending)
-            return
-        self._maybe_inject_bootstrap()
 
     def _handle_user_line(self, line: bytes) -> None:
         return
@@ -391,21 +383,26 @@ class SessionManagerWrapper:
         if pending.stage == "await_resume_prompt":
             # First prompt after the LLM finished its turn — start filtering
             # so the user doesn't see the raw `/resume` injection, then
-            # inject it.
+            # inject it.  Submit is deferred to await_resume_submit.
             # LLM 응답이 끝난 직후의 첫 프롬프트 — 필터링을 켜서 raw `/resume`
-            # 주입이 사용자에게 보이지 않게 한 뒤 주입.
+            # 주입이 사용자에게 보이지 않게 한 뒤 주입. 제출은
+            # await_resume_submit으로 지연.
             self.mode = "filtering"
-            self._inject_text(f"/resume {pending.target}\n")
+            self._inject_text(f"/resume {pending.target}")
+            pending.stage = "await_resume_submit"
+        elif pending.stage == "await_resume_submit":
+            self._submit()
             pending.stage = "await_handoff_prompt"
         elif pending.stage == "await_handoff_prompt":
-            # Second prompt — the resumed session is ready for input. Inject
-            # the handoff block plus the user's prompt, then return to
-            # passthrough so the user sees the new session's response.
-            # 두 번째 프롬프트 — 복귀 세션이 입력 받을 준비 완료. handoff
-            # 블록과 사용자 프롬프트를 주입하고 패스스루로 복귀해 새 세션의
-            # 응답이 사용자에게 보이게 한다.
+            # The resumed session is ready for input. Inject the handoff
+            # block plus the user's prompt.  Submit deferred to next detection.
+            # 복귀 세션이 입력 대기 중. handoff 블록과 사용자 프롬프트를
+            # 주입한다. 제출은 다음 감지로 지연.
             text = format_handoff_injection(pending.handoff, pending.user_prompt)
-            self._inject_text(text + "\n")
+            self._inject_text(text)
+            pending.stage = "await_handoff_submit"
+        elif pending.stage == "await_handoff_submit":
+            self._submit()
             self.mode = "passthrough"
             self._drain_input_queue()
             self._pending_action = None
@@ -482,75 +479,42 @@ class SessionManagerWrapper:
                 return arg[len("--resume=") :]
         return None
 
-    def _compute_pending_init(self) -> bool:
-        return not Path(
-            self.project_path, ".session-manager", "project-context.md"
-        ).exists()
-
-    def _compute_pending_register(self) -> bool:
-        if self._initial_session_name is not None:
-            return False
-        store = SessionStore(self.project_path)
-        return not store.list_sessions()
-
-    def _maybe_inject_bootstrap(self) -> None:
-        """
-        Inject the init / session_register prompt(s) once on the first
-        prompt of a fresh project or unregistered session.
-
-        새 프로젝트 또는 미등록 세션의 첫 프롬프트에서 init / session_register
-        지시를 한 번 주입한다. 두 플래그가 모두 켜져 있으면 한 번에 합쳐
-        주입한다.
-        """
-        parts: list[str] = []
-        if self._pending_init:
-            parts.append(format_init_injection())
-            self._pending_init = False
-        if self._pending_register:
-            parts.append(format_register_injection())
-            self._pending_register = False
-        if not parts:
-            return
-        # Filter the raw injection out of the user's view. The LLM's
-        # subsequent tool-call response remains visible after we flip back.
-        # raw 주입 텍스트는 사용자에게 보이지 않게 가린다. 패스스루로 복귀한
-        # 뒤의 LLM 도구 호출 응답은 사용자에게 정상 표시된다.
-        self.mode = "filtering"
-        self._inject_text("\n".join(parts) + "\n")
-        self.mode = "passthrough"
-        self._drain_input_queue()
-
     def _advance_new(self, pending: _PendingAction) -> None:
         if pending.stage == "await_rename_or_exit_prompt":
             # First prompt after the LLM finished its turn. Start filtering
-            # so neither /rename nor /exit is visible to the user. If the
-            # current session has a name, rename it first (so it persists
-            # under that name in `claude --resume` history); otherwise jump
-            # straight to /exit.
+            # so neither /rename nor /exit is visible to the user.
             # LLM 응답이 끝난 직후의 첫 프롬프트. 필터링을 켜서 /rename·/exit이
-            # 사용자에게 보이지 않게 한다. 현재 세션에 이름이 있으면 먼저
-            # /rename 으로 보존하고, 이름이 없으면 바로 /exit.
+            # 사용자에게 보이지 않게 한다.
             self.mode = "filtering"
             if pending.rename_current is not None:
-                self._inject_text(f"/rename {pending.rename_current}\n")
-                pending.stage = "await_exit_prompt"
+                self._inject_text(f"/rename {pending.rename_current}")
+                pending.stage = "await_rename_submit"
             else:
-                self._inject_text("/exit\n")
-                pending.stage = "await_child_exit"
+                self._inject_text("/exit")
+                pending.stage = "await_exit_submit"
+        elif pending.stage == "await_rename_submit":
+            self._submit()
+            pending.stage = "await_exit_prompt"
         elif pending.stage == "await_exit_prompt":
             # /rename has been processed; now exit the current session.
             # /rename 처리 완료, 이제 현재 세션 종료.
-            self._inject_text("/exit\n")
+            self._inject_text("/exit")
+            pending.stage = "await_exit_submit"
+        elif pending.stage == "await_exit_submit":
+            self._submit()
             pending.stage = "await_child_exit"
         elif pending.stage == "await_new_session_prompt":
             # New child has spawned, MCP handshake completed, and the first
             # prompt of the fresh session is up. Inject the handoff plus the
-            # user's prompt, then return the user terminal to passthrough.
+            # user's prompt. Submit deferred to next detection.
             # 새 자식이 spawn되고 MCP 핸드셰이크가 끝난 뒤 새 세션의 첫
-            # 프롬프트가 떴다. handoff와 사용자 프롬프트를 주입한 후 사용자
-            # 터미널을 패스스루로 복귀.
+            # 프롬프트가 떴다. handoff와 사용자 프롬프트를 주입. 제출은 다음
+            # 감지로 지연.
             text = format_handoff_injection(pending.handoff, pending.user_prompt)
-            self._inject_text(text + "\n")
+            self._inject_text(text)
+            pending.stage = "await_new_handoff_submit"
+        elif pending.stage == "await_new_handoff_submit":
+            self._submit()
             self.mode = "passthrough"
             self._drain_input_queue()
             self._pending_action = None

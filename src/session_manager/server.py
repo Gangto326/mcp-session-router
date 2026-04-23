@@ -40,6 +40,9 @@ from session_manager.wrapper.socket_client import WrapperSocketClient
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_SESSION_NAME = "default"
+_DEFAULT_SESSION_TITLE = "Default session"
+
 
 @dataclass
 class AppContext:
@@ -110,6 +113,31 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     if deleted:
         logger.info("Startup cleanup: removed %d expired session(s)", len(deleted))
 
+    # Auto-register a default session if none exists and no --resume
+    # was given.  The LLM can update the name/title later via
+    # session_switch or session_create once it understands the context.
+    #
+    # 세션이 없고 --resume 인자도 없으면 기본 세션을 자동 등록한다.
+    # LLM이 맥락을 파악한 뒤 session_switch/session_create로 이름을
+    # 갱신할 수 있다.
+    if state.get_current_session() is None and not session_store.list_sessions():
+        default = SessionMetadata.new(
+            name=_DEFAULT_SESSION_NAME, title=_DEFAULT_SESSION_TITLE
+        )
+        session_store.save_session(default)
+        state.set_current_session(_DEFAULT_SESSION_NAME)
+        logger.info("Auto-registered default session")
+
+    # Build instructions dynamically — add a project-context.md hint
+    # when the file does not exist yet so the LLM creates it.
+    #
+    # instructions를 동적으로 구성한다 — project-context.md가 없으면
+    # LLM에게 생성하라는 힌트를 추가한다.
+    instructions = _SERVER_INSTRUCTIONS
+    if not project_context_store.exists():
+        instructions += _INIT_PROJECT_HINT
+    server._mcp_server.instructions = instructions  # type: ignore[attr-defined]
+
     ctx = AppContext(
         state=state,
         session_store=session_store,
@@ -148,20 +176,22 @@ When input contains [handoff]...[/handoff]:
 2. Read the message field for previous session context.
 3. Text after [/handoff] is the user's actual prompt.
 
-## Auto-Init
-When input contains [자동 초기화], the wrapper detected that bootstrapping \
-is needed. Follow each instruction in the message before handling the user's \
-request.
-
 ## Summary Format
 When switching or ending a session, write a 2-3 sentence summary: \
 where (files/areas touched), what (work performed), status \
 (done / in-progress / remaining). Update the title if it has evolved.\
 """
 
+_INIT_PROJECT_HINT = """
+
+## Project Initialization Required
+.session-manager/project-context.md does not exist yet. Before handling the \
+user's first request, briefly explore the project structure and call \
+init_project with a concise overview.\
+"""
+
 mcp_server = FastMCP(
     "session-manager",
-    instructions=_SERVER_INSTRUCTIONS,
     lifespan=app_lifespan,
 )
 
