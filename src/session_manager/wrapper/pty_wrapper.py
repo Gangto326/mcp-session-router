@@ -37,6 +37,7 @@ import pexpect
 
 from session_manager.wrapper.handoff_formatter import format_handoff_injection
 from session_manager.wrapper.socket_server import WrapperSocketServer
+from session_manager.wrapper.virtual_screen import VirtualScreen
 
 # figures.pointer "❯" (UTF-8 E2 9D AF) followed by chalk.inverse "\x1b[7m"
 # is what ink-text-input renders for the prompt cursor. Verified against
@@ -116,6 +117,13 @@ class SessionManagerWrapper:
             socket_path=socket_path,
             on_message=self._handle_mcp_signal,
         )
+
+        # Virtual terminal screen mirroring Claude Code's PTY output. Used to
+        # extract the live input prompt text (the line containing ❯) when
+        # the user submits a slash command.
+        # Claude Code의 PTY 출력을 미러링하는 가상 터미널 화면. 사용자가
+        # 슬래시 명령을 submit한 시점의 입력란 텍스트(❯ 라인) 추출에 사용.
+        self.virtual_screen = VirtualScreen()
 
         self._pending_action: _PendingAction | None = None
 
@@ -242,6 +250,12 @@ class SessionManagerWrapper:
             # EOF on PTY master means the child closed its end.
             # PTY master에서의 EOF — 자식 프로세스가 자기 쪽을 닫음.
             return False
+
+        # Mirror every chunk into the virtual screen, regardless of mode,
+        # so the input prompt line is always up to date for extraction.
+        # mode 와 무관하게 모든 chunk를 가상 화면에 반영 — 입력란 추출이
+        # 항상 최신 상태에서 가능하도록.
+        self.virtual_screen.feed(chunk)
 
         self.output_buffer += chunk
         if self._detect_prompt(self.output_buffer):
@@ -541,6 +555,7 @@ class SessionManagerWrapper:
                 chunk = os.read(self.pty_fd, 4096)
                 if not chunk:
                     return
+                self.virtual_screen.feed(chunk)
                 if self.mode == "passthrough":
                     os.write(self._stdout_fd, chunk)
         except OSError:
@@ -584,3 +599,8 @@ class SessionManagerWrapper:
             termios.tcsetwinsize(self.pty_fd, (rows, cols))
         except OSError:
             return
+        # Keep the virtual screen in lockstep with the actual PTY size so
+        # Ink's wrap-aware redraws extract correctly.
+        # Ink가 wrap을 고려해 그리는 부분 갱신이 정확히 추출되도록 가상
+        # 화면을 실제 PTY 크기와 동기화.
+        self.virtual_screen.resize(cols, rows)

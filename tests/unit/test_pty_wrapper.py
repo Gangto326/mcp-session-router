@@ -454,3 +454,78 @@ class TestMcpSignalRouting:
         assert wrapper._pending_action is None
 
 
+class TestVirtualScreenIntegration:
+    """Verify PTY chunks reach VirtualScreen and resize stays in sync.
+    PTY 청크가 가상 화면에 도달하는지, resize가 동기화되는지 검증.
+    """
+
+    def test_init_creates_virtual_screen(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        from session_manager.wrapper.virtual_screen import VirtualScreen
+
+        assert isinstance(wrapper.virtual_screen, VirtualScreen)
+        assert wrapper.virtual_screen.get_prompt_line() is None
+
+    def test_handle_pty_readable_feeds_virtual_screen(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        chunk = "❯ /test".encode()
+        reads = iter([chunk, b""])
+        monkeypatch.setattr("os.read", lambda fd, n: next(reads))
+        monkeypatch.setattr("os.write", lambda fd, data: len(data))
+        wrapper.pty_fd = 0  # any value, os.read is mocked
+
+        assert wrapper._handle_pty_readable() is True
+        assert wrapper.virtual_screen.get_prompt_line() == "/test"
+
+    def test_drain_pty_feeds_virtual_screen(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        chunk = "❯ /drained".encode()
+        reads = iter([chunk, b""])
+        monkeypatch.setattr("os.read", lambda fd, n: next(reads))
+        monkeypatch.setattr("os.write", lambda fd, data: len(data))
+        wrapper.pty_fd = 0
+
+        wrapper._drain_pty()
+        assert wrapper.virtual_screen.get_prompt_line() == "/drained"
+
+    def test_sync_winsize_resizes_virtual_screen(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import termios
+
+        wrapper.pty_fd = 0
+        monkeypatch.setattr("os.isatty", lambda fd: True)
+        monkeypatch.setattr(termios, "tcgetwinsize", lambda fd: (40, 120))
+        monkeypatch.setattr(termios, "tcsetwinsize", lambda fd, size: None)
+
+        wrapper._sync_winsize()
+        assert len(wrapper.virtual_screen._screen.display) == 40
+        assert len(wrapper.virtual_screen._screen.display[0]) == 120
+
+    def test_sync_winsize_skipped_when_pty_fd_invalid(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Negative pty_fd → early return, virtual screen unchanged.
+        pty_fd가 음수면 일찍 return, 가상 화면 변경 없음.
+        """
+        wrapper.pty_fd = -1
+        # Set virtual screen to a known non-default size first
+        # 가상 화면을 default가 아닌 크기로 먼저 설정
+        wrapper.virtual_screen.resize(120, 40)
+
+        wrapper._sync_winsize()  # should be a no-op
+        assert len(wrapper.virtual_screen._screen.display) == 40
+        assert len(wrapper.virtual_screen._screen.display[0]) == 120
+
+
