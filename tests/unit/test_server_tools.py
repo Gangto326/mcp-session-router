@@ -316,6 +316,33 @@ class TestSessionEnd:
         assert result["ended"] == "ghost"
         assert app.state.get_current_session() is None
 
+    def test_sends_intercept_done_when_active(self, app: AppContext) -> None:
+        """intercept_active=True 일 때 session_end → 래퍼에 intercept_done 송신.
+        intercept_active=True → session_end notifies wrapper.
+        """
+        app.session_store.save_session(SessionMetadata.new(name="s", title="S"))
+        app.state.set_current_session("s")
+        app.intercept_active["value"] = True
+
+        session_end(summary="bye", ctx=_make_ctx(app))
+
+        app.socket_client.send_signal.assert_called_once_with(
+            {"action": "intercept_done"}
+        )
+        assert app.intercept_active["value"] is False
+
+    def test_no_intercept_done_when_inactive(self, app: AppContext) -> None:
+        """intercept_active=False 일 때 session_end → 래퍼 통보 없음.
+        intercept_active=False → no notify.
+        """
+        app.session_store.save_session(SessionMetadata.new(name="s", title="S"))
+        app.state.set_current_session("s")
+        app.intercept_active["value"] = False
+
+        session_end(summary="bye", ctx=_make_ctx(app))
+
+        app.socket_client.send_signal.assert_not_called()
+
 
 # --------------------------------------------------------------- update_static
 

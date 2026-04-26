@@ -19,9 +19,14 @@ tool call can arrive.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import socket
+from collections.abc import Awaitable, Callable
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class WrapperSocketClient:
@@ -114,3 +119,57 @@ class WrapperSocketClient:
             self._read_buffer += chunk
         line, self._read_buffer = self._read_buffer.split(b"\n", 1)
         return json.loads(line.decode("utf-8"))
+
+    # ------------------------------------------------------ async receive
+    # 비동기 수신 ----------------------------------------------------------------
+
+    async def recv_loop(
+        self,
+        on_message: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Background async loop that receives push messages from the wrapper.
+
+        래퍼가 push하는 메시지를 받는 백그라운드 비동기 루프. handshake가
+        끝난 뒤 호출하면 socket을 non-blocking 모드로 전환하고, 매 라인
+        구분 JSON 메시지를 ``on_message`` 콜백으로 전달한다.
+
+        연결이 끊기거나 task가 취소되면 루프 종료.
+        """
+        if self._sock is None:
+            return
+        self._sock.setblocking(False)
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                try:
+                    chunk = await loop.sock_recv(self._sock, 4096)
+                except (OSError, asyncio.CancelledError):
+                    return
+                if not chunk:
+                    # EOF — wrapper closed its end.
+                    # EOF — 래퍼가 자기 쪽을 닫음.
+                    return
+                self._read_buffer += chunk
+                while b"\n" in self._read_buffer:
+                    line, self._read_buffer = self._read_buffer.split(b"\n", 1)
+                    try:
+                        msg = json.loads(line.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        # Malformed line — skip silently to keep the loop alive.
+                        # 깨진 라인은 무시하고 루프 유지.
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    try:
+                        await on_message(msg)
+                    except Exception:
+                        # Don't let a callback error kill the receive loop.
+                        # 콜백 에러로 receive 루프가 죽지 않도록.
+                        logger.exception("on_message callback raised")
+        finally:
+            # Restore blocking mode for any subsequent synchronous send.
+            # 이후 동기 송신을 위해 blocking 모드 복원.
+            try:
+                self._sock.setblocking(True)
+            except OSError:
+                pass

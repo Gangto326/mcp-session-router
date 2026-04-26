@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -304,6 +304,7 @@ class TestResumeViaHandshake:
         )
 
         mock_client_instance = MagicMock()
+        mock_client_instance.recv_loop = AsyncMock()
         mock_client_instance.request_handshake.return_value = "backend"
 
         mock_server = MagicMock()
@@ -351,6 +352,7 @@ class TestContinueResolvesLatest:
         store.save_session(recent)
 
         mock_client_instance = MagicMock()
+        mock_client_instance.recv_loop = AsyncMock()
         mock_client_instance.request_handshake.return_value = None
 
         mock_server = MagicMock()
@@ -384,6 +386,7 @@ class TestFirstRunAutoRegistersDefault:
         "default" 세션을 자동 등록한다.
         """
         mock_client_instance = MagicMock()
+        mock_client_instance.recv_loop = AsyncMock()
         mock_client_instance.request_handshake.return_value = None
 
         mock_server = MagicMock()
