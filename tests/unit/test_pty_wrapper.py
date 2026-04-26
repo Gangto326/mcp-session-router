@@ -17,6 +17,7 @@ from session_manager.wrapper.pty_wrapper import (
     OUTPUT_BUFFER_TAIL_KEEP,
     PROMPT_POINTER,
     SessionManagerWrapper,
+    _InterceptState,
     _PendingAction,
 )
 
@@ -527,5 +528,143 @@ class TestVirtualScreenIntegration:
         wrapper._sync_winsize()  # should be a no-op
         assert len(wrapper.virtual_screen._screen.display) == 40
         assert len(wrapper.virtual_screen._screen.display[0]) == 120
+
+
+class TestStdinSubmitInterception:
+    """Submit detection (stdin \\r) and intercept entry/exit.
+    submit 감지 (stdin \\r) + 가로채기 진입/종료.
+    """
+
+    def test_submit_with_match_starts_intercept(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Lone \\r with matching prompt text → enter filtering, queue, signal.
+        \\r 단독 + 매칭 가능한 prompt → filtering 진입, 큐잉, MCP 신호.
+        """
+        wrapper.virtual_screen.feed("❯ /resume foo".encode())
+        sent: list[dict] = []
+        monkeypatch.setattr(
+            wrapper.socket_server, "send",
+            lambda msg: sent.append(msg) or True,
+        )
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
+        wrapper._stdin_fd = 0
+
+        wrapper._handle_stdin_readable()
+
+        assert wrapper.mode == "filtering"
+        assert wrapper.input_queue == b"\r"
+        assert wrapper._intercept_state is not None
+        assert wrapper._intercept_state.command == "resume"
+        assert wrapper._intercept_state.args == "foo"
+        assert sent == [
+            {"action": "intercept", "command": "resume", "args": "foo"}
+        ]
+
+    def test_submit_no_match_passes_through(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Lone \\r with non-command prompt → forward as normal.
+        \\r 단독이지만 prompt가 명령 아님 → 정상 forward.
+        """
+        wrapper.virtual_screen.feed("❯ hello".encode())
+        writes: list[bytes] = []
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+
+        wrapper._handle_stdin_readable()
+
+        assert wrapper.mode == "passthrough"
+        assert wrapper._intercept_state is None
+        assert writes == [b"\r"]
+
+    def test_non_submit_chunk_skips_match_attempt(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-\\r chunk bypasses match attempt entirely (forwarded as typing).
+        \\r 아닌 chunk는 매칭 시도 자체가 없음 (타이핑으로 forward).
+        """
+        # Even with a matchable prompt, a non-\r chunk must not trigger.
+        # 매칭 가능한 prompt가 있어도 \r 아닌 chunk는 trigger되면 안 됨.
+        wrapper.virtual_screen.feed("❯ /resume foo".encode())
+        writes: list[bytes] = []
+        monkeypatch.setattr("os.read", lambda fd, n: b"a")
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+
+        wrapper._handle_stdin_readable()
+
+        assert wrapper.mode == "passthrough"
+        assert wrapper._intercept_state is None
+        assert writes == [b"a"]
+
+    def test_filtering_mode_queues_additional_input(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Once in filtering, extra stdin chunks accumulate in input_queue.
+        filtering 진입 후 추가 stdin은 input_queue에 적재.
+        """
+        wrapper.mode = "filtering"
+        wrapper.input_queue = b"\r"
+        monkeypatch.setattr("os.read", lambda fd, n: b"hello")
+        wrapper._stdin_fd = 0
+
+        wrapper._handle_stdin_readable()
+
+        assert wrapper.input_queue == b"\rhello"
+
+    def test_intercept_done_signal_finishes_intercept(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`intercept_done` from MCP drains the queue raw and exits filtering.
+        MCP의 intercept_done → 큐 원본 그대로 forward + filtering 종료.
+        """
+        wrapper._intercept_state = _InterceptState(command="resume", args="foo")
+        wrapper.mode = "filtering"
+        wrapper.input_queue = b"\rhello"
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper.pty_fd = 1
+
+        wrapper._handle_mcp_signal({"action": "intercept_done"})
+
+        assert wrapper.mode == "passthrough"
+        assert wrapper._intercept_state is None
+        assert wrapper.input_queue == b""
+        assert writes == [b"\rhello"]
+
+    def test_intercept_done_ignored_when_not_active(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        """intercept_done with no active state is a no-op (no mode/queue change).
+        intercept_state가 없을 때 intercept_done은 no-op.
+        """
+        wrapper._intercept_state = None
+        wrapper.mode = "passthrough"
+        wrapper.input_queue = b"untouched"
+
+        wrapper._handle_mcp_signal({"action": "intercept_done"})
+
+        assert wrapper.mode == "passthrough"
+        assert wrapper.input_queue == b"untouched"
 
 

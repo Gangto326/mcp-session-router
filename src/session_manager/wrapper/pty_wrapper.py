@@ -35,6 +35,10 @@ from typing import Any, Literal
 
 import pexpect
 
+from session_manager.wrapper.command_matcher import (
+    InterceptedCommand,
+    match_intercept_command,
+)
 from session_manager.wrapper.handoff_formatter import format_handoff_injection
 from session_manager.wrapper.socket_server import WrapperSocketServer
 from session_manager.wrapper.virtual_screen import VirtualScreen
@@ -87,6 +91,20 @@ class _PendingAction:
     new_session_name: str = ""
 
 
+@dataclass
+class _InterceptState:
+    """
+    In-progress slash-command interception waiting for the MCP response.
+
+    사용자가 직접 친 슬래시 명령(`/resume`, `/exit` 등)을 가로채고 MCP에서
+    session_end 처리가 끝났다는 응답이 오기를 기다리는 상태를 보관한다.
+    응답을 받기 전까지는 filtering 모드로 사용자 입력을 큐잉한다.
+    """
+
+    command: str  # one of KNOWN_COMMANDS
+    args: str
+
+
 class SessionManagerWrapper:
     def __init__(
         self,
@@ -126,6 +144,7 @@ class SessionManagerWrapper:
         self.virtual_screen = VirtualScreen()
 
         self._pending_action: _PendingAction | None = None
+        self._intercept_state: _InterceptState | None = None
 
         # Initial current_session_name handed back during the MCP handshake,
         # decided from CLI args:
@@ -287,17 +306,69 @@ class SessionManagerWrapper:
             self.input_queue += chunk
             return
 
+        # Submit detection: Ink's parseKeypress only treats a lone \r as
+        # Return (s === '\r'). Multi-byte chunks are typed text, not submit.
+        # submit 감지 — Ink parseKeypress는 단독 \r만 Return으로 인정
+        # (s === '\r'). 멀티 바이트 chunk는 타이핑 중인 텍스트로 간주.
+        if chunk == b"\r":
+            prompt_text = self.virtual_screen.get_prompt_line()
+            matched = match_intercept_command(prompt_text)
+            if matched is not None:
+                self._start_intercept(matched, chunk)
+                return
+
         self.stdin_line_buffer += chunk
         while b"\n" in self.stdin_line_buffer:
             line, self.stdin_line_buffer = self.stdin_line_buffer.split(b"\n", 1)
             self._handle_user_line(line + b"\n")
 
         # Forward keystrokes to the PTY so Ink can render them in real time.
-        # Slash-command interception will later gate this path differently.
-        #
         # Ink가 실시간으로 렌더링할 수 있도록 키 입력을 PTY로 즉시 전달.
-        # 슬래시 커맨드 가로채기 도입 시 이 경로를 분기 처리할 예정.
         os.write(self.pty_fd, chunk)
+
+    # ------------------------------------------------------- Slash interception
+    # 슬래시 명령 가로채기 ------------------------------------------------------
+
+    def _start_intercept(
+        self, matched: InterceptedCommand, submit_chunk: bytes
+    ) -> None:
+        """Begin a slash-command interception flow.
+
+        슬래시 명령 가로채기 흐름 시작 — filtering 모드로 들어가서 사용자
+        입력을 큐잉하고 MCP 측에 가로채기 신호를 보낸다. 이후 사용자 stdin은
+        _handle_stdin_readable의 filtering 분기에서 자동으로 input_queue에
+        적재된다.
+        """
+        self.mode = "filtering"
+        # Queue the submit chunk so it can be replayed to the PTY when the
+        # session_end response arrives.
+        # submit chunk를 큐잉 — session_end 응답 도착 시 PTY로 재생되도록.
+        self.input_queue += submit_chunk
+        self._intercept_state = _InterceptState(
+            command=matched.command,
+            args=matched.args,
+        )
+        self.socket_server.send(
+            {
+                "action": "intercept",
+                "command": matched.command,
+                "args": matched.args,
+            }
+        )
+
+    def _finish_intercept(self) -> None:
+        """End interception and replay the queued input to the PTY.
+
+        가로채기 종료 — 큐잉된 입력(원래의 submit chunk + filtering 동안
+        들어온 추가 입력)을 PTY로 그대로 흘려보낸다. SWITCH/NEW의
+        _drain_input_queue와 달리 newline을 공백으로 치환하지 않음 — 사용자가
+        의도한 \r submit이 그대로 전달되어야 한다.
+        """
+        self._intercept_state = None
+        self.mode = "passthrough"
+        if self.input_queue:
+            os.write(self.pty_fd, self.input_queue)
+            self.input_queue = b""
 
     # --------------------------------------------------- Detection & injection
     # 프롬프트 감지 / 텍스트 주입 -----------------------------------------------
@@ -364,6 +435,11 @@ class SessionManagerWrapper:
             user_prompt_val = handoff.get("user_prompt", "")
             user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
             self._handle_new(rename_current, new_session_name, handoff, user_prompt)
+        elif action == "intercept_done":
+            # MCP 측에서 session_end 처리가 끝났다는 응답. 가로채기 상태일
+            # 때만 종료하고 큐잉된 명령을 흘려보낸다 (그 외 상태에서는 무시).
+            if self._intercept_state is not None:
+                self._finish_intercept()
 
     # ----------------------------------------------------------- Action handlers
     # 세션 액션 처리 ------------------------------------------------------------
