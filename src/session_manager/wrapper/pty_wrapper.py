@@ -331,10 +331,21 @@ class SessionManagerWrapper:
             return
 
         if self.mode == "filtering":
-            # Buffer keystrokes during injection; drained back to the PTY
-            # when filtering ends.
-            # 주입 중 들어온 키 입력은 큐에 보관, 필터링 종료 시 PTY로 일괄 반영.
+            # Buffer keystrokes during SWITCH/NEW injection; drained back to
+            # the PTY when filtering ends. Used by SWITCH/NEW only.
+            # SWITCH/NEW 주입 중 들어온 키 입력은 큐에 보관, 필터링 종료 시
+            # PTY로 일괄 반영. SWITCH/NEW 전용 메커니즘.
             self.input_queue += chunk
+            return
+
+        # During slash-command interception, drop user input — the visible
+        # input line stays as-is (we held \r, not the typed text), and the
+        # held \r is forwarded when the MCP responds. Ctrl+C handling is
+        # added in 6-7.
+        # 슬래시 명령 가로채기 중에는 사용자 입력을 drop — 입력란은 그대로
+        # 유지된다 (우리는 \r만 보관하고 텍스트는 이미 PTY로 갔음). MCP
+        # 응답이 오면 보관한 \r을 forward해 명령 실행. Ctrl+C 처리는 6-7.
+        if self._intercept_state is not None:
             return
 
         # Submit detection: Ink's parseKeypress only treats a lone \r as
@@ -345,7 +356,7 @@ class SessionManagerWrapper:
             prompt_text = self.virtual_screen.get_prompt_line()
             matched = match_intercept_command(prompt_text)
             if matched is not None:
-                self._start_intercept(matched, chunk)
+                self._start_intercept(matched)
                 return
 
         self.stdin_line_buffer += chunk
@@ -360,21 +371,14 @@ class SessionManagerWrapper:
     # ------------------------------------------------------- Slash interception
     # 슬래시 명령 가로채기 ------------------------------------------------------
 
-    def _start_intercept(
-        self, matched: InterceptedCommand, submit_chunk: bytes
-    ) -> None:
+    def _start_intercept(self, matched: InterceptedCommand) -> None:
         """Begin a slash-command interception flow.
 
-        슬래시 명령 가로채기 흐름 시작 — filtering 모드로 들어가서 사용자
-        입력을 큐잉하고 MCP 측에 가로채기 신호를 보낸다. 이후 사용자 stdin은
-        _handle_stdin_readable의 filtering 분기에서 자동으로 input_queue에
-        적재된다.
+        슬래시 명령 가로채기 흐름 시작 — \\r은 PTY로 forward하지 않고 보관,
+        MCP에 가로채기 신호 송신. 가로채기 중 들어오는 사용자 stdin은
+        _handle_stdin_readable에서 drop된다 (입력란은 그대로 유지). MCP 응답
+        도착 시 _finish_intercept가 \\r을 forward해 명령을 실행한다.
         """
-        self.mode = "filtering"
-        # Queue the submit chunk so it can be replayed to the PTY when the
-        # session_end response arrives.
-        # submit chunk를 큐잉 — session_end 응답 도착 시 PTY로 재생되도록.
-        self.input_queue += submit_chunk
         self._intercept_state = _InterceptState(
             command=matched.command,
             args=matched.args,
@@ -388,18 +392,17 @@ class SessionManagerWrapper:
         )
 
     def _finish_intercept(self) -> None:
-        """End interception and replay the queued input to the PTY.
+        """End interception and forward the held \\r to the PTY.
 
-        가로채기 종료 — 큐잉된 입력(원래의 submit chunk + filtering 동안
-        들어온 추가 입력)을 PTY로 그대로 흘려보낸다. SWITCH/NEW의
-        _drain_input_queue와 달리 newline을 공백으로 치환하지 않음 — 사용자가
-        의도한 \r submit이 그대로 전달되어야 한다.
+        가로채기 종료 — 보관한 \\r을 PTY로 forward해 입력란의 명령을
+        실행시킨다. 가로채기 중 사용자 stdin은 drop되었으므로 입력란은
+        가로채기 시점 그대로 (사용자가 친 ``/resume foo`` 등).
         """
         self._intercept_state = None
-        self.mode = "passthrough"
-        if self.input_queue:
-            os.write(self.pty_fd, self.input_queue)
-            self.input_queue = b""
+        try:
+            os.write(self.pty_fd, b"\r")
+        except OSError:
+            pass
 
     # --------------------------------------------------- Detection & injection
     # 프롬프트 감지 / 텍스트 주입 -----------------------------------------------

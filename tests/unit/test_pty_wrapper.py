@@ -542,8 +542,9 @@ class TestStdinSubmitInterception:
         wrapper: SessionManagerWrapper,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Lone \\r with matching prompt text → enter filtering, queue, signal.
-        \\r 단독 + 매칭 가능한 prompt → filtering 진입, 큐잉, MCP 신호.
+        """Lone \\r with matching prompt text → state set + MCP signal.
+        \\r 단독 + 매칭 가능한 prompt → state 설정 + MCP 신호.
+        Mode/queue는 변경되지 않음 (큐잉 없이 \\r은 _intercept_state로만 보관).
         """
         wrapper.virtual_screen.feed("❯ /resume foo".encode())
         sent: list[dict] = []
@@ -556,8 +557,8 @@ class TestStdinSubmitInterception:
 
         wrapper._handle_stdin_readable()
 
-        assert wrapper.mode == "filtering"
-        assert wrapper.input_queue == b"\r"
+        assert wrapper.mode == "passthrough"  # filtering mode 사용 안 함
+        assert wrapper.input_queue == b""  # 큐잉 안 함
         assert wrapper._intercept_state is not None
         assert wrapper._intercept_state.command == "resume"
         assert wrapper._intercept_state.args == "foo"
@@ -613,34 +614,57 @@ class TestStdinSubmitInterception:
         assert wrapper._intercept_state is None
         assert writes == [b"a"]
 
-    def test_filtering_mode_queues_additional_input(
+    def test_intercept_active_drops_user_stdin(
         self,
         wrapper: SessionManagerWrapper,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Once in filtering, extra stdin chunks accumulate in input_queue.
-        filtering 진입 후 추가 stdin은 input_queue에 적재.
+        """Once in intercept, additional stdin is dropped (no PTY write,
+        no queue accumulation).
+        가로채기 중 추가 stdin은 drop — PTY write 없음, 큐 적재 없음.
+        """
+        wrapper._intercept_state = _InterceptState(command="resume", args="foo")
+        writes: list[bytes] = []
+        monkeypatch.setattr("os.read", lambda fd, n: b"hello")
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+
+        wrapper._handle_stdin_readable()
+
+        assert writes == []
+        assert wrapper.input_queue == b""
+        assert wrapper.mode == "passthrough"
+
+    def test_filtering_mode_still_queues_for_switch_new(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SWITCH/NEW filtering mode keeps the original queueing behaviour
+        (separate from interception drop).
+        SWITCH/NEW의 filtering mode는 기존 큐잉 동작 유지 (가로채기 drop과 별개).
         """
         wrapper.mode = "filtering"
-        wrapper.input_queue = b"\r"
+        wrapper.input_queue = b""
         monkeypatch.setattr("os.read", lambda fd, n: b"hello")
         wrapper._stdin_fd = 0
 
         wrapper._handle_stdin_readable()
 
-        assert wrapper.input_queue == b"\rhello"
+        assert wrapper.input_queue == b"hello"
 
     def test_intercept_done_signal_finishes_intercept(
         self,
         wrapper: SessionManagerWrapper,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """`intercept_done` from MCP drains the queue raw and exits filtering.
-        MCP의 intercept_done → 큐 원본 그대로 forward + filtering 종료.
+        """`intercept_done` from MCP forwards a single \\r to the PTY.
+        MCP의 intercept_done → PTY로 \\r 한 번 forward (큐 없음).
         """
         wrapper._intercept_state = _InterceptState(command="resume", args="foo")
-        wrapper.mode = "filtering"
-        wrapper.input_queue = b"\rhello"
         writes: list[bytes] = []
         monkeypatch.setattr(
             "os.write", lambda fd, data: writes.append(data) or len(data)
@@ -649,25 +673,22 @@ class TestStdinSubmitInterception:
 
         wrapper._handle_mcp_signal({"action": "intercept_done"})
 
-        assert wrapper.mode == "passthrough"
         assert wrapper._intercept_state is None
-        assert wrapper.input_queue == b""
-        assert writes == [b"\rhello"]
+        assert writes == [b"\r"]
 
     def test_intercept_done_ignored_when_not_active(
         self, wrapper: SessionManagerWrapper
     ) -> None:
-        """intercept_done with no active state is a no-op (no mode/queue change).
+        """intercept_done with no active state is a no-op.
         intercept_state가 없을 때 intercept_done은 no-op.
         """
         wrapper._intercept_state = None
         wrapper.mode = "passthrough"
-        wrapper.input_queue = b"untouched"
 
         wrapper._handle_mcp_signal({"action": "intercept_done"})
 
         assert wrapper.mode == "passthrough"
-        assert wrapper.input_queue == b"untouched"
+        assert wrapper._intercept_state is None
 
 
 class TestAutoAcceptConfirmations:
