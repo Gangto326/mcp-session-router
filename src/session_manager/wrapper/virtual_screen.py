@@ -67,3 +67,13 @@ class VirtualScreen:
                 rest = line[idx + 1 :]
                 return rest.lstrip(" \xa0").rstrip()
         return None
+
+    def contains(self, needle: str) -> bool:
+        """Return True if any row of the virtual screen contains *needle*.
+        가상 화면 어느 행에라도 ``needle`` 부분 문자열이 있으면 True.
+
+        Used to detect confirmation prompts (e.g. ``I am using this for local
+        development``) so the wrapper can auto-accept them.
+        confirmation prompt 감지에 사용 — 발견되면 wrapper가 자동 승인.
+        """
+        return any(needle in line for line in self._screen.display)

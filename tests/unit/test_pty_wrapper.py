@@ -8,10 +8,12 @@ PTY 래퍼의 내부 로직 단위 테스트. PTY 의존 메서드는 monkeypatc
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from session_manager.wrapper.pty_wrapper import (
+    AUTO_CONFIRM_PATTERNS,
     INVERSE_VIDEO_START,
     OUTPUT_BUFFER_CAP,
     OUTPUT_BUFFER_TAIL_KEEP,
@@ -666,5 +668,133 @@ class TestStdinSubmitInterception:
 
         assert wrapper.mode == "passthrough"
         assert wrapper.input_queue == b"untouched"
+
+
+class TestAutoAcceptConfirmations:
+    """Auto-accept of channels dev warning + MCP server registration prompts.
+    channels dev 경고 + MCP server 등록 prompt 자동 승인.
+    """
+
+    def test_injects_cr_when_channels_dev_warning_visible(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Channels dev warning text on screen → \\r injected once.
+        가상 화면에 channels dev 경고 텍스트가 있으면 \\r 1회 주입.
+        """
+        wrapper.virtual_screen.feed(
+            b"Some preamble\r\n  I am using this for local development\r\n  Exit"
+        )
+        wrapper.pty_fd = 1
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+
+        wrapper._auto_accept_confirmations()
+
+        assert b"\r" in writes
+        assert "I am using this for local development" in wrapper._handled_confirmations
+
+    def test_each_pattern_handled_at_most_once(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Calling auto-accept twice with same screen → only one \\r.
+        같은 화면으로 두 번 호출해도 \\r은 한 번만.
+        """
+        wrapper.virtual_screen.feed(
+            b"  I am using this for local development\r\n"
+        )
+        wrapper.pty_fd = 1
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+
+        wrapper._auto_accept_confirmations()
+        wrapper._auto_accept_confirmations()
+
+        assert writes.count(b"\r") == 1
+
+    def test_no_inject_when_no_pattern_visible(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Random screen content → no injection.
+        무관한 화면 → 주입 없음.
+        """
+        wrapper.virtual_screen.feed(b"Hello world\r\nA normal Claude reply.")
+        wrapper.pty_fd = 1
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+
+        wrapper._auto_accept_confirmations()
+
+        assert writes == []
+        assert wrapper._handled_confirmations == set()
+
+    def test_handles_multiple_distinct_patterns(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Distinct patterns visible (at different times) → each accepted once.
+        서로 다른 패턴 (각각 다른 시점) → 각자 1회씩 승인.
+        """
+        wrapper.pty_fd = 1
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+
+        # 첫 화면: MCP server 등록
+        wrapper.virtual_screen.feed(
+            b"  Use this and all future MCP servers in this project\r\n"
+        )
+        wrapper._auto_accept_confirmations()
+        assert writes.count(b"\r") == 1
+
+        # 같은 자식, 두 번째 화면: channels dev 경고
+        wrapper.virtual_screen.feed(
+            b"  I am using this for local development\r\n"
+        )
+        wrapper._auto_accept_confirmations()
+        assert writes.count(b"\r") == 2
+
+    def test_known_patterns_set(self) -> None:
+        """The constant lists exactly the three confirmation prompts we expect.
+        상수에 우리가 처리하는 confirmation prompt 3개가 정확히 들어있는지.
+        """
+        assert AUTO_CONFIRM_PATTERNS == (
+            "I am using this for local development",
+            "Use this and all future MCP servers",
+            "Use this MCP server",
+        )
+
+    def test_spawn_resets_handled_set(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A new spawn re-arms confirmations: the set is cleared.
+        새 spawn 시 _handled_confirmations 초기화 — 자동 승인 재무장.
+        """
+        wrapper._handled_confirmations.add("I am using this for local development")
+        # _spawn_child calls pexpect.spawn — mock it.
+        # _spawn_child가 pexpect.spawn 호출 — mock.
+        fake_child = MagicMock()
+        fake_child.fileno.return_value = 1
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.pexpect.spawn",
+            lambda *a, **k: fake_child,
+        )
+
+        wrapper._spawn_child()
+
+        assert wrapper._handled_confirmations == set()
 
 

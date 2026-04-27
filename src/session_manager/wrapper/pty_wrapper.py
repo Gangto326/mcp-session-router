@@ -62,6 +62,21 @@ INVERSE_VIDEO_START = b"\x1b[7m"
 OUTPUT_BUFFER_CAP = 16 * 1024
 OUTPUT_BUFFER_TAIL_KEEP = 256
 
+# Confirmation prompts that ccode auto-accepts on every spawn.
+#
+# All three default to option 1 in Claude Code, so a single \r is enough.
+# Patterns must be unique enough that they only match the prompt screen,
+# not normal LLM output.
+#
+# ccode가 매 spawn 마다 자동 승인하는 confirmation prompt 텍스트.
+# 셋 다 default가 1번이라 \r 한 번으로 OK. 일반 LLM 출력에는 잘 나오지
+# 않을 만큼 고유한 문자열로 골랐다.
+AUTO_CONFIRM_PATTERNS: tuple[str, ...] = (
+    "I am using this for local development",  # channels dev 경고
+    "Use this and all future MCP servers",  # MCP server 등록, 옵션 1
+    "Use this MCP server",  # MCP server 등록, 옵션 2 (1번과 별도 매칭)
+)
+
 Mode = Literal["passthrough", "filtering"]
 
 
@@ -146,6 +161,12 @@ class SessionManagerWrapper:
         self._pending_action: _PendingAction | None = None
         self._intercept_state: _InterceptState | None = None
 
+        # Confirmation patterns already auto-accepted in the current child.
+        # Reset on each spawn so a respawned child re-arms the auto-accept.
+        # 현재 자식에서 이미 자동 승인한 confirmation 패턴.
+        # 새 자식이 spawn될 때마다 초기화해 자동 승인을 재무장.
+        self._handled_confirmations: set[str] = set()
+
         # Initial current_session_name handed back during the MCP handshake,
         # decided from CLI args:
         # - `--resume foo` → "foo"
@@ -199,6 +220,9 @@ class SessionManagerWrapper:
         # 자식별 감지 상태 초기화 — 이전 세션의 잔여 바이트가 새 자식의
         # 첫 프롬프트 감지를 오염시키지 않도록.
         self.output_buffer = b""
+        # Re-arm confirmation auto-accept for the new child.
+        # 새 자식에 대해 confirmation 자동 승인 재무장.
+        self._handled_confirmations = set()
 
     def _should_respawn_for_new(self) -> bool:
         """
@@ -275,6 +299,13 @@ class SessionManagerWrapper:
         # mode 와 무관하게 모든 chunk를 가상 화면에 반영 — 입력란 추출이
         # 항상 최신 상태에서 가능하도록.
         self.virtual_screen.feed(chunk)
+
+        # Auto-accept any confirmation prompts that just appeared in the
+        # virtual screen (channels dev warning, MCP server registration).
+        # Each pattern is processed at most once per child.
+        # 가상 화면에 새로 등장한 confirmation prompt 자동 승인 (channels
+        # dev 경고, MCP server 등록). 자식별로 패턴당 최대 1회 처리.
+        self._auto_accept_confirmations()
 
         self.output_buffer += chunk
         if self._detect_prompt(self.output_buffer):
@@ -386,6 +417,24 @@ class SessionManagerWrapper:
 
     def _inject_text(self, text: str) -> None:
         os.write(self.pty_fd, text.encode("utf-8"))
+
+    def _auto_accept_confirmations(self) -> None:
+        """Send \\r whenever a known confirmation prompt appears on screen.
+
+        가상 화면에 알려진 confirmation prompt 텍스트가 나타나면 \\r 주입.
+        모든 prompt의 default가 1번이라 단순 Enter로 승인된다. 한 번 처리한
+        패턴은 ``_handled_confirmations``에 기록해 같은 자식에서 다시 매칭
+        되지 않는다.
+        """
+        for pattern in AUTO_CONFIRM_PATTERNS:
+            if pattern in self._handled_confirmations:
+                continue
+            if self.virtual_screen.contains(pattern):
+                try:
+                    os.write(self.pty_fd, b"\r")
+                except OSError:
+                    return
+                self._handled_confirmations.add(pattern)
 
     def _submit(self) -> None:
         """Send a standalone \\r so Ink recognises it as Return.

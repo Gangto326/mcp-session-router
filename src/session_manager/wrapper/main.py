@@ -24,6 +24,18 @@ from session_manager.wrapper.pty_wrapper import SessionManagerWrapper
 
 SOCKET_ENV_VAR = "SESSION_MANAGER_SOCKET"
 
+# The MCP server entry name as registered with `claude mcp add session-manager`.
+# `claude mcp add session-manager`로 등록한 MCP 서버 이름.
+_CHANNEL_SERVER_NAME = "session-manager"
+
+# Slash-command interception relies on the experimental claude/channel
+# capability. Until the session-manager server is on Anthropic's official
+# channel allowlist, the development flag is required to register it.
+# 슬래시 명령 가로채기는 experimental claude/channel capability에 의존.
+# session-manager가 Anthropic 공식 channel allowlist에 등재되기 전까지는
+# development 플래그로 등록해야 한다.
+_CHANNELS_DEV_FLAG = "--dangerously-load-development-channels"
+
 
 def _resolve_socket_path(project_path: str) -> str:
     # Short hash keeps the path well under the AF_UNIX 108-byte limit while
@@ -32,6 +44,21 @@ def _resolve_socket_path(project_path: str) -> str:
     # 경로 제한을 여유 있게 지킨다.
     project_hash = hashlib.md5(project_path.encode("utf-8")).hexdigest()[:12]
     return f"/tmp/session-manager-{project_hash}.sock"
+
+
+def _ensure_channels_flag(args: list[str]) -> list[str]:
+    """Prepend the channels development flag when the user hasn't set one.
+
+    사용자가 channels 관련 플래그를 직접 주지 않았으면 development 플래그를
+    앞에 추가한다. 사용자가 ``--channels`` (production allowlist) 또는
+    ``--dangerously-load-development-channels``을 직접 주면 그대로 둔다.
+    """
+    for arg in args:
+        if arg == "--channels" or arg.startswith("--channels="):
+            return list(args)
+        if arg == _CHANNELS_DEV_FLAG or arg.startswith(_CHANNELS_DEV_FLAG + "="):
+            return list(args)
+    return [_CHANNELS_DEV_FLAG, f"server:{_CHANNEL_SERVER_NAME}", *args]
 
 
 def main() -> int:
@@ -44,9 +71,11 @@ def main() -> int:
     # 다시 connect 할 수 있도록 노출.
     os.environ[SOCKET_ENV_VAR] = socket_path
 
+    claude_args = _ensure_channels_flag(sys.argv[1:])
+
     wrapper = SessionManagerWrapper(
         socket_path=socket_path,
-        claude_args=sys.argv[1:],
+        claude_args=claude_args,
         project_path=project_path,
     )
     wrapper.start()

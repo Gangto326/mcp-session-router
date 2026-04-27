@@ -108,3 +108,22 @@ def test_partial_redraw_pattern():
     # 부분 갱신: \r로 col 0 복귀, \x1b[2K로 라인 클리어, 더 긴 텍스트 재기록.
     s.feed(b"\r\x1b[2K" + PROMPT_MARKER.encode() + b" /help")
     assert s.get_prompt_line() == "/help"
+
+
+def test_contains_finds_text_in_any_row():
+    """contains() matches a substring across any row.
+    contains()는 어느 행에서든 부분 문자열을 찾으면 True.
+    """
+    s = VirtualScreen(80, 24)
+    s.feed(b"first row\r\nsecond row with target\r\nthird row")
+    assert s.contains("target") is True
+    assert s.contains("first row") is True
+    assert s.contains("nonexistent") is False
+
+
+def test_contains_returns_false_on_empty():
+    """contains() on an empty screen returns False.
+    빈 화면에서 contains()는 False.
+    """
+    s = VirtualScreen(80, 24)
+    assert s.contains("anything") is False
