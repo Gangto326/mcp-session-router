@@ -14,6 +14,8 @@ import pytest
 
 from session_manager.wrapper.pty_wrapper import (
     AUTO_CONFIRM_PATTERNS,
+    CTRL_C,
+    INTERCEPT_TIMEOUT_SEC,
     INVERSE_VIDEO_START,
     OUTPUT_BUFFER_CAP,
     OUTPUT_BUFFER_TAIL_KEEP,
@@ -689,6 +691,175 @@ class TestStdinSubmitInterception:
 
         assert wrapper.mode == "passthrough"
         assert wrapper._intercept_state is None
+
+
+class TestInterceptTimeoutAndCancel:
+    """Timeout (15s) and Ctrl+C cancellation of an active interception.
+    가로채기 timeout (15초) 및 Ctrl+C 취소.
+    """
+
+    def test_start_intercept_sets_deadline(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """_start_intercept set a deadline INTERCEPT_TIMEOUT_SEC ahead.
+        _start_intercept가 INTERCEPT_TIMEOUT_SEC 후로 deadline 설정.
+        """
+        from session_manager.wrapper.command_matcher import InterceptedCommand
+
+        # Freeze time at a known value
+        # 시간 고정
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.time.monotonic",
+            lambda: 1000.0,
+        )
+        monkeypatch.setattr(
+            wrapper.socket_server, "send", lambda msg: True
+        )
+
+        wrapper._start_intercept(InterceptedCommand("resume", "foo"))
+
+        assert wrapper._intercept_state is not None
+        assert wrapper._intercept_state.deadline == 1000.0 + INTERCEPT_TIMEOUT_SEC
+
+    def test_check_timeout_no_op_when_inactive(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_check_intercept_timeout no-op when no intercept active.
+        가로채기 비활성 시 _check_intercept_timeout은 no-op.
+        """
+        wrapper._intercept_state = None
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+
+        wrapper._check_intercept_timeout()
+        assert writes == []
+
+    def test_check_timeout_no_op_before_deadline(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Before deadline, _check_intercept_timeout does nothing.
+        deadline 전에는 _check_intercept_timeout이 아무것도 안 함.
+        """
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.time.monotonic",
+            lambda: 100.0,
+        )
+        wrapper._intercept_state = _InterceptState(
+            command="resume", args="foo", deadline=200.0
+        )
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+
+        wrapper._check_intercept_timeout()
+
+        assert writes == []
+        assert wrapper._intercept_state is not None  # 그대로 활성
+
+    def test_check_timeout_forwards_cr_after_deadline(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After deadline: state cleared, notice on stdout, \\r forwarded to PTY.
+        deadline 이후: state 정리, stdout 안내, PTY로 \\r forward.
+        """
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.time.monotonic",
+            lambda: 300.0,
+        )
+        wrapper._intercept_state = _InterceptState(
+            command="resume", args="foo", deadline=200.0
+        )
+        wrapper.pty_fd = 1
+        wrapper._stdout_fd = 2
+        writes: list[tuple[int, bytes]] = []
+        monkeypatch.setattr(
+            "os.write",
+            lambda fd, data: writes.append((fd, data)) or len(data),
+        )
+
+        wrapper._check_intercept_timeout()
+
+        assert wrapper._intercept_state is None
+        # stdout과 pty 모두 write 발생
+        fds_written = [fd for fd, _ in writes]
+        assert wrapper._stdout_fd in fds_written
+        assert wrapper.pty_fd in fds_written
+        # stdout에는 안내 메시지, pty에는 \r
+        stdout_data = b"".join(d for fd, d in writes if fd == wrapper._stdout_fd)
+        pty_data = b"".join(d for fd, d in writes if fd == wrapper.pty_fd)
+        assert b"timeout" in stdout_data
+        assert pty_data == b"\r"
+
+    def test_ctrl_c_during_intercept_cancels(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl+C (b\"\\x03\") while intercepting: state cleared, \\x03 forwarded.
+        가로채기 중 Ctrl+C: state 정리, PTY로 \\x03 forward (보관 \\r은 폐기).
+        """
+        wrapper._intercept_state = _InterceptState(
+            command="resume", args="foo", deadline=999.0
+        )
+        wrapper.pty_fd = 1
+        writes: list[bytes] = []
+        monkeypatch.setattr("os.read", lambda fd, n: CTRL_C)
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper._stdin_fd = 0
+
+        wrapper._handle_stdin_readable()
+
+        assert wrapper._intercept_state is None
+        assert writes == [CTRL_C]
+        # \r은 forward되지 않음 — 명령 실행 X
+        assert b"\r" not in writes
+
+    def test_non_ctrl_c_during_intercept_dropped(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regular keys during intercept are dropped (state stays active).
+        가로채기 중 일반 키는 drop (state 그대로 활성 유지).
+        """
+        wrapper._intercept_state = _InterceptState(
+            command="resume", args="foo", deadline=999.0
+        )
+        wrapper.pty_fd = 1
+        writes: list[bytes] = []
+        monkeypatch.setattr("os.read", lambda fd, n: b"hello")
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper._stdin_fd = 0
+
+        wrapper._handle_stdin_readable()
+
+        assert wrapper._intercept_state is not None  # 활성 유지
+        assert writes == []
+
+    def test_cancel_intercept_helper(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_cancel_intercept clears state and forwards Ctrl+C to PTY.
+        _cancel_intercept가 state 정리하고 PTY로 \\x03 forward.
+        """
+        wrapper._intercept_state = _InterceptState(
+            command="exit", args="", deadline=999.0
+        )
+        wrapper.pty_fd = 1
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+
+        wrapper._cancel_intercept()
+
+        assert wrapper._intercept_state is None
+        assert writes == [CTRL_C]
 
 
 class TestAutoAcceptConfirmations:

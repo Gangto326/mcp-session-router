@@ -29,8 +29,9 @@ import select
 import signal
 import sys
 import termios
+import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import pexpect
@@ -77,6 +78,20 @@ AUTO_CONFIRM_PATTERNS: tuple[str, ...] = (
     "Use this MCP server",  # MCP server 등록, 옵션 2 (1번과 별도 매칭)
 )
 
+# Slash-command interception timeout. If the LLM doesn't call session_end
+# within this window, the held \r is forwarded anyway (graceful degradation
+# = same outcome as not intercepting, plus a one-line notice).
+# 슬래시 명령 가로채기 timeout. LLM이 이 시간 안에 session_end를 호출하지
+# 않으면 보관한 \r을 그냥 forward (graceful degradation = 가로채기 안 한
+# 것과 같은 결과 + 한 줄 안내).
+INTERCEPT_TIMEOUT_SEC = 15.0
+
+# Ctrl+C bytes from raw-mode stdin (terminal sends \x03 instead of SIGINT
+# because tty.setraw clears ISIG).
+# raw mode stdin에서 Ctrl+C — tty.setraw가 ISIG를 끄므로 SIGINT 대신
+# \x03 바이트로 옴.
+CTRL_C = b"\x03"
+
 Mode = Literal["passthrough", "filtering"]
 
 
@@ -113,11 +128,14 @@ class _InterceptState:
 
     사용자가 직접 친 슬래시 명령(`/resume`, `/exit` 등)을 가로채고 MCP에서
     session_end 처리가 끝났다는 응답이 오기를 기다리는 상태를 보관한다.
-    응답을 받기 전까지는 filtering 모드로 사용자 입력을 큐잉한다.
+    응답이 늦으면 ``deadline`` 시점에 graceful degradation으로 종료한다.
     """
 
     command: str  # one of KNOWN_COMMANDS
     args: str
+    # time.monotonic() value at which this interception times out.
+    # 가로채기가 timeout되는 time.monotonic() 시각. 0.0이면 미설정.
+    deadline: float = field(default=0.0)
 
 
 class SessionManagerWrapper:
@@ -282,6 +300,13 @@ class SessionManagerWrapper:
             if client_fd >= 0 and client_fd in readable:
                 self.socket_server.handle_client_readable()
 
+            # Time out an active interception if the LLM hasn't responded
+            # within INTERCEPT_TIMEOUT_SEC. select's 100ms tick gives us
+            # ~100ms timeout granularity — accurate enough.
+            # 활성 가로채기가 INTERCEPT_TIMEOUT_SEC 안에 응답 못 받으면
+            # timeout. select 100ms 틱이라 ~100ms 정확도 — 충분.
+            self._check_intercept_timeout()
+
         self._drain_pty()
 
     def _handle_pty_readable(self) -> bool:
@@ -340,12 +365,13 @@ class SessionManagerWrapper:
 
         # During slash-command interception, drop user input — the visible
         # input line stays as-is (we held \r, not the typed text), and the
-        # held \r is forwarded when the MCP responds. Ctrl+C handling is
-        # added in 6-7.
+        # held \r is forwarded when the MCP responds. Ctrl+C is the only
+        # exception: it cancels the command outright.
         # 슬래시 명령 가로채기 중에는 사용자 입력을 drop — 입력란은 그대로
-        # 유지된다 (우리는 \r만 보관하고 텍스트는 이미 PTY로 갔음). MCP
-        # 응답이 오면 보관한 \r을 forward해 명령 실행. Ctrl+C 처리는 6-7.
+        # 유지된다. 단 Ctrl+C는 예외로 처리해 명령 자체를 취소한다.
         if self._intercept_state is not None:
+            if chunk == CTRL_C:
+                self._cancel_intercept()
             return
 
         # Submit detection: Ink's parseKeypress only treats a lone \r as
@@ -378,10 +404,13 @@ class SessionManagerWrapper:
         MCP에 가로채기 신호 송신. 가로채기 중 들어오는 사용자 stdin은
         _handle_stdin_readable에서 drop된다 (입력란은 그대로 유지). MCP 응답
         도착 시 _finish_intercept가 \\r을 forward해 명령을 실행한다.
+        ``deadline`` 시점까지 응답이 없으면 _check_intercept_timeout이
+        graceful degradation으로 종료한다.
         """
         self._intercept_state = _InterceptState(
             command=matched.command,
             args=matched.args,
+            deadline=time.monotonic() + INTERCEPT_TIMEOUT_SEC,
         )
         self.socket_server.send(
             {
@@ -399,6 +428,48 @@ class SessionManagerWrapper:
         가로채기 시점 그대로 (사용자가 친 ``/resume foo`` 등).
         """
         self._intercept_state = None
+        try:
+            os.write(self.pty_fd, b"\r")
+        except OSError:
+            pass
+
+    def _cancel_intercept(self) -> None:
+        """User pressed Ctrl+C during interception: cancel the command.
+
+        사용자가 가로채기 중 Ctrl+C를 누른 경우 — 명령 자체 취소. 보관한 \\r은
+        forward하지 않고 폐기 (명령 실행 안 함). PTY로는 \\x03을 흘려보내
+        Claude Code의 진행 중인 LLM turn (channel 응답 처리 등)을 함께
+        중단시킨다. session_end가 이미 호출 중이었다면 그 호출은 별개로
+        진행될 수 있으나 (race), wrapper는 intercept_done을 수신해도 이미
+        비활성 상태라 무시한다 (6-4의 비활성 시 no-op 동작).
+        """
+        self._intercept_state = None
+        try:
+            os.write(self.pty_fd, CTRL_C)
+        except OSError:
+            pass
+
+    def _check_intercept_timeout(self) -> None:
+        """Time out the active interception if the deadline has passed.
+
+        활성 가로채기가 deadline을 넘기면 graceful degradation으로 종료. 한 줄
+        안내를 stdout에 출력한 뒤 보관한 \\r을 forward해 명령은 실행되도록
+        한다. summary 갱신은 누락된 채로 남는다 (옵션 E와 동일 결과).
+        """
+        state = self._intercept_state
+        if state is None:
+            return
+        if time.monotonic() < state.deadline:
+            return
+        self._intercept_state = None
+        try:
+            os.write(
+                self._stdout_fd,
+                b"\r\n[session-manager] timeout - command forwarded "
+                b"without summary update\r\n",
+            )
+        except OSError:
+            pass
         try:
             os.write(self.pty_fd, b"\r")
         except OSError:
