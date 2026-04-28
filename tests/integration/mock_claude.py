@@ -29,9 +29,28 @@ import tty
 # 실제 Claude Code가 입력 프롬프트에 쓰는 바이트와 동일.
 PROMPT = b"\xe2\x9d\xaf \x1b[7m \x1b[27m"
 
+# Prefix and suffix for the input line: ❯ + space, then inverse cursor.
+# 입력 줄의 prefix/suffix — ❯ + 공백, 그리고 inverse cursor.
+PROMPT_PREFIX = b"\xe2\x9d\xaf "
+PROMPT_SUFFIX = b"\x1b[7m \x1b[27m"
+
 
 def _write(data: bytes) -> None:
     os.write(1, data)
+
+
+def _render_input_line(line_buf: bytes) -> None:
+    """Redraw the prompt with the current line buffer between marker and cursor.
+
+    현재 입력 버퍼를 ❯ 마커와 cursor 사이에 다시 그린다. \\x1b[1G로 cursor를
+    col 1로 옮기고 \\x1b[2K로 라인을 비운 뒤 prompt + 입력 텍스트 + cursor를
+    새로 출력한다 — Ink가 매 키 입력마다 입력란을 redraw하는 동작과 동일.
+
+    \\r 대신 \\x1b[1G를 사용하는 이유: PTY의 OPOST가 \\r을 \\r\\n으로 변환해
+    cursor가 다음 줄로 가버리는 문제 회피. 절대 cursor 이동 ANSI 시퀀스는
+    OPOST 변환에 영향받지 않음.
+    """
+    _write(b"\x1b[1G\x1b[2K" + PROMPT_PREFIX + line_buf + PROMPT_SUFFIX)
 
 
 def _process_command(cmd: str) -> bool:
@@ -72,7 +91,7 @@ def main() -> None:
     else:
         old_attrs = None
 
-    _write(PROMPT)
+    _render_input_line(b"")
     line_buf = b""
 
     while True:
@@ -93,12 +112,12 @@ def main() -> None:
                         termios.tcsetattr(0, termios.TCSADRAIN, old_attrs)
                     return
                 line_buf = b""
-                _write(PROMPT)
+                _render_input_line(b"")
             else:
                 line_buf += ch
-                # Re-render prompt after every keystroke (like Ink)
-                # Ink처럼 매 키 입력마다 프롬프트 재렌더링
-                _write(PROMPT)
+                # Re-render prompt with current input after every keystroke
+                # 매 키 입력마다 현재 입력 텍스트와 함께 프롬프트 재렌더링
+                _render_input_line(line_buf)
 
 
 if __name__ == "__main__":
