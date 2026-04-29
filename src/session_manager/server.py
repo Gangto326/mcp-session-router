@@ -273,18 +273,37 @@ _SERVER_INSTRUCTIONS = """\
 You manage multiple conversation sessions within a single Claude Code process.
 
 ## Context Switch Detection
-When the user's message concerns a different topic/code area from the current \
-session, spawn a sub-agent with this prompt:
-  "User prompt: '{prompt}'. Current session: {name}. \
-Call check_session to get the session list. Compare each summary against \
-the prompt. Respond as ACTION:SESSION_NAME:REASON. \
-ACTION = STAY | SWITCH | NEW | ASK_USER."
+When the user's message could shift topic, code area, file/directory scope, \
+or domain from the current session, spawn a sub-agent with this prompt:
+  "User prompt: '{prompt}'. Current session: {name}.
+
+  Call check_session to get all sessions and their summaries.
+
+  Decision rules (apply in order):
+  - If exactly one session matches → SWITCH:that_name
+  - If multiple sessions plausibly match → ASK_USER (list candidates)
+  - If the current session matches and others don't → STAY
+  - If NO session matches OR all summaries are null/missing → NEW
+  - A default-named session with null summary represents an unclaimed \
+  conversation; treat it as no match unless the prompt is a literal \
+  continuation of the current turn.
+
+  Prefer SWITCH or NEW over STAY when in doubt — keeping each session \
+  focused is cheaper than a polluted multi-topic session.
+
+  Respond as exactly: ACTION:SESSION_NAME:REASON
+  ACTION = STAY | SWITCH | NEW | ASK_USER"
 Then:
 - STAY: process normally.
 - SWITCH: confirm with user, then switch.
 - NEW: confirm with user, then create a new session.
 - ASK_USER: present candidates and let user choose.
-If context clearly matches the current session, skip the sub-agent.
+
+**Why dispatch eagerly**: a sub-agent call costs ~1-2s and a few hundred \
+tokens. A polluted single session costs much more — longer context every \
+turn, degraded answers, and far more total tokens over time. Skip the \
+sub-agent ONLY when the message is an obvious follow-up to the immediately \
+previous turn within the same session.
 
 ## Handoff Block
 When input contains [handoff]...[/handoff]:
@@ -335,11 +354,43 @@ def _get_app_ctx(ctx: Context) -> AppContext:
 
 @mcp_server.tool()
 def check_session(ctx: Context) -> dict:
-    """
-    Return the current session and a list of all registered sessions.
+    """Return all registered sessions so you can route the user message to the right one.
 
-    현재 세션 이름과 등록된 전체 세션 목록을 반환한다.
-    서브 에이전트가 사용자의 메시지를 어느 세션으로 보낼지 판단할 때 사용한다.
+    **Call this tool BEFORE responding to any user message** that could shift
+    the topic, code area, file/directory scope, or domain from the current
+    session. The returned summaries let you decide:
+
+    - STAY in the current session (topic clearly matches)
+    - SWITCH to a different existing session (topic matches another one)
+    - CREATE a new session via session_create (topic matches none)
+
+    **Trigger conditions — call this when ANY apply**:
+    - User mentions a different file path, directory, component, or domain
+    - User shifts from one area (e.g. frontend) to another (e.g. backend)
+    - User starts a topic the current conversation does not naturally cover
+    - You are uncertain which session this message belongs to
+
+    Skip ONLY when the message is a direct continuation of the immediately
+    previous turn AND clearly within the current session's scope.
+
+    **Why route proactively** — the cost of running a sub-agent (one extra
+    call, 1-2 seconds, a few hundred tokens) is **much smaller** than the
+    cost of answering multi-topic questions inside a polluted single session
+    (longer context window every turn, degraded answer quality, far more
+    total tokens spent over many turns). Switching sessions early keeps each
+    session's context focused — better answers, fewer total tokens, easier
+    to resume later. **When in doubt, prefer SWITCH or NEW over STAY.**
+
+    현재 세션과 등록된 전체 세션 목록을 반환한다. 사용자 메시지가 현재 세션의
+    주제·코드 영역·파일/디렉토리 범위·도메인과 조금이라도 다를 가능성이 있으면
+    응답 전에 먼저 이 도구를 호출해 어느 세션에서 처리할지 판단한다.
+
+    **적극적으로 호출해야 이득인 이유**:
+    서브 에이전트 1회 호출 (1-2초, 수백 토큰)의 비용은 한 세션에 여러 주제가
+    누적되어 컨텍스트가 오염될 때의 손실 (긴 context window, 답변 품질 저하,
+    누적 토큰 폭증) 보다 훨씬 작다. 세션을 빨리 분리하면 각 세션이 초점을
+    유지해 답변 품질이 올라가고 총 토큰 소비가 줄며 나중에 복귀하기도 쉽다.
+    의심스러우면 STAY 보다 SWITCH/NEW 를 선호한다.
     """
     app = _get_app_ctx(ctx)
     sessions = app.session_store.list_sessions()
