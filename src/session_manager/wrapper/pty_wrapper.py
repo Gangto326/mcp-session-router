@@ -32,6 +32,7 @@ import termios
 import time
 import tty
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 import pexpect
@@ -86,6 +87,15 @@ AUTO_CONFIRM_PATTERNS: tuple[str, ...] = (
 # 것과 같은 결과 + 한 줄 안내).
 INTERCEPT_TIMEOUT_SEC = 15.0
 
+# AGENT_GUIDE.md sits in the package root (one level above wrapper/). The
+# wrapper @-attaches this manual on session start so the LLM gets the full
+# operational rules in conversation history without relying on initialize
+# instructions (which have a 2KB cap).
+# AGENT_GUIDE.md는 패키지 루트에 위치. wrapper가 세션 시작 시 @-attachment로
+# 주입해, 2KB 제한이 있는 initialize instructions에 의존하지 않고 운영 매뉴얼
+# 전체를 LLM 컨텍스트에 박는다.
+AGENT_GUIDE_PATH = (Path(__file__).parent.parent / "AGENT_GUIDE.md").resolve()
+
 # Ctrl+C bytes from raw-mode stdin (terminal sends \x03 instead of SIGINT
 # because tty.setraw clears ISIG).
 # raw mode stdin에서 Ctrl+C — tty.setraw가 ISIG를 끄므로 SIGINT 대신
@@ -100,6 +110,18 @@ def _safe_fileno(stream: Any) -> int:
         return stream.fileno()
     except (OSError, AttributeError, ValueError):
         return -1
+
+
+def _debug_log(msg: str) -> None:
+    """No-op stub. Used during AGENT_GUIDE rollout for diagnostics; left
+    in place so call sites in this module remain valid. Re-enable by
+    restoring the file-write body if you need to trace stage transitions
+    or chunk flow again.
+
+    AGENT_GUIDE 검증용 디버그 로그였으나 비활성화. 호출 사이트는 그대로
+    남겨 두었으므로, 추적이 다시 필요하면 본문만 복원하면 된다.
+    """
+    return
 
 
 @dataclass
@@ -185,6 +207,38 @@ class SessionManagerWrapper:
         # 새 자식이 spawn될 때마다 초기화해 자동 승인을 재무장.
         self._handled_confirmations: set[str] = set()
 
+        # AGENT_GUIDE.md injection stage machine. (Re)set inside _spawn_child
+        # based on whether the new child receives a fresh conversation.
+        # Stages must be split across separate prompt-detect cycles because
+        # injecting text and sending \r in the same cycle looks like a paste
+        # to Ink's TextInput, and Ink treats paste \r as a newline (no submit).
+        # AGENT_GUIDE 주입 stage 머신. _spawn_child에서 갱신.
+        # inject와 \r submit을 같은 prompt-detect 사이클에 보내면 Ink가 paste로
+        # 인식해 \r을 줄바꿈으로 처리(submit 안 됨)하므로, prompt-detect 사이클
+        # 사이에 분리 — SWITCH/NEW의 stage 패턴과 동일.
+        self._agent_guide_stage: Literal[
+            "needed", "injected", "submitted", "done"
+        ] = "done"
+
+        # time.monotonic() of the most recent auto-accept fire. Used by the
+        # AGENT_GUIDE inject guard to wait a brief cooldown after a
+        # confirmation gets accepted, so Claude Code has time to redraw
+        # the screen without the confirmation menu before we inject.
+        # 마지막 auto-accept 발동 시각. AGENT_GUIDE inject 가드가 자동 승인
+        # 직후의 redraw race를 피하기 위해 짧은 cooldown 대기에 사용.
+        self._last_auto_accept_at: float = 0.0
+
+        # Tracking for the AGENT_GUIDE submitted -> done transition. We
+        # don't want to drop filtering until the LLM has actually finished
+        # replying — detected as ❯ disappearing (thinking starts) then
+        # reappearing (new input field). Falls back to a hard timeout if
+        # neither transition lands.
+        # AGENT_GUIDE submitted → done 전환 추적. LLM 응답 종료 전에 filtering
+        # 풀리면 응답이 사용자 화면에 노출되므로, ❯ 사라짐→재등장 transition을
+        # 기다린다. 30초 hard timeout으로 stuck 방지.
+        self._seen_pointer_clear: bool = False
+        self._submitted_at: float = 0.0
+
         # Initial current_session_name handed back during the MCP handshake,
         # decided from CLI args:
         # - `--resume foo` → "foo"
@@ -226,6 +280,19 @@ class SessionManagerWrapper:
             self.socket_server.stop()
 
     def _spawn_child(self) -> None:
+        # Detect a NEW-flow respawn before spawning so we know whether the
+        # incoming child receives a brand-new conversation that needs a
+        # fresh AGENT_GUIDE injection. (For SWITCH the conversation is
+        # reused via /resume, so the prior manual stays in scope.)
+        # spawn 전에 NEW 재spawn 여부를 미리 판별. NEW면 새 conversation이라
+        # 매뉴얼 재주입이 필요. SWITCH는 /resume으로 같은 conversation을
+        # 재사용하므로 기존 매뉴얼이 유지된다.
+        is_new_respawn = (
+            self._pending_action is not None
+            and self._pending_action.action_type == "new"
+            and self._pending_action.stage == "await_handshake"
+        )
+
         self.child = pexpect.spawn(
             "claude",
             self.claude_args,
@@ -241,6 +308,32 @@ class SessionManagerWrapper:
         # Re-arm confirmation auto-accept for the new child.
         # 새 자식에 대해 confirmation 자동 승인 재무장.
         self._handled_confirmations = set()
+
+        # Decide whether to inject AGENT_GUIDE on this child's first prompt:
+        # - NEW respawn → inject (fresh conversation, no manual yet).
+        # - --resume <name> → skip (existing conversation already carries the
+        #   manual from the previous start).
+        # - fresh start (no --resume) → inject.
+        # NOTE: --continue is not detected here, so it currently re-injects
+        # the manual every time. Documented limitation; can be tightened
+        # later by extending _parse_initial_session_name.
+        # AGENT_GUIDE inject 여부 결정. NEW 재spawn / fresh start면 inject,
+        # --resume이면 기존 conversation에 이미 박혀 있어 skip.
+        # --continue는 별도 감지 안 해 매번 재주입됨 (알려진 limitation).
+        if is_new_respawn:
+            self._agent_guide_stage = "needed"
+        elif self._initial_session_name is not None:
+            # --resume — existing conversation already has the manual.
+            self._agent_guide_stage = "done"
+        else:
+            self._agent_guide_stage = "needed"
+        self._seen_pointer_clear = False
+        self._submitted_at = 0.0
+        _debug_log(
+            f"spawn: is_new_respawn={is_new_respawn}, "
+            f"initial_session={self._initial_session_name!r}, "
+            f"agent_guide_stage={self._agent_guide_stage}"
+        )
 
     def _should_respawn_for_new(self) -> bool:
         """
@@ -332,16 +425,42 @@ class SessionManagerWrapper:
         # dev 경고, MCP server 등록). 자식별로 패턴당 최대 1회 처리.
         self._auto_accept_confirmations()
 
+        # Track ❯ disappearance during the AGENT_GUIDE submitted stage so
+        # we can tell when the LLM's reply is actually complete (❯ then
+        # reappears). Without this, mode=passthrough flips before the LLM
+        # even starts thinking and the reply leaks to the user's screen.
+        # AGENT_GUIDE submitted 단계에서 ❯ 사라짐 추적 — LLM 응답 종료 시점
+        # (❯ 재등장) 감지에 사용.
+        if (
+            self._agent_guide_stage == "submitted"
+            and PROMPT_POINTER not in chunk
+        ):
+            self._seen_pointer_clear = True
+
         self.output_buffer += chunk
-        if self._detect_prompt(self.output_buffer):
-            # Clear after a successful detection so the same prompt isn't
-            # matched again as more output trickles in.
-            # 감지 직후 버퍼를 비워, 같은 프롬프트가 후속 chunk에서 다시
-            # 매칭되는 것을 막는다.
-            self.output_buffer = b""
+        detected = self._detect_prompt(self.output_buffer)
+        # TEMP diagnostic: trace every PTY chunk so we can see whether (a)
+        # chunks stop arriving during the gap, or (b) chunks arrive but
+        # _detect_prompt fails to match. Remove after root cause is found.
+        # 임시 진단 — 매 PTY chunk를 로그해 (a) gap 동안 chunk가 끊기는지,
+        # (b) chunk는 오는데 _detect_prompt가 못 잡는지 가린다.
+        _debug_log(
+            f"pty-chunk: len={len(chunk)} "
+            f"chunk_has_pointer={PROMPT_POINTER in chunk} "
+            f"chunk_has_inverse={INVERSE_VIDEO_START in chunk} "
+            f"buffer_len={len(self.output_buffer)} "
+            f"buffer_has_pointer={PROMPT_POINTER in self.output_buffer} "
+            f"buffer_has_inverse={INVERSE_VIDEO_START in self.output_buffer} "
+            f"detected={detected}"
+        )
+        if detected:
+            # The handler decides whether to clear the buffer (it knows
+            # which stage we're in). After this call we just truncate to
+            # keep size bounded.
+            # handler가 stage를 알고 있으므로 buffer 비우기 결정도 handler에
+            # 위임. 호출 후엔 size cap만 보장.
             self._handle_prompt_detected()
-        else:
-            self._truncate_output_buffer()
+        self._truncate_output_buffer()
 
         if self.mode == "passthrough":
             os.write(self._stdout_fd, chunk)
@@ -482,12 +601,15 @@ class SessionManagerWrapper:
         idx = buffer.rfind(PROMPT_POINTER)
         if idx == -1:
             return False
-        # Only count an inverse-video sequence in a small window after the
-        # pointer; a stale "❯" elsewhere in the buffer must not match.
-        #
-        # 표지자 직후 좁은 윈도우 안의 반전 시퀀스만 인정. 버퍼 다른 위치에
-        # 남아 있는 오래된 "❯"가 잘못 매칭되지 않도록 함.
-        return INVERSE_VIDEO_START in buffer[idx : idx + 64]
+        # Look for an inverse-video sequence anywhere after the latest ❯.
+        # Ink's input field can wrap across multiple lines (especially after
+        # we inject a long @-attachment), putting the cursor's inverse far
+        # from the pointer. rfind() already pinned us to the latest ❯ so
+        # earlier stale pointers can't compete.
+        # 마지막 ❯ 이후 영역 전체에서 inverse 검색. 입력란이 multi-line wrap
+        # 되면 cursor inverse가 ❯에서 멀리 있을 수 있어 좁은 64-byte 윈도우는
+        # 누락. rfind()로 마지막 ❯ 위치를 잡으니 stale ❯과는 경합 없음.
+        return INVERSE_VIDEO_START in buffer[idx:]
 
     def _inject_text(self, text: str) -> None:
         os.write(self.pty_fd, text.encode("utf-8"))
@@ -504,11 +626,13 @@ class SessionManagerWrapper:
             if pattern in self._handled_confirmations:
                 continue
             if self.virtual_screen.contains(pattern):
+                _debug_log(f"auto-accept: detected '{pattern}', sending \\r")
                 try:
                     os.write(self.pty_fd, b"\r")
                 except OSError:
                     return
                 self._handled_confirmations.add(pattern)
+                self._last_auto_accept_at = time.monotonic()
 
     def _submit(self) -> None:
         """Send a standalone \\r so Ink recognises it as Return.
@@ -521,12 +645,135 @@ class SessionManagerWrapper:
     # 확장 지점 -------------------------------------------------------------------
 
     def _handle_prompt_detected(self) -> None:
+        """Process a detected prompt and decide whether to clear the buffer.
+
+        Buffer-clearing rules (in-handler so the stage machine drives them):
+        - stage=needed held (cooldown / unhandled confirmation): keep buffer
+          so the next chunk can re-trigger this stage.
+        - stage=needed advanced to injected: keep buffer so the next chunk
+          re-fires detect=True for the injected→submit step (Ink may not
+          redraw ❯ after we append text — partial redraw only).
+        - stage=injected after submit: clear buffer; we now wait for a brand
+          new ❯ that arrives after the LLM finishes its reply.
+        - stage=submitted/done: clear buffer.
+        - pending SWITCH/NEW step: clear buffer; those stage machines also
+          want a brand new ❯ for their next step.
+
+        Buffer 비우기 규칙은 stage 머신이 결정. needed→injected advance 후엔
+        buffer를 유지해야 partial redraw 환경(❯이 chunk에 새로 안 들어옴)에서
+        다음 stage가 발동된다.
+        """
+        if self._agent_guide_stage == "needed":
+            cooldown_remaining = (
+                self._last_auto_accept_at + 0.5 - time.monotonic()
+            )
+            if self._last_auto_accept_at > 0.0 and cooldown_remaining > 0:
+                _debug_log(
+                    f"prompt-detect: auto-accept cooldown "
+                    f"({cooldown_remaining:.3f}s left), holding inject"
+                )
+                return  # keep buffer
+
+            for pattern in AUTO_CONFIRM_PATTERNS:
+                if pattern in self._handled_confirmations:
+                    continue
+                if self.virtual_screen.contains(pattern):
+                    screen_dump = "|".join(self.virtual_screen._safe_display())
+                    _debug_log(
+                        f"prompt-detect: unhandled confirmation '{pattern}' "
+                        f"on screen, holding AGENT_GUIDE inject. "
+                        f"screen[:300]={screen_dump[:300]!r}"
+                    )
+                    return  # keep buffer
+
+            _debug_log(
+                f"prompt-detect: stage=needed -> injecting AGENT_GUIDE "
+                f"(handled_confirmations={sorted(self._handled_confirmations)})"
+            )
+            self.mode = "filtering"
+            # Short, directive bootstrap text. The single-line reply
+            # signals to the user that the wrapper + MCP layer have
+            # finished initialising and the manual is in scope.
+            # 짧고 지시적인 부트스트랩. 한 줄 응답이 사용자에게 wrapper + MCP
+            # layer 초기화 완료 + 매뉴얼 적용 시작을 알리는 신호.
+            self._inject_text(
+                f"@{AGENT_GUIDE_PATH} System bootstrap. "
+                f"Reply with exactly: \"MCP session-manager ready\""
+            )
+            self._agent_guide_stage = "injected"
+            # Keep buffer: Ink's partial redraw won't re-emit ❯, so we need
+            # the existing pointer in the buffer for the next chunk to
+            # re-trigger detect=True for the injected→submit step.
+            return
+
+        if self._agent_guide_stage == "injected":
+            _debug_log("prompt-detect: stage=injected -> submitting \\r")
+            self._submit()
+            self._agent_guide_stage = "submitted"
+            self._submitted_at = time.monotonic()
+            self._seen_pointer_clear = False
+            self.output_buffer = b""  # wait for LLM-reply-after-submit
+            return
+
+        if self._agent_guide_stage == "submitted":
+            # Hold filtering until the LLM has actually finished replying.
+            # Two stacked guards:
+            #   (1) Minimum wait — even if `_seen_pointer_clear` flips True
+            #       on the very next chunk, that chunk may just be a
+            #       partial redraw that happens not to contain ❯ rather
+            #       than a real "thinking-started" signal. A short wait
+            #       lets the LLM's brief reply complete first.
+            #   (2) Pointer-clear transition — once minimum wait has
+            #       elapsed, only drop filtering after we've actually seen
+            #       ❯ disappear (LLM thinking) AND now reappear (this
+            #       detect=True call = new input field).
+            # 30s hard timeout backstops both guards.
+            #
+            # filtering을 LLM 응답 종료까지 유지. 두 단계 가드:
+            #   (1) Minimum wait — submit 직후 들어온 chunk가 partial
+            #       redraw일 수 있어 너무 빨리 _seen_pointer_clear가 True가
+            #       되는 false-positive 방지.
+            #   (2) Pointer-clear transition — minimum wait가 지난 뒤에는
+            #       ❯이 실제로 사라졌다 다시 등장한 시점에만 done.
+            # 30초 hard timeout이 두 가드 모두를 백스톱.
+            elapsed = time.monotonic() - self._submitted_at
+            if elapsed < 2.0:
+                _debug_log(
+                    f"prompt-detect: stage=submitted, minimum wait "
+                    f"({elapsed:.1f}s/2.0s), holding filtering"
+                )
+                return  # buffer keep
+            if not self._seen_pointer_clear and elapsed < 30.0:
+                _debug_log(
+                    f"prompt-detect: stage=submitted, ❯ not yet cleared "
+                    f"({elapsed:.1f}s elapsed), holding filtering"
+                )
+                return  # buffer keep
+            _debug_log(
+                f"prompt-detect: stage=submitted -> done "
+                f"(seen_clear={self._seen_pointer_clear}, "
+                f"elapsed={elapsed:.1f}s)"
+            )
+            self._agent_guide_stage = "done"
+            if self._pending_action is None:
+                self.mode = "passthrough"
+                self._drain_input_queue()
+            self.output_buffer = b""
+            # fall through to pending-action processing
+
         pending = self._pending_action
         if pending is not None:
             if pending.action_type == "switch":
                 self._advance_switch(pending)
             elif pending.action_type == "new":
                 self._advance_new(pending)
+            self.output_buffer = b""  # SWITCH/NEW stages await the next ❯
+            return
+
+        # stage=done, no pending action — clear so we don't keep matching
+        # the same ❯ on every chunk.
+        # done 상태에서 pending 없으면 같은 ❯에 매번 매칭되지 않게 비움.
+        self.output_buffer = b""
 
     def _handle_user_line(self, line: bytes) -> None:
         return
