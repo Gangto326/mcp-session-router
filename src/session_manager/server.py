@@ -89,6 +89,21 @@ async def send_channel_notification(
 _DEFAULT_SESSION_NAME = "default"
 _DEFAULT_SESSION_TITLE = "Default session"
 
+# Mark every session-manager tool as always-loaded so Claude Code skips its
+# deferred-tool / ToolSearch step. Required because:
+#   1) The routing harness (AGENT_GUIDE.md) needs these tools callable from
+#      the *first* user message, before any ToolSearch round-trip.
+#   2) Sub-agents spawned by the harness do not inherit the parent's
+#      ToolSearch results (anthropics/claude-code Issue #25200), so deferred
+#      tools are unreachable from a sub-agent without this opt-out.
+# Each tool's `_meta` carries `"anthropic/alwaysLoad": true`, which Claude
+# Code v2.1.121+ honours per-tool regardless of `ENABLE_TOOL_SEARCH` setting.
+# 모든 session-manager 도구를 always-loaded로 표시 — Claude Code의 deferred /
+# ToolSearch 단계를 건너뛰게 함. 이유: (1) 라우팅 하네스가 첫 사용자 메시지에서
+# 도구를 즉시 호출해야 하고, (2) sub-agent가 parent의 ToolSearch 결과를
+# 상속하지 않아 deferred 도구를 호출할 수 없기 때문 (Issue #25200).
+_ALWAYS_LOAD_META: dict[str, bool] = {"anthropic/alwaysLoad": True}
+
 
 @dataclass
 class AppContext:
@@ -352,7 +367,7 @@ def _get_app_ctx(ctx: Context) -> AppContext:
 # 도구 등록 -------------------------------------------------------------------
 
 
-@mcp_server.tool()
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def check_session(ctx: Context) -> dict:
     """Return all registered sessions so you can route the user message to the right one.
 
@@ -409,7 +424,7 @@ def check_session(ctx: Context) -> dict:
     }
 
 
-@mcp_server.tool()
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def session_register(name: str, title: str, ctx: Context, summary: str | None = None) -> dict:
     """
     Register a new session with the given name and title.
@@ -434,7 +449,7 @@ _HANDOFF_INSTRUCTIONS = [
 ]
 
 
-@mcp_server.tool()
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def session_switch(
     target: str,
     summary: str,
@@ -484,7 +499,7 @@ def session_switch(
     return {"switched_to": target}
 
 
-@mcp_server.tool()
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def session_create(
     new_session_name: str,
     title: str,
@@ -544,7 +559,7 @@ def session_create(
     }
 
 
-@mcp_server.tool()
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def session_end(summary: str, ctx: Context) -> dict:
     """
     Archive the current session with a final summary.
@@ -583,7 +598,7 @@ def session_end(summary: str, ctx: Context) -> dict:
     return {"ended": current_name}
 
 
-@mcp_server.tool()
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def update_static(
     ctx: Context,
     project_context: str | None = None,
@@ -615,7 +630,7 @@ def update_static(
     return {"updated_at": static.updated_at}
 
 
-@mcp_server.tool()
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def init_project(content: str, ctx: Context) -> dict:
     """
     Create project-context.md if it does not exist yet.
@@ -634,7 +649,7 @@ def init_project(content: str, ctx: Context) -> dict:
     return {"created": True}
 
 
-@mcp_server.tool()
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def reinit_project(content: str, ctx: Context) -> dict:
     """
     Overwrite project-context.md with fresh content.
@@ -647,7 +662,7 @@ def reinit_project(content: str, ctx: Context) -> dict:
     return {"reinitialized": True}
 
 
-@mcp_server.tool()
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def update_project_context(content: str, ctx: Context) -> dict:
     """
     Replace project-context.md with updated content.
