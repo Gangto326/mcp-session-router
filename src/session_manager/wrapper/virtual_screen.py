@@ -12,6 +12,7 @@ PTY 출력을 pyte 가상 화면에 먹이고, submit (stdin \\r) 시점에 ❯ 
 from __future__ import annotations
 
 import pyte
+from wcwidth import wcwidth
 
 # figures.pointer (U+276F) — Ink draws this at the start of the input prompt.
 # Ink가 입력란 시작에 그리는 마커.
@@ -46,6 +47,41 @@ class VirtualScreen:
         # pyte.Screen.resize는 (lines, columns) 키워드 인자 — 명시 호출.
         self._screen.resize(lines=rows, columns=cols)
 
+    def _safe_display(self) -> list[str]:
+        """Render the virtual screen as text rows, robust to pyte stub bugs.
+        가상 화면을 텍스트 행 리스트로 렌더 — pyte stub 버그에 견고.
+
+        Mimics pyte.Screen.display, but guards against orphan wide-char
+        stubs (empty data left over when a wide char is partially
+        overwritten or clipped). pyte 0.8.2 raises IndexError in that
+        case (see screens.py:241 — ``wcwidth(char[0])`` on empty string).
+        Orphan stubs are rendered as a single space to preserve column
+        indexing for downstream slicing/matching.
+        pyte.Screen.display 모방 — 외톨이 wide-char stub(빈 문자열)을
+        안전 처리. pyte 0.8.2는 이 경우 IndexError 발생
+        (screens.py:241 — 빈 문자열에 ``wcwidth(char[0])``). 외톨이 stub은
+        단일 공백으로 렌더해 컬럼 인덱싱을 보존, 후속 슬라이싱/매칭이 안 깨짐.
+        """
+        rows: list[str] = []
+        for y in range(self._screen.lines):
+            line = self._screen.buffer[y]
+            cells: list[str] = []
+            skip_next = False
+            for x in range(self._screen.columns):
+                if skip_next:
+                    skip_next = False
+                    continue
+                char = line[x].data
+                if not char:
+                    # Orphan stub from a removed/clipped wide char.
+                    # 사라진/잘린 wide char가 남긴 외톨이 stub.
+                    cells.append(" ")
+                    continue
+                skip_next = wcwidth(char[0]) == 2
+                cells.append(char)
+            rows.append("".join(cells))
+        return rows
+
     def get_prompt_line(self) -> str | None:
         """Return the current input prompt text (after ❯ marker), or None.
         현재 입력란 라인 텍스트 반환 (❯ 마커 다음). 없으면 None.
@@ -59,7 +95,7 @@ class VirtualScreen:
         Ink가 회색으로 그리는 placeholder text는 여기서 제거하지 않음 —
         매칭 레이어에서 처리.
         """
-        for line in reversed(self._screen.display):
+        for line in reversed(self._safe_display()):
             idx = line.find(PROMPT_MARKER)
             if idx >= 0:
                 # Strip the marker, then leading space/NBSP and trailing whitespace.
@@ -76,4 +112,4 @@ class VirtualScreen:
         development``) so the wrapper can auto-accept them.
         confirmation prompt 감지에 사용 — 발견되면 wrapper가 자동 승인.
         """
-        return any(needle in line for line in self._screen.display)
+        return any(needle in line for line in self._safe_display())

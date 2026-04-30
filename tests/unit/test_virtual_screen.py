@@ -127,3 +127,58 @@ def test_contains_returns_false_on_empty():
     """
     s = VirtualScreen(80, 24)
     assert s.contains("anything") is False
+
+
+def test_orphan_wide_char_stub_does_not_crash():
+    """Orphan wide-char stub must not raise IndexError.
+    외톨이 wide-char stub은 IndexError를 일으키지 않아야 함.
+
+    Repro: draw a hangul char (width=2) at column 0, return cursor with
+    \\r, then write a single ASCII char. pyte overwrites column 0 with
+    the ASCII glyph but leaves the stub at column 1 as ``""`` — pyte
+    0.8.2's Screen.display then crashes on ``char[0]`` of the empty stub
+    (screens.py:241). Our _safe_display must handle this gracefully.
+    재현: 0열에 한글(width=2) → ``\\r``로 cursor 복귀 → ASCII 한 글자.
+    pyte는 0열을 ASCII로 덮어쓰지만 1열의 stub은 ``""``로 그대로 남고,
+    pyte 0.8.2의 Screen.display는 빈 stub의 ``char[0]``에서 크래시
+    (screens.py:241). _safe_display는 이를 안전하게 처리해야 함.
+    """
+    import pytest
+
+    s = VirtualScreen(10, 2)
+    s.feed("안".encode())
+    s.feed(b"\r")
+    s.feed(b"a")
+
+    # Sanity check the bug exists in raw pyte (guards against silent
+    # pyte upgrades that fix it — if this stops raising, the safe
+    # wrapper may be redundant and worth revisiting).
+    # raw pyte에서 버그 존재 확인 — 만약 향후 pyte가 조용히 고치면
+    # 이 단언이 깨지고, safe wrapper가 불필요한지 재검토 신호가 됨.
+    with pytest.raises(IndexError):
+        _ = s._screen.display
+
+    # Our wrapper must not crash and must preserve column indexing
+    # (orphan stub rendered as a single space).
+    # 우리 래퍼는 크래시 없이 컬럼 인덱싱 보존 (외톨이 stub은 공백 1칸).
+    rows = s._safe_display()
+    assert len(rows) == 2
+    assert rows[0].startswith("a ")
+    assert s.contains("a") is True
+
+
+def test_get_prompt_line_survives_orphan_stub():
+    """get_prompt_line() must survive an orphan stub elsewhere on screen.
+    화면 어딘가에 외톨이 stub이 있어도 get_prompt_line()은 동작해야 함.
+    """
+    s = VirtualScreen(20, 3)
+    # Row 0: orphan-stub trap (한글 → \r → ASCII).
+    # 0행: 외톨이 stub 트랩.
+    s.feed("안".encode())
+    s.feed(b"\r")
+    s.feed(b"a")
+    # Move to row 2 and draw a normal prompt.
+    # 2행으로 이동 후 정상 prompt 그리기.
+    s.feed(b"\x1b[3;1H")  # CUP → row 3, col 1 (1-indexed)
+    s.feed(PROMPT_MARKER.encode() + b" /help")
+    assert s.get_prompt_line() == "/help"
