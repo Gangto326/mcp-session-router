@@ -33,6 +33,7 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 
+from session_manager.claude_conversation import get_active_conversation_id
 from session_manager.lifecycle import cleanup_expired_sessions, get_cleanup_period_days
 from session_manager.models.session import (
     SessionMetadata,
@@ -409,8 +410,19 @@ def check_session(ctx: Context) -> dict:
     """
     app = _get_app_ctx(ctx)
     sessions = app.session_store.list_sessions()
+    # active_conversation_id is the Claude Code conversation id whose
+    # jsonl was most recently appended to under this cwd. Use it to
+    # detect picker-driven conversation switches that the wrapper cannot
+    # observe directly (Claude Code's /resume picker doesn't notify the
+    # MCP layer). When `current` is null but the conversation is clearly
+    # one of the existing tracked sessions, the routing logic can still
+    # locate the right session via this id.
+    # active_conversation_id는 cwd 안에서 jsonl이 가장 최근에 갱신된 Claude
+    # Code conversation의 id. wrapper가 직접 관찰 불가능한 picker 기반
+    # conversation 전환을 우회 감지하는 용도.
     return {
         "current": app.state.get_current_session(),
+        "active_conversation_id": get_active_conversation_id(app.project_path),
         "sessions": [
             {
                 "name": s.name,
