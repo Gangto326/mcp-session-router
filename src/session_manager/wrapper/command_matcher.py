@@ -20,20 +20,20 @@ from dataclasses import dataclass
 # Commands whose execution would lose summary info if not preceded by
 # session_end. Information commands (/help, /cost, /model, /clear) are NOT
 # here — they don't change session identity.
+# Bare /resume (no argument) is also included: while it only opens the
+# picker rather than committing to a switch, the intercept's real purpose
+# is to force a summary update on the leaving session for routing
+# accuracy — and the user might still pick another conversation from the
+# picker. Letting bare /resume slip past would leave the leaving session's
+# summary stale and degrade routing precision.
 # session_end 없이 실행되면 summary가 누락되는 명령들. 정보 명령
 # (/help, /cost, /model, /clear 등)은 여기에 포함되지 않음 — 세션 정체성을
-# 바꾸지 않으므로.
+# 바꾸지 않으므로. 빈 /resume (인자 없음)도 포함 — picker 만 띄우는 명령이긴
+# 하지만 가로채기의 진짜 목적은 떠나는 세션 summary 갱신을 통한 라우팅 정확도
+# 보호이고, 사용자가 picker 에서 다른 conversation 을 고를 수도 있다.
+# 빈 /resume 을 그냥 흘려보내면 떠나는 세션 summary 가 stale 로 남아 라우팅
+# 정확도가 떨어진다.
 KNOWN_COMMANDS: tuple[str, ...] = ("resume", "exit", "rename", "new")
-
-# Commands that only carry session-archive intent when targeted at a specific
-# session via argument. Without an argument, ``/resume`` opens Claude Code's
-# session picker — the user is browsing, not committing to a switch — so
-# intercepting it would archive the current session against the user's
-# intent. Bare ``/resume`` therefore passes through unintercepted.
-# 인자가 있을 때만 archive 의도가 있는 명령들. 인자 없는 ``/resume``은 Claude
-# Code의 picker를 띄우는 동작 (사용자가 둘러보는 단계)이라 가로채면 의도와
-# 다르게 archive가 실행된다. 인자 없는 ``/resume``은 가로채기 skip.
-COMMANDS_REQUIRING_ARG: tuple[str, ...] = ("resume",)
 
 # Anchored start-to-end. The argument group (\S.*?) starts with non-whitespace
 # so trailing field padding doesn't get captured as args. \s*$ absorbs any
@@ -87,11 +87,4 @@ def match_intercept_command(prompt_text: str | None) -> InterceptedCommand | Non
         return None
     command = match.group(1)
     args = (match.group(2) or "").strip()
-    # Bare /resume opens the Claude Code session picker; archiving the
-    # current session at that moment is unwanted side-effect. Skip the
-    # intercept so the keystroke is forwarded as a plain command.
-    # 인자 없는 /resume은 picker 호출 — 이 시점에 archive를 강제하면 부작용.
-    # 가로채기 skip하여 keystroke를 일반 명령으로 통과시킨다.
-    if command in COMMANDS_REQUIRING_ARG and not args:
-        return None
     return InterceptedCommand(command=command, args=args)
