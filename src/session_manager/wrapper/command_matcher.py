@@ -25,6 +25,16 @@ from dataclasses import dataclass
 # 바꾸지 않으므로.
 KNOWN_COMMANDS: tuple[str, ...] = ("resume", "exit", "rename", "new")
 
+# Commands that only carry session-archive intent when targeted at a specific
+# session via argument. Without an argument, ``/resume`` opens Claude Code's
+# session picker — the user is browsing, not committing to a switch — so
+# intercepting it would archive the current session against the user's
+# intent. Bare ``/resume`` therefore passes through unintercepted.
+# 인자가 있을 때만 archive 의도가 있는 명령들. 인자 없는 ``/resume``은 Claude
+# Code의 picker를 띄우는 동작 (사용자가 둘러보는 단계)이라 가로채면 의도와
+# 다르게 archive가 실행된다. 인자 없는 ``/resume``은 가로채기 skip.
+COMMANDS_REQUIRING_ARG: tuple[str, ...] = ("resume",)
+
 # Anchored start-to-end. The argument group (\S.*?) starts with non-whitespace
 # so trailing field padding doesn't get captured as args. \s*$ absorbs any
 # remaining trailing whitespace.
@@ -77,4 +87,11 @@ def match_intercept_command(prompt_text: str | None) -> InterceptedCommand | Non
         return None
     command = match.group(1)
     args = (match.group(2) or "").strip()
+    # Bare /resume opens the Claude Code session picker; archiving the
+    # current session at that moment is unwanted side-effect. Skip the
+    # intercept so the keystroke is forwarded as a plain command.
+    # 인자 없는 /resume은 picker 호출 — 이 시점에 archive를 강제하면 부작용.
+    # 가로채기 skip하여 keystroke를 일반 명령으로 통과시킨다.
+    if command in COMMANDS_REQUIRING_ARG and not args:
+        return None
     return InterceptedCommand(command=command, args=args)

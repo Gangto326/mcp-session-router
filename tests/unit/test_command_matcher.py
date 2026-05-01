@@ -53,15 +53,6 @@ class TestPositiveMatches:
             "/resume foo  [conversation id or search term]"
         ) == InterceptedCommand("resume", "foo")
 
-    def test_resume_only_placeholder(self):
-        """Empty argument with only placeholder visible.
-        인자 없이 placeholder만 보이는 경우.
-        """
-        assert match_intercept_command(
-            "/resume  [conversation id or search term]"
-        ) == InterceptedCommand("resume", "")
-
-
 class TestNegativeMatches:
     """Inputs that must NOT trigger interception.
     가로채기를 trigger 하면 안 되는 입력.
@@ -136,6 +127,27 @@ class TestNegativeMatches:
         `/resumefoo` (공백 없음)은 `/resume foo`와 다름.
         """
         assert match_intercept_command("/resumefoo") is None
+
+    def test_bare_resume_skipped(self):
+        """Bare /resume opens Claude Code's session picker, not a session
+        switch — interception would archive the current session even
+        though the user is just browsing.
+        인자 없는 /resume은 Claude Code의 session picker 호출 — 가로채기를
+        발동하면 사용자가 둘러보는 단계인데 현재 세션이 archive되어 의도와 다른
+        결과를 초래하므로 skip.
+        """
+        assert match_intercept_command("/resume") is None
+        assert match_intercept_command("/resume   ") is None
+
+    def test_bare_resume_with_only_placeholder_skipped(self):
+        """Ink renders a placeholder hint inside the empty input — the
+        underlying command is still bare /resume, so still skipped.
+        Ink가 빈 입력란에 placeholder hint를 그려도 실제 명령은 인자 없는
+        /resume이므로 동일하게 가로채기 skip.
+        """
+        assert match_intercept_command(
+            "/resume  [conversation id or search term]"
+        ) is None
 
 
 class TestEdgeCases:
