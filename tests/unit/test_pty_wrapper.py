@@ -67,12 +67,24 @@ class TestDetectPrompt:
         buffer = INVERSE_VIDEO_START + b"text"
         assert wrapper._detect_prompt(buffer) is False
 
-    def test_not_detected_inverse_too_far_from_pointer(
+    def test_detected_inverse_far_from_pointer(
         self, wrapper: SessionManagerWrapper
     ) -> None:
-        # 64바이트 윈도우 밖의 inverse 시퀀스는 매칭에서 제외
+        """Inverse anywhere after the latest ❯ counts as detected.
+
+        The wrapper widened the detect window from a 64-byte slice after
+        ❯ to *everything past the latest ❯* to handle multi-line wrapped
+        input fields, where ❯ sits on the first line and the cursor
+        inverse on the last. A distance-based window misses that case.
+
+        ❯ 이후 거리에 무관하게 inverse 가 있으면 detect 된다.
+
+        Multi-line wrap 입력란에서는 ❯ 마커가 첫 라인에, cursor inverse 가
+        마지막 라인에 있을 수 있다. 거리 기반 좁은 윈도우는 이 케이스를
+        놓치므로 detect 범위를 마지막 ❯ 이후 buffer 전체로 확대했다.
+        """
         buffer = PROMPT_POINTER + b"x" * 100 + INVERSE_VIDEO_START
-        assert wrapper._detect_prompt(buffer) is False
+        assert wrapper._detect_prompt(buffer) is True
 
     def test_chunk_boundary_detection(self, wrapper: SessionManagerWrapper) -> None:
         # ❯의 첫 2바이트만 도착한 시점에는 매칭 안 됨
