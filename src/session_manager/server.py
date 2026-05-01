@@ -411,15 +411,13 @@ def check_session(ctx: Context) -> dict:
     app = _get_app_ctx(ctx)
     sessions = app.session_store.list_sessions()
     # active_conversation_id is the Claude Code conversation id whose
-    # jsonl was most recently appended to under this cwd. Use it to
-    # detect picker-driven conversation switches that the wrapper cannot
-    # observe directly (Claude Code's /resume picker doesn't notify the
-    # MCP layer). When `current` is null but the conversation is clearly
-    # one of the existing tracked sessions, the routing logic can still
-    # locate the right session via this id.
-    # active_conversation_id는 cwd 안에서 jsonl이 가장 최근에 갱신된 Claude
-    # Code conversation의 id. wrapper가 직접 관찰 불가능한 picker 기반
-    # conversation 전환을 우회 감지하는 용도.
+    # jsonl was most recently appended to under this cwd. Combined with
+    # each session's claude_conversation_ids, the routing harness can
+    # match picker-driven conversation transitions to the correct
+    # tracked session even when current_session is None.
+    # active_conversation_id 와 각 세션의 claude_conversation_ids 를 결합하면
+    # current 가 None 인 picker 후 상태에서도 라우팅 하네스가 사용자가 들어간
+    # conversation 을 정확히 어느 세션에 매칭할지 결정할 수 있다.
     return {
         "current": app.state.get_current_session(),
         "active_conversation_id": get_active_conversation_id(app.project_path),
@@ -430,6 +428,7 @@ def check_session(ctx: Context) -> dict:
                 "summary": s.summary,
                 "last_accessed": s.last_accessed,
                 "status": s.status.value,
+                "claude_conversation_ids": list(s.claude_conversation_ids),
             }
             for s in sessions
         ],
@@ -446,11 +445,19 @@ def session_register(name: str, title: str, ctx: Context, summary: str | None = 
     """
     app = _get_app_ctx(ctx)
     session = SessionMetadata.new(name=name, title=title, summary=summary)
+    # Link the active Claude Code conversation so picker-driven returns
+    # to this conversation can be matched back to this session.
+    # 활성 Claude Code conversation 을 연결 — 이후 사용자가 picker 로 같은
+    # conversation 에 돌아왔을 때 라우팅이 정확히 이 세션으로 매칭되게 한다.
+    conv_id = get_active_conversation_id(app.project_path)
+    if conv_id is not None:
+        session.link_conversation(conv_id)
     app.session_store.save_session(session)
     app.state.set_current_session(name)
     return {
         "registered": name,
         "session_id": session.session_id,
+        "claude_conversation_ids": list(session.claude_conversation_ids),
     }
 
 
@@ -479,6 +486,11 @@ def session_switch(
     app = _get_app_ctx(ctx)
     current_name = app.state.get_current_session()
 
+    # Compute active conversation once — used for both outgoing-session
+    # link and target-session link below.
+    # 활성 conversation 을 한 번만 계산해 outgoing/target 세션 양쪽에 연결한다.
+    active_conv_id = get_active_conversation_id(app.project_path)
+
     # Update the outgoing session's metadata.
     # 나가는 세션의 메타데이터를 갱신한다.
     if current_name is not None:
@@ -490,6 +502,8 @@ def session_switch(
             current.transitions.append(
                 TransitionRecord.new(from_session=current_name, to_session=target)
             )
+            if active_conv_id is not None:
+                current.link_conversation(active_conv_id)
             current.touch()
             app.session_store.save_session(current)
 
@@ -508,6 +522,19 @@ def session_switch(
     })
 
     app.state.set_current_session(target)
+
+    # Link the same active conversation to the target session as well so
+    # routing matches it on the next turn even before the wrapper's
+    # /resume injection actually changes Claude Code's conversation.
+    # target 세션에도 동일 conversation 연결 — wrapper 의 /resume 주입이
+    # Claude Code conversation 을 실제로 바꾸기 전이라도 다음 턴에 라우팅이
+    # 매칭하도록.
+    if active_conv_id is not None:
+        target_session = app.session_store.load_session_by_name(target)
+        if target_session is not None:
+            target_session.link_conversation(active_conv_id)
+            app.session_store.save_session(target_session)
+
     return {"switched_to": target}
 
 
@@ -544,6 +571,13 @@ def session_create(
         current = app.session_store.load_session_by_name(current_name)
         if current is not None:
             current.summary = handoff_summary
+            # Link the conversation we're leaving before the wrapper
+            # respawns into a brand-new one.
+            # 자식 재spawn 으로 새 conversation 으로 가기 전, 떠나는 conversation
+            # 을 outgoing 세션에 연결해둔다.
+            conv_id = get_active_conversation_id(app.project_path)
+            if conv_id is not None:
+                current.link_conversation(conv_id)
             current.touch()
             app.session_store.save_session(current)
             rename_current = current_name
@@ -589,6 +623,13 @@ def session_end(summary: str, ctx: Context) -> dict:
         if current is not None:
             current.summary = summary
             current.status = SessionStatus.ARCHIVED
+            # Link the conversation being archived so the metadata
+            # remembers which conversation this session was inside.
+            # 마감되는 시점의 conversation 을 연결해 메타데이터가 마지막으로
+            # 어느 conversation 안에 있었는지 기억한다.
+            conv_id = get_active_conversation_id(app.project_path)
+            if conv_id is not None:
+                current.link_conversation(conv_id)
             current.touch()
             app.session_store.save_session(current)
 

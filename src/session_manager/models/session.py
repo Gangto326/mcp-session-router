@@ -59,6 +59,17 @@ class SessionMetadata:
     last_accessed: str
     transitions: list[TransitionRecord] = field(default_factory=list)
     status: SessionStatus = SessionStatus.ACTIVE
+    # Claude Code conversation IDs that this metadata session has been
+    # observed inside. Populated by session_register / session_switch /
+    # session_create / session_end when the cwd's active_conversation_id
+    # is known. Used by the routing harness to detect picker-driven
+    # conversation transitions: if `active_conversation_id` matches one
+    # of these, the routing is unambiguous.
+    # 이 메타데이터 세션 안에서 관측된 Claude Code conversation id 목록.
+    # cwd 의 active_conversation_id 가 알려진 시점에 도구들이 채운다. picker
+    # 기반 conversation 전환 감지에 사용 — active_conversation_id 가 어느
+    # 세션의 이 목록에 있으면 라우팅이 명확해진다.
+    claude_conversation_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def new(cls, name: str, title: str, summary: str | None = None) -> SessionMetadata:
@@ -82,6 +93,7 @@ class SessionMetadata:
             "last_accessed": self.last_accessed,
             "transitions": [t.to_dict() for t in self.transitions],
             "status": self.status.value,
+            "claude_conversation_ids": list(self.claude_conversation_ids),
         }
 
     @classmethod
@@ -97,7 +109,19 @@ class SessionMetadata:
                 TransitionRecord.from_dict(t) for t in data.get("transitions", [])
             ],
             status=SessionStatus(data.get("status", SessionStatus.ACTIVE.value)),
+            # Default to empty list for legacy session files written before
+            # this field existed.
+            # 이 필드 도입 전에 작성된 세션 파일과의 호환을 위해 기본값 빈 리스트.
+            claude_conversation_ids=list(data.get("claude_conversation_ids", [])),
         )
 
     def touch(self) -> None:
         self.last_accessed = _utc_now_iso()
+
+    def link_conversation(self, conv_id: str) -> None:
+        """Associate a Claude Code conversation id with this session (idempotent).
+
+        Claude Code conversation id 를 이 세션에 연결한다. 이미 있으면 무시 (멱등).
+        """
+        if conv_id and conv_id not in self.claude_conversation_ids:
+            self.claude_conversation_ids.append(conv_id)
