@@ -99,6 +99,12 @@ alias ccode='uv run --project /path/to/mcp-session-router ccode'
 
 15초 안에 LLM이 응답하지 않으면 graceful degradation으로 `\r`을 그대로 forward하고 안내 메시지를 출력한다 (summary는 갱신되지 못한 채). 가로채기 중 Ctrl+C를 누르면 명령 자체가 취소 (LLM 응답 중단 + 명령 실행 안 함).
 
+### Plan Mode 동작
+
+Claude Code가 plan mode일 때는 read-only 정책상 `session_switch`·`session_create` 같은 상태 변경 MCP 도구가 자동 차단된다. 이 상태에서 라우팅을 시도하면 서브 에이전트가 SWITCH로 판단해도 도구 호출이 막혀 STAY로 강제 후퇴 → 잘못된 세션에 응답이 들어가 컨텍스트가 오염될 수 있다.
+
+이를 피하기 위해 LLM은 plan mode 활성을 감지하면 라우팅 gate(서브 에이전트 호출 + `check_session`)를 스킵하고, 응답 첫 줄에 `Routing: SKIPPED (plan mode active)`만 명시한 뒤 현재 세션에서 답한다. plan mode를 종료하고 보낸 다음 메시지부터 라우팅이 정상 적용된다. 라우팅 검증을 받고 싶은 질문이면 plan mode를 먼저 종료하고 보내는 것이 안전하다.
+
 ## 사용 시나리오
 
 ### 세션 전환
