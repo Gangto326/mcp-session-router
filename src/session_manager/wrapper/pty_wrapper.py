@@ -37,6 +37,7 @@ from typing import Any, Literal
 
 import pexpect
 
+from session_manager import debug_log
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
     match_intercept_command,
@@ -113,15 +114,21 @@ def _safe_fileno(stream: Any) -> int:
 
 
 def _debug_log(msg: str) -> None:
-    """No-op stub. Used during AGENT_GUIDE rollout for diagnostics; left
-    in place so call sites in this module remain valid. Re-enable by
-    restoring the file-write body if you need to trace stage transitions
-    or chunk flow again.
+    """Forward legacy free-form debug strings to the unified debug_log.
 
-    AGENT_GUIDE 검증용 디버그 로그였으나 비활성화. 호출 사이트는 그대로
-    남겨 두었으므로, 추적이 다시 필요하면 본문만 복원하면 된다.
+    Original stub was a no-op; existing call sites carry useful free-form
+    text (prompt-detect stage transitions, auto-confirm hits, chunk flow
+    diagnostics). Forwarding them as ``DEBUG_TRACE`` events keeps that
+    text searchable in the unified NDJSON without rewriting every call.
+
+    기존 자유 형식 디버그 문자열을 통합 debug_log 로 전달.
+
+    원래 stub 은 no-op 이었으나, 호출 사이트에는 유용한 자유 형식 텍스트가
+    들어 있다 (prompt-detect stage 전환, auto-confirm 발동, chunk 흐름
+    진단 등). 이를 ``DEBUG_TRACE`` 이벤트로 전달하면 호출 지점을 다 다시
+    쓰지 않아도 통합 NDJSON 에서 텍스트 검색이 된다.
     """
-    return
+    debug_log.log("DEBUG_TRACE", "WRAPPER", {"msg": msg})
 
 
 @dataclass
@@ -300,6 +307,23 @@ class SessionManagerWrapper:
             echo=False,
         )
         self.pty_fd = self.child.fileno()
+        debug_log.log(
+            "SPAWN",
+            "SYSTEM",
+            {
+                "claude_args": list(self.claude_args),
+                "pid": self.child.pid,
+                "is_new_respawn": is_new_respawn,
+                "initial_session_name": self._initial_session_name,
+                # input_queue carryover into a new child is a known
+                # suspect for "ghost" injection — log explicitly even
+                # though we don't reset it here.
+                # input_queue 가 새 자식으로 따라 들어가는 동작은 "유령"
+                # injection 의 의심 후보 — 여기서 reset 하지 않더라도
+                # 잔존 사실을 명시적으로 기록.
+                "input_queue_carryover_len": len(self.input_queue),
+            },
+        )
         # Reset per-child detection state so the previous session's tail
         # bytes can't trigger a false prompt on the new child.
         # 자식별 감지 상태 초기화 — 이전 세션의 잔여 바이트가 새 자식의
@@ -343,12 +367,35 @@ class SessionManagerWrapper:
         종료 단계에 도달한 경우에만 True를 반환하고, 동시에 stage를
         핸드셰이크 대기로 전진시킨다.
         """
+        # CHILD_EXIT checkpoint — record the previous child's exit state
+        # so respawn decisions are auditable. exitstatus is the OS exit
+        # code; signalstatus is the signal number if killed.
+        # CHILD_EXIT 체크포인트 — 직전 자식의 종료 상태를 기록해 respawn
+        # 결정을 사후 추적 가능하게 한다.
+        debug_log.log(
+            "CHILD_EXIT",
+            "SYSTEM",
+            {
+                "exit_status": getattr(self.child, "exitstatus", None)
+                if self.child is not None
+                else None,
+                "signal_status": getattr(self.child, "signalstatus", None)
+                if self.child is not None
+                else None,
+                "pending_action_type": self._pending_action.action_type
+                if self._pending_action is not None
+                else None,
+                "pending_stage": self._pending_action.stage
+                if self._pending_action is not None
+                else None,
+            },
+        )
         pending = self._pending_action
         if pending is None or pending.action_type != "new":
             return False
         if pending.stage != "await_child_exit":
             return False
-        pending.stage = "await_handshake"
+        self._set_stage(pending, "await_handshake")
         return True
 
     # ------------------------------------------------------------------ I/O loop
@@ -474,12 +521,37 @@ class SessionManagerWrapper:
         if not chunk:
             return
 
+        # USER_KEY checkpoint — every real user keystroke arrives here.
+        # The mask helper redacts content by default; users can opt in to
+        # raw logging via SESSION_MANAGER_LOG_RAW_STDIN=1.
+        # USER_KEY 체크포인트 — 실제 사용자 키스트로크는 모두 이 지점으로 진입.
+        # 기본은 마스킹, SESSION_MANAGER_LOG_RAW_STDIN=1 로 raw opt-in 가능.
+        debug_log.log(
+            "USER_KEY",
+            "USER",
+            {
+                "mode": self.mode,
+                "intercept_active": self._intercept_state is not None,
+                "chunk": debug_log.mask_stdin_chunk(chunk),
+            },
+        )
+
         if self.mode == "filtering":
             # Buffer keystrokes during SWITCH/NEW injection; drained back to
             # the PTY when filtering ends. Used by SWITCH/NEW only.
             # SWITCH/NEW 주입 중 들어온 키 입력은 큐에 보관, 필터링 종료 시
             # PTY로 일괄 반영. SWITCH/NEW 전용 메커니즘.
             self.input_queue += chunk
+            debug_log.log(
+                "INPUT_QUEUE",
+                "USER",
+                {
+                    "op": "append",
+                    "added_len": len(chunk),
+                    "total_len": len(self.input_queue),
+                    "reason": "filtering_mode",
+                },
+            )
             return
 
         # During slash-command interception, drop user input — the visible
@@ -499,6 +571,11 @@ class SessionManagerWrapper:
         # (s === '\r'). 멀티 바이트 chunk는 타이핑 중인 텍스트로 간주.
         if chunk == b"\r":
             prompt_text = self.virtual_screen.get_prompt_line()
+            debug_log.log(
+                "VSCREEN",
+                "SYSTEM",
+                {"phase": "submit_detect", "prompt_text": prompt_text},
+            )
             matched = match_intercept_command(prompt_text)
             if matched is not None:
                 self._start_intercept(matched)
@@ -526,6 +603,15 @@ class SessionManagerWrapper:
         ``deadline`` 시점까지 응답이 없으면 _check_intercept_timeout이
         graceful degradation으로 종료한다.
         """
+        debug_log.log(
+            "INTERCEPT_START",
+            "USER",
+            {
+                "command": matched.command,
+                "args": matched.args,
+                "deadline_sec": INTERCEPT_TIMEOUT_SEC,
+            },
+        )
         self._intercept_state = _InterceptState(
             command=matched.command,
             args=matched.args,
@@ -546,8 +632,18 @@ class SessionManagerWrapper:
         실행시킨다. 가로채기 중 사용자 stdin은 drop되었으므로 입력란은
         가로채기 시점 그대로 (사용자가 친 ``/resume foo`` 등).
         """
+        debug_log.log(
+            "INTERCEPT_FINISH",
+            "WRAPPER",
+            {"reason": "session_end_received"},
+        )
         self._intercept_state = None
         try:
+            debug_log.log(
+                "WRAPPER_INJECT",
+                "WRAPPER",
+                {"caller": "_finish_intercept", "raw": "\\r"},
+            )
             os.write(self.pty_fd, b"\r")
         except OSError:
             pass
@@ -562,8 +658,14 @@ class SessionManagerWrapper:
         진행될 수 있으나 (race), wrapper는 intercept_done을 수신해도 이미
         비활성 상태라 무시한다 (6-4의 비활성 시 no-op 동작).
         """
+        debug_log.log("INTERCEPT_FINISH", "USER", {"reason": "user_ctrl_c"})
         self._intercept_state = None
         try:
+            debug_log.log(
+                "WRAPPER_INJECT",
+                "WRAPPER",
+                {"caller": "_cancel_intercept", "raw": "\\x03"},
+            )
             os.write(self.pty_fd, CTRL_C)
         except OSError:
             pass
@@ -580,6 +682,11 @@ class SessionManagerWrapper:
             return
         if time.monotonic() < state.deadline:
             return
+        debug_log.log(
+            "INTERCEPT_FINISH",
+            "SYSTEM",
+            {"reason": "timeout", "elapsed_sec": INTERCEPT_TIMEOUT_SEC},
+        )
         self._intercept_state = None
         try:
             os.write(
@@ -590,6 +697,11 @@ class SessionManagerWrapper:
         except OSError:
             pass
         try:
+            debug_log.log(
+                "WRAPPER_INJECT",
+                "WRAPPER",
+                {"caller": "_check_intercept_timeout", "raw": "\\r"},
+            )
             os.write(self.pty_fd, b"\r")
         except OSError:
             pass
@@ -612,6 +724,29 @@ class SessionManagerWrapper:
         return INVERSE_VIDEO_START in buffer[idx:]
 
     def _inject_text(self, text: str) -> None:
+        # Single WRAPPER_INJECT checkpoint — every wrapper-driven write to
+        # the PTY passes through here. The caller frame name disambiguates
+        # the inject type (handoff / resume / rename / exit / agent_guide /
+        # submit) without changing every call site's signature.
+        # 단일 WRAPPER_INJECT 체크포인트 — wrapper 가 PTY 에 쓰는 모든 문장이
+        # 이 지점을 통과한다. 호출자 프레임 이름으로 inject type (handoff /
+        # resume / rename / exit / agent_guide / submit) 을 구분 — 호출 지점
+        # 시그니처를 바꾸지 않고도 분류 가능.
+        import sys as _sys
+
+        caller = _sys._getframe(1).f_code.co_name if hasattr(_sys, "_getframe") else "?"
+        debug_log.log(
+            "WRAPPER_INJECT",
+            "WRAPPER",
+            {
+                "caller": caller,
+                "stage": getattr(self._pending_action, "stage", None)
+                if self._pending_action is not None
+                else None,
+                "agent_guide_stage": self._agent_guide_stage,
+                "text": debug_log.mask_text(text),
+            },
+        )
         os.write(self.pty_fd, text.encode("utf-8"))
 
     def _auto_accept_confirmations(self) -> None:
@@ -627,7 +762,17 @@ class SessionManagerWrapper:
                 continue
             if self.virtual_screen.contains(pattern):
                 _debug_log(f"auto-accept: detected '{pattern}', sending \\r")
+                debug_log.log(
+                    "AUTO_CONFIRM",
+                    "WRAPPER",
+                    {"pattern": pattern},
+                )
                 try:
+                    debug_log.log(
+                        "WRAPPER_INJECT",
+                        "WRAPPER",
+                        {"caller": "_auto_accept_confirmations", "raw": "\\r"},
+                    )
                     os.write(self.pty_fd, b"\r")
                 except OSError:
                     return
@@ -810,9 +955,37 @@ class SessionManagerWrapper:
             # 때만 종료하고 큐잉된 명령을 흘려보낸다 (그 외 상태에서는 무시).
             if self._intercept_state is not None:
                 self._finish_intercept()
+            else:
+                debug_log.log(
+                    "INTERCEPT_DONE_DROPPED",
+                    "SYSTEM",
+                    {"reason": "no_active_intercept"},
+                )
 
     # ----------------------------------------------------------- Action handlers
     # 세션 액션 처리 ------------------------------------------------------------
+
+    def _set_stage(self, pending: _PendingAction, new_stage: str) -> None:
+        """Centralised stage transition with logging.
+
+        Every SWITCH/NEW stage move goes through here so the log shows the
+        full state machine path for one action.
+
+        중앙화된 stage 전환 + 로깅. 모든 SWITCH/NEW stage 이동이 이 지점을
+        통과해 한 액션의 전체 상태 머신 경로가 로그에 남는다.
+        """
+        debug_log.log(
+            "STAGE",
+            "WRAPPER",
+            {
+                "action_type": pending.action_type,
+                "target": pending.target,
+                "new_session_name": pending.new_session_name,
+                "before": pending.stage,
+                "after": new_stage,
+            },
+        )
+        pending.stage = new_stage
 
     def _handle_switch(
         self,
@@ -838,6 +1011,17 @@ class SessionManagerWrapper:
             user_prompt=user_prompt,
             stage="await_resume_prompt",
         )
+        debug_log.log(
+            "STAGE",
+            "WRAPPER",
+            {
+                "action_type": "switch",
+                "target": target,
+                "before": None,
+                "after": "await_resume_prompt",
+                "user_prompt": debug_log.mask_text(user_prompt),
+            },
+        )
 
     def _advance_switch(self, pending: _PendingAction) -> None:
         if pending.stage == "await_resume_prompt":
@@ -849,10 +1033,10 @@ class SessionManagerWrapper:
             # await_resume_submit으로 지연.
             self.mode = "filtering"
             self._inject_text(f"/resume {pending.target}")
-            pending.stage = "await_resume_submit"
+            self._set_stage(pending, "await_resume_submit")
         elif pending.stage == "await_resume_submit":
             self._submit()
-            pending.stage = "await_handoff_prompt"
+            self._set_stage(pending, "await_handoff_prompt")
         elif pending.stage == "await_handoff_prompt":
             # The resumed session is ready for input. Inject the handoff
             # block plus the user's prompt.  Submit deferred to next detection.
@@ -860,11 +1044,12 @@ class SessionManagerWrapper:
             # 주입한다. 제출은 다음 감지로 지연.
             text = format_handoff_injection(pending.handoff, pending.user_prompt)
             self._inject_text(text)
-            pending.stage = "await_handoff_submit"
+            self._set_stage(pending, "await_handoff_submit")
         elif pending.stage == "await_handoff_submit":
             self._submit()
             self.mode = "passthrough"
             self._drain_input_queue()
+            self._set_stage(pending, "done")
             self._pending_action = None
 
     def _drain_input_queue(self) -> None:
@@ -875,6 +1060,16 @@ class SessionManagerWrapper:
         # 필터링 중 사용자가 친 입력의 개행을 공백으로 치환 — 쌓인 Enter가
         # 자동으로 submit되지 않도록 하고, 사용자가 다시 눌러 보내게 한다.
         cleaned = self.input_queue.replace(b"\n", b" ")
+        debug_log.log(
+            "INPUT_QUEUE",
+            "USER",
+            {
+                "op": "drain",
+                "queue_len": len(self.input_queue),
+                "cleaned_len": len(cleaned),
+                "raw_chunk": debug_log.mask_stdin_chunk(self.input_queue),
+            },
+        )
         os.write(self.pty_fd, cleaned)
         self.input_queue = b""
 
@@ -905,6 +1100,18 @@ class SessionManagerWrapper:
             rename_current=rename_current,
             new_session_name=new_session_name,
         )
+        debug_log.log(
+            "STAGE",
+            "WRAPPER",
+            {
+                "action_type": "new",
+                "rename_current": rename_current,
+                "new_session_name": new_session_name,
+                "before": None,
+                "after": "await_rename_or_exit_prompt",
+                "user_prompt": debug_log.mask_text(user_prompt),
+            },
+        )
 
     def _handle_handshake_request(self) -> None:
         """
@@ -921,11 +1128,29 @@ class SessionManagerWrapper:
             and pending.action_type == "new"
             and pending.stage == "await_handshake"
         ):
+            debug_log.log(
+                "HANDSHAKE",
+                "WRAPPER",
+                {
+                    "phase": "wrapper_response",
+                    "branch": "new_respawn",
+                    "current_session_name": pending.new_session_name,
+                },
+            )
             self.socket_server.send(
                 {"current_session_name": pending.new_session_name}
             )
-            pending.stage = "await_new_session_prompt"
+            self._set_stage(pending, "await_new_session_prompt")
             return
+        debug_log.log(
+            "HANDSHAKE",
+            "WRAPPER",
+            {
+                "phase": "wrapper_response",
+                "branch": "initial",
+                "current_session_name": self._initial_session_name,
+            },
+        )
         self.socket_server.send(
             {"current_session_name": self._initial_session_name}
         )
@@ -948,21 +1173,21 @@ class SessionManagerWrapper:
             self.mode = "filtering"
             if pending.rename_current is not None:
                 self._inject_text(f"/rename {pending.rename_current}")
-                pending.stage = "await_rename_submit"
+                self._set_stage(pending, "await_rename_submit")
             else:
                 self._inject_text("/exit")
-                pending.stage = "await_exit_submit"
+                self._set_stage(pending, "await_exit_submit")
         elif pending.stage == "await_rename_submit":
             self._submit()
-            pending.stage = "await_exit_prompt"
+            self._set_stage(pending, "await_exit_prompt")
         elif pending.stage == "await_exit_prompt":
             # /rename has been processed; now exit the current session.
             # /rename 처리 완료, 이제 현재 세션 종료.
             self._inject_text("/exit")
-            pending.stage = "await_exit_submit"
+            self._set_stage(pending, "await_exit_submit")
         elif pending.stage == "await_exit_submit":
             self._submit()
-            pending.stage = "await_child_exit"
+            self._set_stage(pending, "await_child_exit")
         elif pending.stage == "await_new_session_prompt":
             # New child has spawned, MCP handshake completed, and the first
             # prompt of the fresh session is up. Inject the handoff plus the
@@ -972,11 +1197,12 @@ class SessionManagerWrapper:
             # 감지로 지연.
             text = format_handoff_injection(pending.handoff, pending.user_prompt)
             self._inject_text(text)
-            pending.stage = "await_new_handoff_submit"
+            self._set_stage(pending, "await_new_handoff_submit")
         elif pending.stage == "await_new_handoff_submit":
             self._submit()
             self.mode = "passthrough"
             self._drain_input_queue()
+            self._set_stage(pending, "done")
             self._pending_action = None
         # `await_child_exit`와 `await_handshake` 단계에서는 프롬프트 감지로
         # 진행하지 않는다 — 자식 종료(outer loop)와 소켓 핸드셰이크(별도

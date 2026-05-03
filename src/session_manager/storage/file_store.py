@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from session_manager import debug_log
 from session_manager.models import Config, SessionMetadata, StaticField
 
 _SESSION_MANAGER_DIRNAME = ".session-manager"
@@ -16,6 +17,18 @@ _PROJECT_CONTEXT_FILENAME = "project-context.md"
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
+    # Single STORAGE_SAVE checkpoint — every disk write under this layer
+    # passes through here so the log captures the "what file changed when".
+    # 단일 STORAGE_SAVE 체크포인트 — 이 레이어의 모든 디스크 쓰기가 이
+    # 지점을 통과하므로 "어떤 파일이 언제 바뀌었는가" 가 로그에 잡힌다.
+    debug_log.log(
+        "STORAGE_SAVE",
+        "MCP_TOOL",
+        {
+            "path": str(path),
+            "len": len(text),
+        },
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
@@ -27,7 +40,13 @@ def _dump_json(data: Any) -> str:
 
 
 def _load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    debug_log.log(
+        "STORAGE_LOAD",
+        "MCP_TOOL",
+        {"path": str(path), "len": len(text)},
+    )
+    return json.loads(text)
 
 
 class SessionStore:
@@ -64,7 +83,17 @@ class SessionStore:
 
     def delete_session(self, session_id: str) -> None:
         path = self._sessions_dir / f"{session_id}.json"
+        existed = path.exists()
         path.unlink(missing_ok=True)
+        debug_log.log(
+            "STORAGE_DELETE",
+            "MCP_TOOL",
+            {
+                "path": str(path),
+                "session_id": session_id,
+                "existed": existed,
+            },
+        )
 
 
 class FieldStore:

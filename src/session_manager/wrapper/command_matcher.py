@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from session_manager import debug_log
+
 # Commands whose execution would lose summary info if not preceded by
 # session_end. Information commands (/help, /cost, /model, /clear) are NOT
 # here — they don't change session identity.
@@ -80,11 +82,44 @@ def match_intercept_command(prompt_text: str | None) -> InterceptedCommand | Non
         3. 엄격 화이트리스트 정규식 매칭.
     """
     if not prompt_text or not prompt_text.strip():
+        debug_log.log(
+            "CMD_MATCH",
+            "USER",
+            {"matched": False, "reason": "empty_prompt", "prompt": prompt_text},
+        )
         return None
     cleaned = _PLACEHOLDER_RE.sub("", prompt_text)
     match = _COMMAND_RE.match(cleaned)
     if match is None:
+        # Capture the first token so a /unknown command shows up in logs
+        # (helps diagnose false-negatives when Claude Code adds a new
+        # lifecycle command we haven't whitelisted).
+        # 첫 토큰을 기록 — /unknown 명령이 로그에 남도록 (Claude Code 가
+        # 새 lifecycle 명령을 추가했는데 화이트리스트에 없을 때 false-
+        # negative 진단에 도움).
+        first_token = cleaned.split(None, 1)[0] if cleaned.strip() else ""
+        debug_log.log(
+            "CMD_MATCH",
+            "USER",
+            {
+                "matched": False,
+                "reason": "no_regex_match",
+                "prompt": prompt_text,
+                "cleaned": cleaned,
+                "first_token": first_token,
+            },
+        )
         return None
     command = match.group(1)
     args = (match.group(2) or "").strip()
+    debug_log.log(
+        "CMD_MATCH",
+        "USER",
+        {
+            "matched": True,
+            "command": command,
+            "args": args,
+            "prompt": prompt_text,
+        },
+    )
     return InterceptedCommand(command=command, args=args)

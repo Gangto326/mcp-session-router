@@ -30,6 +30,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from session_manager import debug_log
+
 
 class WrapperSocketServer:
     def __init__(
@@ -122,6 +124,11 @@ class WrapperSocketServer:
             # MCP-wrapper session isn't disturbed.
             # 단일 클라이언트 정책 — 기존 MCP-래퍼 세션을 흔들지 않도록 새
             # 연결을 즉시 닫는다.
+            debug_log.log(
+                "SOCKET_REJECT",
+                "SYSTEM",
+                {"reason": "second_client_attempted"},
+            )
             try:
                 client.close()
             except OSError:
@@ -131,6 +138,7 @@ class WrapperSocketServer:
         client.setblocking(False)
         self._client_sock = client
         self._read_buffer = b""
+        debug_log.log("SOCKET_ACCEPT", "SYSTEM", {"client_fd": client.fileno()})
 
     def handle_client_readable(self) -> None:
         """
@@ -163,7 +171,29 @@ class WrapperSocketServer:
                 # Drop malformed frames; a misbehaving peer shouldn't crash
                 # the wrapper, and there's nothing useful to do with garbage.
                 # 잘못된 프레임은 무시. 잘못 동작하는 피어가 래퍼를 죽이지 않도록.
+                debug_log.log(
+                    "SOCKET_RECV",
+                    "SYSTEM",
+                    {
+                        "direction": "wrapper<-mcp",
+                        "dropped": True,
+                        "reason": "malformed_frame",
+                        "len": len(line),
+                    },
+                )
                 continue
+            debug_log.log(
+                "SOCKET_RECV",
+                "MCP_TOOL",
+                {
+                    "direction": "wrapper<-mcp",
+                    "type": message.get("type") if isinstance(message, dict) else None,
+                    "action": message.get("action")
+                    if isinstance(message, dict)
+                    else None,
+                    "payload": message,
+                },
+            )
             self._on_message(message)
 
     # ----------------------------------------------------------------- Sender
@@ -176,6 +206,19 @@ class WrapperSocketServer:
         message를 JSON으로 직렬화한 뒤 개행을 붙여 클라이언트로 전송한다.
         성공 여부를 반환하며, 실패 시 클라이언트 연결을 닫는다.
         """
+        # Single SOCKET_SEND checkpoint on the wrapper→MCP direction.
+        # 단일 SOCKET_SEND 체크포인트 (wrapper → MCP 방향).
+        debug_log.log(
+            "SOCKET_SEND",
+            "WRAPPER",
+            {
+                "direction": "wrapper->mcp",
+                "type": message.get("type"),
+                "action": message.get("action"),
+                "payload": message,
+                "has_client": self._client_sock is not None,
+            },
+        )
         if self._client_sock is None:
             return False
         payload = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")

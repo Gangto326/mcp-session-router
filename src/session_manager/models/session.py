@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from session_manager import debug_log
+
 
 def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat()
@@ -123,5 +125,35 @@ class SessionMetadata:
 
         Claude Code conversation id 를 이 세션에 연결한다. 이미 있으면 무시 (멱등).
         """
-        if conv_id and conv_id not in self.claude_conversation_ids:
-            self.claude_conversation_ids.append(conv_id)
+        if not conv_id:
+            return
+        before = list(self.claude_conversation_ids)
+        if conv_id in before:
+            debug_log.log(
+                "CONV_LINK",
+                "MCP_TOOL",
+                {
+                    "session": self.name,
+                    "conv_id": conv_id,
+                    "skipped": True,
+                    "reason": "already_linked",
+                    "list": before,
+                },
+                conv_id=conv_id,
+                session=self.name,
+            )
+            return
+        self.claude_conversation_ids.append(conv_id)
+        debug_log.log(
+            "CONV_LINK",
+            "MCP_TOOL",
+            {
+                "session": self.name,
+                "conv_id": conv_id,
+                "skipped": False,
+                "before": before,
+                "after": list(self.claude_conversation_ids),
+            },
+            conv_id=conv_id,
+            session=self.name,
+        )

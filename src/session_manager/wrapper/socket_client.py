@@ -26,6 +26,8 @@ import socket
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from session_manager import debug_log
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,11 +77,22 @@ class WrapperSocketClient:
         핸드셰이크 요청을 보내고 래퍼가 응답한 현재 세션 이름을 반환한다.
         래퍼에 활성 세션이 없으면 None을 반환한다.
         """
+        debug_log.log("HANDSHAKE", "MCP_TOOL", {"phase": "request"})
         self._send({"type": "handshake_request"})
         response = self._recv_one()
         if response is None:
+            debug_log.log(
+                "HANDSHAKE", "MCP_TOOL", {"phase": "response", "result": None}
+            )
             return None
-        return response.get("current_session_name")
+        result = response.get("current_session_name")
+        debug_log.log(
+            "HANDSHAKE",
+            "MCP_TOOL",
+            {"phase": "response", "result": result},
+            session=result,
+        )
+        return result
 
     # -------------------------------------------------------- signal sender
     # 신호 송신 ------------------------------------------------------------------
@@ -99,6 +112,18 @@ class WrapperSocketClient:
 
         message를 라인 구분 JSON으로 직렬화하여 전송한다.
         """
+        # Single SOCKET_SEND checkpoint on the MCP→wrapper direction.
+        # 단일 SOCKET_SEND 체크포인트 (MCP → wrapper 방향).
+        debug_log.log(
+            "SOCKET_SEND",
+            "MCP_TOOL",
+            {
+                "direction": "mcp->wrapper",
+                "type": message.get("type"),
+                "action": message.get("action"),
+                "payload": message,
+            },
+        )
         if self._sock is None:
             raise RuntimeError("Not connected")
         payload = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
@@ -160,6 +185,16 @@ class WrapperSocketClient:
                         continue
                     if not isinstance(msg, dict):
                         continue
+                    debug_log.log(
+                        "SOCKET_RECV",
+                        "WRAPPER",
+                        {
+                            "direction": "mcp<-wrapper",
+                            "type": msg.get("type"),
+                            "action": msg.get("action"),
+                            "payload": msg,
+                        },
+                    )
                     try:
                         await on_message(msg)
                     except Exception:

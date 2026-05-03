@@ -12,6 +12,7 @@ import json
 import logging
 from pathlib import Path
 
+from session_manager import debug_log
 from session_manager.storage import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,11 @@ def cleanup_expired_sessions(
     now = datetime.datetime.now(datetime.UTC)
     cutoff = now - datetime.timedelta(days=period_days)
     deleted: list[str] = []
+    debug_log.log(
+        "CLEANUP_START",
+        "SYSTEM",
+        {"period_days": period_days, "cutoff": cutoff.isoformat()},
+    )
 
     for session in store.list_sessions():
         try:
@@ -72,5 +78,20 @@ def cleanup_expired_sessions(
                 session.name,
                 session.last_accessed,
             )
+            debug_log.log(
+                "CLEANUP_DELETE",
+                "SYSTEM",
+                {
+                    "session": session.name,
+                    "session_id": session.session_id,
+                    "last_accessed": session.last_accessed,
+                },
+                session=session.name,
+            )
 
+    debug_log.log(
+        "CLEANUP_DONE",
+        "SYSTEM",
+        {"deleted_count": len(deleted), "deleted": deleted},
+    )
     return deleted

@@ -81,12 +81,57 @@ async def send_channel_notification(
     The message wraps as ``<channel source="session-manager" ...>content</channel>``
     in Claude's input.
     """
+    debug_log.log(
+        "CHANNEL_PUSH",
+        "MCP_TOOL",
+        {
+            "content": debug_log.mask_text(content),
+            "meta": meta,
+        },
+    )
     notif = JSONRPCNotification(
         jsonrpc="2.0",
         method="notifications/claude/channel",
         params={"content": content, "meta": meta},
     )
     await write_stream.send(SessionMessage(message=JSONRPCMessage(notif)))
+
+
+def _log_tool_call(
+    tool: str, app: AppContext | None, args: dict[str, Any]
+) -> str:
+    """Emit MCP_TOOL_CALL with a fresh event id; pair with _log_tool_return.
+
+    MCP_TOOL_CALL 이벤트를 기록하고 새 event_id 반환. 같은 id 로
+    _log_tool_return 과 짝지어 호출 ↔ 반환을 묶는다.
+    """
+    event_id = debug_log.new_event_id()
+    debug_log.log(
+        "MCP_TOOL_CALL",
+        "LLM",
+        {"tool": tool, "event_id": event_id, "args": args},
+        session=app.state.get_current_session() if app else None,
+    )
+    return event_id
+
+
+def _log_tool_return(
+    tool: str,
+    event_id: str,
+    app: AppContext | None,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Emit MCP_TOOL_RETURN sharing event_id with the matching _log_tool_call.
+
+    같은 event_id 로 _log_tool_call 과 짝지어 MCP_TOOL_RETURN 을 기록한다.
+    """
+    debug_log.log(
+        "MCP_TOOL_RETURN",
+        "MCP_TOOL",
+        {"tool": tool, "event_id": event_id, "result": result},
+        session=app.state.get_current_session() if app else None,
+    )
+    return result
 
 _DEFAULT_SESSION_NAME = "default"
 _DEFAULT_SESSION_TITLE = "Default session"
@@ -136,6 +181,15 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     """
     project_path = Path(os.getcwd())
     socket_path = os.environ.get("SESSION_MANAGER_SOCKET", "")
+    debug_log.log(
+        "MCP_BOOT",
+        "SYSTEM",
+        {
+            "project_path": str(project_path),
+            "socket_path": socket_path,
+            "env": debug_log.mask_env(),
+        },
+    )
 
     # -- stores
     session_store = SessionStore(project_path)
@@ -279,6 +333,12 @@ def _make_intercept_handler(
         }
         # Mark intercept active so session_end knows to notify the wrapper.
         # 가로채기 활성 표시 — session_end가 래퍼 통보 여부 판단에 사용.
+        debug_log.log(
+            "INTERCEPT_RECEIVED",
+            "USER",
+            {"command": command, "args": args, "current_session": current},
+            session=current,
+        )
         app.intercept_active["value"] = True
         await send_channel_notification(write_stream, content, meta)
         logger.info("Pushed intercept channel notification: %s", full_cmd)
@@ -410,6 +470,7 @@ def check_session(ctx: Context) -> dict:
     의심스러우면 STAY 보다 SWITCH/NEW 를 선호한다.
     """
     app = _get_app_ctx(ctx)
+    event_id = _log_tool_call("check_session", app, {})
     sessions = app.session_store.list_sessions()
     # active_conversation_id is the Claude Code conversation id whose
     # jsonl was most recently appended to under this cwd. Combined with
@@ -419,7 +480,7 @@ def check_session(ctx: Context) -> dict:
     # active_conversation_id 와 각 세션의 claude_conversation_ids 를 결합하면
     # current 가 None 인 picker 후 상태에서도 라우팅 하네스가 사용자가 들어간
     # conversation 을 정확히 어느 세션에 매칭할지 결정할 수 있다.
-    return {
+    result = {
         "current": app.state.get_current_session(),
         "active_conversation_id": get_active_conversation_id(app.project_path),
         "sessions": [
@@ -434,6 +495,7 @@ def check_session(ctx: Context) -> dict:
             for s in sessions
         ],
     }
+    return _log_tool_return("check_session", event_id, app, result)
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
@@ -445,6 +507,15 @@ def session_register(name: str, title: str, ctx: Context, summary: str | None = 
     호출되어, 세션에 이름·제목을 부여하고 현재 세션으로 설정한다.
     """
     app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "session_register",
+        app,
+        {
+            "name": name,
+            "title": title,
+            "summary": debug_log.mask_text(summary),
+        },
+    )
     session = SessionMetadata.new(name=name, title=title, summary=summary)
     # Link the active Claude Code conversation so picker-driven returns
     # to this conversation can be matched back to this session.
@@ -455,11 +526,16 @@ def session_register(name: str, title: str, ctx: Context, summary: str | None = 
         session.link_conversation(conv_id)
     app.session_store.save_session(session)
     app.state.set_current_session(name)
-    return {
-        "registered": name,
-        "session_id": session.session_id,
-        "claude_conversation_ids": list(session.claude_conversation_ids),
-    }
+    return _log_tool_return(
+        "session_register",
+        event_id,
+        app,
+        {
+            "registered": name,
+            "session_id": session.session_id,
+            "claude_conversation_ids": list(session.claude_conversation_ids),
+        },
+    )
 
 
 _HANDOFF_INSTRUCTIONS = [
@@ -485,6 +561,16 @@ def session_switch(
     세션에 속한다고 판단했을 때 호출한다.
     """
     app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "session_switch",
+        app,
+        {
+            "target": target,
+            "summary": debug_log.mask_text(summary),
+            "user_prompt": debug_log.mask_text(user_prompt),
+            "updated_title": updated_title,
+        },
+    )
     current_name = app.state.get_current_session()
 
     # Compute active conversation once — used for both outgoing-session
@@ -536,7 +622,9 @@ def session_switch(
             target_session.link_conversation(active_conv_id)
             app.session_store.save_session(target_session)
 
-    return {"switched_to": target}
+    return _log_tool_return(
+        "session_switch", event_id, app, {"switched_to": target}
+    )
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
@@ -555,6 +643,16 @@ def session_create(
     현재 세션을 마무리하고 래퍼에 NEW 신호를 보낸다.
     """
     app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "session_create",
+        app,
+        {
+            "new_session_name": new_session_name,
+            "title": title,
+            "handoff_summary": debug_log.mask_text(handoff_summary),
+            "user_prompt": debug_log.mask_text(user_prompt),
+        },
+    )
 
     # Clean up expired sessions when creating a new one.
     # 새 세션 생성 시 만료된 세션을 정리한다.
@@ -600,10 +698,15 @@ def session_create(
     })
 
     app.state.set_current_session(new_session_name)
-    return {
-        "created": new_session_name,
-        "rename_current": rename_current,
-    }
+    return _log_tool_return(
+        "session_create",
+        event_id,
+        app,
+        {
+            "created": new_session_name,
+            "rename_current": rename_current,
+        },
+    )
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
@@ -617,6 +720,11 @@ def session_end(summary: str, ctx: Context) -> dict:
     하게 한다.
     """
     app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "session_end",
+        app,
+        {"summary": debug_log.mask_text(summary)},
+    )
     current_name = app.state.get_current_session()
 
     if current_name is not None:
@@ -649,7 +757,7 @@ def session_end(summary: str, ctx: Context) -> dict:
             logger.warning("Failed to send intercept_done: %s", exc)
         app.intercept_active["value"] = False
 
-    return {"ended": current_name}
+    return _log_tool_return("session_end", event_id, app, {"ended": current_name})
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
@@ -668,6 +776,18 @@ def update_static(
     갱신하면 다른 세션에서 최신 값을 읽을 수 있다.
     """
     app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "update_static",
+        app,
+        {
+            "project_context": debug_log.mask_text(project_context),
+            "conventions": debug_log.mask_text(conventions),
+            "project_map": project_map,
+            # variables can hold secrets — log only key names + value lengths.
+            # variables 는 비밀이 들어올 수 있으므로 key 이름과 값 길이만 기록.
+            "variables": debug_log.mask_dict_keys_only(variables),
+        },
+    )
     static = app.field_store.load_static()
 
     if project_context is not None:
@@ -681,7 +801,9 @@ def update_static(
 
     static.touch()
     app.field_store.save_static(static)
-    return {"updated_at": static.updated_at}
+    return _log_tool_return(
+        "update_static", event_id, app, {"updated_at": static.updated_at}
+    )
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
@@ -694,13 +816,21 @@ def init_project(content: str, ctx: Context) -> dict:
     이미 존재하면 덮어쓰지 않고 기존 내용을 그대로 반환한다.
     """
     app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "init_project", app, {"content": debug_log.mask_text(content)}
+    )
     if app.project_context_store.exists():
-        return {
-            "created": False,
-            "content": app.project_context_store.read(),
-        }
+        return _log_tool_return(
+            "init_project",
+            event_id,
+            app,
+            {
+                "created": False,
+                "content": app.project_context_store.read(),
+            },
+        )
     app.project_context_store.write(content)
-    return {"created": True}
+    return _log_tool_return("init_project", event_id, app, {"created": True})
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
@@ -712,8 +842,13 @@ def reinit_project(content: str, ctx: Context) -> dict:
     프로젝트 맥락 문서를 새로 쓰고 싶을 때 호출한다.
     """
     app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "reinit_project", app, {"content": debug_log.mask_text(content)}
+    )
     app.project_context_store.write(content)
-    return {"reinitialized": True}
+    return _log_tool_return(
+        "reinit_project", event_id, app, {"reinitialized": True}
+    )
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
@@ -725,8 +860,13 @@ def update_project_context(content: str, ctx: Context) -> dict:
     변경되었을 때 호출하여 문서를 최신 상태로 유지한다.
     """
     app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "update_project_context", app, {"content": debug_log.mask_text(content)}
+    )
     app.project_context_store.write(content)
-    return {"updated": True}
+    return _log_tool_return(
+        "update_project_context", event_id, app, {"updated": True}
+    )
 
 
 def main() -> None:

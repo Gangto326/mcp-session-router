@@ -81,7 +81,19 @@ def main() -> int:
     # 다시 connect 할 수 있도록 노출.
     os.environ[SOCKET_ENV_VAR] = socket_path
 
-    claude_args = _ensure_channels_flag(sys.argv[1:])
+    raw_args = sys.argv[1:]
+    claude_args = _ensure_channels_flag(raw_args)
+    debug_log.log(
+        "WRAPPER_BOOT",
+        "SYSTEM",
+        {
+            "project_path": project_path,
+            "socket_path": socket_path,
+            "raw_args": raw_args,
+            "channels_flag_added": claude_args[: len(claude_args) - len(raw_args)],
+            "env": debug_log.mask_env(),
+        },
+    )
 
     wrapper = SessionManagerWrapper(
         socket_path=socket_path,
@@ -89,6 +101,7 @@ def main() -> int:
         project_path=project_path,
     )
     wrapper.start()
+    debug_log.log("WRAPPER_EXIT", "SYSTEM", {})
     return 0
 
 

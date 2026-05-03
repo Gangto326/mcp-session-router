@@ -27,6 +27,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from session_manager import debug_log
+
 # Claude Code's project-directory naming rule: every non-alphanumeric
 # character of the absolute cwd is replaced by '-'.
 # Claude Code 프로젝트 디렉토리 명명 규칙 — 절대 cwd의 비-알파넘 문자를
@@ -58,9 +60,45 @@ def get_active_conversation_id(cwd: Path) -> str | None:
     """
     project_dir = Path.home() / ".claude" / "projects" / encode_cwd(cwd)
     if not project_dir.is_dir():
+        debug_log.log(
+            "CONV_QUERY",
+            "SYSTEM",
+            {
+                "result": None,
+                "reason": "project_dir_missing",
+                "project_dir": str(project_dir),
+            },
+        )
         return None
     jsonls = list(project_dir.glob("*.jsonl"))
     if not jsonls:
+        debug_log.log(
+            "CONV_QUERY",
+            "SYSTEM",
+            {
+                "result": None,
+                "reason": "no_jsonl_files",
+                "project_dir": str(project_dir),
+            },
+        )
         return None
     latest = max(jsonls, key=lambda p: p.stat().st_mtime)
+    # Top 3 by mtime so the log shows alternatives when the wrong jsonl
+    # is suspected of getting picked (helps diagnose stale-conv issues).
+    # mtime 상위 3개를 함께 기록 — 잘못된 jsonl 이 골라졌다고 의심될 때
+    # 대안을 로그에서 확인 (옛 conversation 잔존 문제 진단에 도움).
+    top3 = sorted(jsonls, key=lambda p: p.stat().st_mtime, reverse=True)[:3]
+    debug_log.log(
+        "CONV_QUERY",
+        "SYSTEM",
+        {
+            "result": latest.stem,
+            "project_dir": str(project_dir),
+            "candidates": len(jsonls),
+            "top3": [
+                {"id": p.stem, "mtime": p.stat().st_mtime} for p in top3
+            ],
+        },
+        conv_id=latest.stem,
+    )
     return latest.stem
