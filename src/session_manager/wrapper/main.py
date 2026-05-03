@@ -20,6 +20,7 @@ import hashlib
 import os
 import sys
 
+from session_manager import debug_log
 from session_manager.wrapper.pty_wrapper import SessionManagerWrapper
 
 SOCKET_ENV_VAR = "SESSION_MANAGER_SOCKET"
@@ -62,6 +63,15 @@ def _ensure_channels_flag(args: list[str]) -> list[str]:
 
 
 def main() -> int:
+    # Tag this process and seed the run id BEFORE anything else so the
+    # MCP server (grandchild) inherits the same id via env and all events
+    # land in one NDJSON file.
+    # 다른 동작보다 먼저 이 프로세스를 태깅하고 run id를 seed — MCP 서버
+    # (손자 프로세스) 가 환경 변수로 같은 id를 상속해 모든 이벤트가 한
+    # NDJSON 파일에 모이도록 한다.
+    debug_log.set_proc_label("wrapper")
+    debug_log.get_run_id()
+
     project_path = os.getcwd()
     socket_path = _resolve_socket_path(project_path)
 

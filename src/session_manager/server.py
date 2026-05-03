@@ -33,6 +33,7 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 
+from session_manager import debug_log
 from session_manager.claude_conversation import get_active_conversation_id
 from session_manager.lifecycle import cleanup_expired_sessions, get_cleanup_period_days
 from session_manager.models.session import (
@@ -734,6 +735,14 @@ def main() -> None:
 
     Claude Code가 이 MCP 서버를 spawn할 때 호출하는 진입점.
     """
+    # Tag this process so log records distinguish MCP server events from
+    # wrapper events. The run id is inherited from the wrapper via the
+    # SESSION_MANAGER_RUN_ID env var, so all events land in one file.
+    # 이 프로세스를 태깅 — 로그 레코드에서 MCP 서버 이벤트와 wrapper 이벤트
+    # 가 구분된다. run id는 SESSION_MANAGER_RUN_ID 환경 변수를 통해 wrapper
+    # 로부터 상속되므로 모든 이벤트가 한 파일에 모인다.
+    debug_log.set_proc_label("mcp")
+
     mcp_server.run()
 
 
