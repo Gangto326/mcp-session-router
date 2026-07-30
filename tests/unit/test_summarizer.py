@@ -158,6 +158,35 @@ class TestQueue:
     def test_no_queue_dir(self, tmp_path: Path) -> None:
         assert summarizer.load_pending_tasks(tmp_path) == []
 
+    def test_duplicate_task_skipped(self, project: Path) -> None:
+        """A→B→A must not pay for the same summary twice.
+
+        A→B→A 왕복이 같은 요약 비용을 두 번 내지 않게 한다.
+        """
+        first = summarizer.enqueue(project, _task())
+        second = summarizer.enqueue(project, _task())
+        assert first is not None
+        assert second is None
+        assert len(summarizer.load_pending_tasks(project)) == 1
+
+    def test_different_kind_is_not_duplicate(self, project: Path) -> None:
+        summarizer.enqueue(project, _task(kind=summarizer.KIND_DEPARTED))
+        assert summarizer.enqueue(project, _task(kind=summarizer.KIND_ACTIVE)) is not None
+        assert len(summarizer.load_pending_tasks(project)) == 2
+
+    def test_requeue_allowed_after_consumption(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        """Dedup keys on *pending* work only — a later refresh must still run.
+
+        중복 판정은 *대기 중* 작업에만 적용 — 처리 후의 재요청은 다시 실행되어야 한다.
+        """
+        summarizer.enqueue(project, _task())
+        summarizer.process_queue(
+            project, run=RunRecorder([GOOD_RESPONSE]), transcript_dir=transcripts
+        )
+        assert summarizer.enqueue(project, _task()) is not None
+
 
 # ---- process_queue -------------------------------------------------------
 
@@ -303,35 +332,81 @@ class _FakeProc:
 
 class TestRunHeadlessSummary:
     @pytest.fixture(autouse=True)
-    def _no_junk_cleanup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _isolate_junk_sweep(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Keep the test away from the real ~/.claude junk directory.
 
         실제 ~/.claude 정크 디렉토리를 건드리지 않게 격리.
         """
-        self.cleaned: list[str] = []
-        monkeypatch.setattr(
-            summarizer, "_cleanup_junk_transcript", self.cleaned.append
-        )
+        self.sweeps = 0
+
+        def count_sweep() -> None:
+            self.sweeps += 1
+
+        monkeypatch.setattr(summarizer, "_sweep_junk_transcripts", count_sweep)
 
     def _patch_subprocess(
         self, monkeypatch: pytest.MonkeyPatch, result: Any
     ) -> None:
+        self.calls: list[dict[str, Any]] = []
+
         def fake_run(*args: Any, **kwargs: Any) -> Any:
+            self.calls.append({"argv": args[0], **kwargs})
             if isinstance(result, Exception):
                 raise result
             return result
 
         monkeypatch.setattr(summarizer.subprocess, "run", fake_run)
 
-    def test_success_returns_result_and_cleans_junk(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_success_returns_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
         envelope = json.dumps(
             {"is_error": False, "session_id": "junk-id", "result": GOOD_RESPONSE}
         )
         self._patch_subprocess(monkeypatch, _FakeProc(envelope))
         assert summarizer.run_headless_summary("p") == GOOD_RESPONSE
-        assert self.cleaned == ["junk-id"]
+
+    def test_prompt_goes_to_stdin_never_argv(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The excerpt must not be visible to ``ps``.
+
+        발췌가 ``ps`` 로 노출되면 안 된다.
+        """
+        secret = "user: 비밀 대화 내용"
+        envelope = json.dumps({"is_error": False, "result": GOOD_RESPONSE})
+        self._patch_subprocess(monkeypatch, _FakeProc(envelope))
+        summarizer.run_headless_summary(secret)
+        call = self.calls[0]
+        assert call["input"] == secret
+        assert secret not in call["argv"]
+
+    def test_mcp_servers_disabled_and_socket_env_stripped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No MCP load (measured ~23K tokens) and no route back to the wrapper.
+
+        MCP 무로드 (실측 약 23K 토큰) + 래퍼 소켓 접근 경로 차단.
+        """
+        monkeypatch.setenv("SESSION_MANAGER_SOCKET", "/tmp/should-not-leak.sock")
+        envelope = json.dumps({"is_error": False, "result": GOOD_RESPONSE})
+        self._patch_subprocess(monkeypatch, _FakeProc(envelope))
+        summarizer.run_headless_summary("p")
+        call = self.calls[0]
+        assert "--strict-mcp-config" in call["argv"]
+        assert summarizer._EMPTY_MCP_CONFIG in call["argv"]
+        assert "SESSION_MANAGER_SOCKET" not in call["env"]
+
+    def test_junk_swept_before_every_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sweeping before (not after) survives timeouts and parse failures.
+
+        사후가 아닌 사전 sweep — 타임아웃·파싱 실패에서도 정크가 남지 않는다.
+        """
+        self._patch_subprocess(
+            monkeypatch, subprocess.TimeoutExpired(cmd="claude", timeout=1)
+        )
+        summarizer.run_headless_summary("p")
+        assert self.sweeps == 1
 
     def test_cli_error_envelope_returns_none(
         self, monkeypatch: pytest.MonkeyPatch
@@ -341,9 +416,6 @@ class TestRunHeadlessSummary:
         )
         self._patch_subprocess(monkeypatch, _FakeProc(envelope, returncode=1))
         assert summarizer.run_headless_summary("p") is None
-        # Even a failed call records a junk transcript — still cleaned.
-        # 실패한 호출도 정크 transcript 를 남기므로 역시 정리한다.
-        assert self.cleaned == ["junk-id"]
 
     def test_plain_text_error_returns_none(
         self, monkeypatch: pytest.MonkeyPatch

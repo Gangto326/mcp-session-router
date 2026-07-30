@@ -168,6 +168,47 @@ class TestExtractDialogue:
     def test_empty_events(self) -> None:
         assert te.extract_dialogue([]) == ""
 
+    def test_user_text_blocks_kept(self, tmp_path: Path) -> None:
+        """A user turn stored as a block list (e.g. with an image) still counts.
+
+        블록 리스트로 저장된 user 발화 (예: 이미지 첨부) 도 발췌에 포함된다.
+        """
+        events = [
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {"type": "image", "source": {}},
+                        {"type": "text", "text": "이 스크린샷을 봐줘"},
+                    ]
+                },
+            },
+            _assistant(_text_block("확인했습니다")),
+        ]
+        path = _write_jsonl(tmp_path / "img.jsonl", events)
+        out = te.extract_dialogue(te.read_tail_events(path))
+        assert out == "user: 이 스크린샷을 봐줘\nassistant: 확인했습니다"
+
+    def test_interruption_marker_dropped(self, tmp_path: Path) -> None:
+        """CLI-written interruption markers are not user dialogue.
+
+        CLI 가 쓴 중단 표식은 사용자 발화가 아니다 (실측된 형태: 블록 리스트).
+        """
+        events = [
+            _user("진짜 질문"),
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "[Request interrupted by user]"}
+                    ]
+                },
+            },
+        ]
+        path = _write_jsonl(tmp_path / "int.jsonl", events)
+        out = te.extract_dialogue(te.read_tail_events(path))
+        assert out == "user: 진짜 질문"
+
 
 # ---- extract_full_text ---------------------------------------------------
 
@@ -180,10 +221,22 @@ class TestExtractFullText:
 
     def test_max_chars_keeps_tail(self, normal_jsonl: Path) -> None:
         out = te.extract_full_text(normal_jsonl, max_chars=50)
-        assert len(out) == 50
-        # The newest dialogue must survive the truncation.
-        # 절단 후에도 가장 최근 대화가 남아야 한다.
+        # Budget respected and the newest dialogue survives. Here the final
+        # message alone exceeds the budget, so there is no line boundary to
+        # cut at — its tail is kept (documented fallback).
+        # 예산을 지키고 가장 최근 대화가 남는다. 이 픽스처는 마지막 메시지
+        # 하나가 예산을 넘으므로 자를 줄 경계가 없다 — 꼬리를 남긴다 (명시된 fallback).
+        assert len(out) <= 50
         assert out.endswith("가" * 10)
+
+    def test_line_boundary_cut_drops_partial_first_line(self, tmp_path: Path) -> None:
+        events = [_user("첫 번째 질문입니다"), _user("두 번째 질문입니다")]
+        path = _write_jsonl(tmp_path / "b.jsonl", events)
+        full = te.extract_full_text(path)
+        # Slice mid-way through the first line — that partial line must go.
+        # 첫 줄 중간을 자르는 예산 — 잘린 줄은 통째로 버려져야 한다.
+        out = te.extract_full_text(path, max_chars=len(full) - 3)
+        assert out == "user: 두 번째 질문입니다"
 
     def test_corrupt_lines_skipped(self, tmp_path: Path) -> None:
         path = _write_jsonl(
