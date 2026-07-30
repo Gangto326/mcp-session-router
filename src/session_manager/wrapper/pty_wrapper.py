@@ -41,12 +41,14 @@ import pexpect
 
 from session_manager import debug_log, summarizer
 from session_manager.claude_conversation import (
+    encode_cwd,
     get_active_conversation_id,
     get_conversation_activity,
 )
 from session_manager.lifecycle import get_cleanup_period_days
 from session_manager.storage.file_store import SessionStore
 from session_manager.summarizer import SummarizerWorker, SummaryTask
+from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS, scan_dialogue_growth
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
     match_intercept_command,
@@ -289,6 +291,15 @@ class SessionManagerWrapper:
         # 백그라운드 요약기 워커 (R1). 래퍼 전체 lifetime 동안 유지되며,
         # 아래 트리거들이 채우는 파일 큐를 비운다.
         self.summarizer_worker = SummarizerWorker(Path(self.project_path))
+
+        # Incremental dialogue-length scan for the periodic refresh trigger.
+        # Keeping the file offset means each turn parses only what was
+        # appended since the last one.
+        # 주기 갱신 트리거용 증분 대화 길이 스캔. 파일 offset 을 유지하므로 매
+        # 턴은 직전 이후 append 된 부분만 파싱한다.
+        self._dialogue_scan_conv_id: str | None = None
+        self._dialogue_scan_offset: int = 0
+        self._dialogue_scan_chars: int = 0
 
     def start(self) -> None:
         """
@@ -828,6 +839,86 @@ class SessionManagerWrapper:
         )
         self.summarizer_worker.wake()
 
+    def _check_summary_refresh(self) -> None:
+        """Refresh the summary once enough new dialogue has accumulated.
+
+        새 대화가 충분히 쌓이면 요약을 갱신한다.
+
+        Without this a session worked in for hours — no switch, no
+        ``/clear`` — keeps the summary it had at the start, and the router
+        reads a description of work that finished long ago. The trigger
+        measures *dialogue*, not tokens or turns: token growth counts tool
+        results and thinking, so reading a few large files would fire a
+        pointless re-summary, and turns vary in size too much to mean
+        anything. The threshold is the excerpt window itself — once more
+        new dialogue exists than one summary can read, the summary is
+        provably behind.
+
+        이것이 없으면 몇 시간을 작업한 세션이 (전환도 ``/clear`` 도 없었다면)
+        시작 시점의 요약을 그대로 갖고 있어, 라우터는 오래전에 끝난 작업의
+        설명을 읽는다. 트리거는 토큰이나 턴이 아니라 *대화* 를 잰다: 토큰
+        증가는 도구 결과·thinking 을 포함하므로 큰 파일 몇 개만 읽어도 무의미한
+        재요약이 발동하고, 턴은 크기 편차가 너무 커서 의미가 없다. 임계값은
+        발췌 창 그 자체다 — 요약 한 번이 읽을 수 있는 양보다 새 대화가 많아진
+        시점이면 그 요약은 확실히 뒤처져 있다.
+        """
+        session_name = self._current_session_name
+        if session_name is None:
+            return
+        project = Path(self.project_path)
+        conv_id = get_active_conversation_id(project)
+        if conv_id is None:
+            return
+        if conv_id != self._dialogue_scan_conv_id:
+            # New conversation (rollover, switch, /clear): restart the scan.
+            # 새 conversation (롤오버·전환·/clear): 스캔을 처음부터.
+            self._dialogue_scan_conv_id = conv_id
+            self._dialogue_scan_offset = 0
+            self._dialogue_scan_chars = 0
+        jsonl_path = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / encode_cwd(project)
+            / f"{conv_id}.jsonl"
+        )
+        (
+            self._dialogue_scan_offset,
+            self._dialogue_scan_chars,
+        ) = scan_dialogue_growth(
+            jsonl_path, self._dialogue_scan_offset, self._dialogue_scan_chars
+        )
+        session = SessionStore(project).load_session_by_name(session_name)
+        if session is None:
+            return
+        # A baseline measured in another conversation says nothing about
+        # this one — treat it as zero rather than comparing across them.
+        # 다른 conversation 에서 측정한 기준값은 이 conversation 에 대해 아무
+        # 것도 말해주지 않는다 — 교차 비교 대신 0 으로 본다.
+        baseline = (
+            session.summary_dialogue_chars
+            if session.summary_dialogue_conversation_id == conv_id
+            else 0
+        )
+        growth = self._dialogue_scan_chars - baseline
+        if growth < EXCERPT_MAX_CHARS:
+            return
+        debug_log.log(
+            "SUMMARY_TRIGGER",
+            "WRAPPER",
+            {
+                "trigger": "growth",
+                "growth_chars": growth,
+                "threshold": EXCERPT_MAX_CHARS,
+            },
+            conv_id=conv_id,
+            session=session_name,
+        )
+        # Duplicate enqueues while this one is still pending are dropped by
+        # the queue, so re-checking every turn costs nothing.
+        # 대기 중 중복 적재는 큐가 버리므로 매 턴 재확인해도 비용이 없다.
+        self._enqueue_active_summary()
+
     def _enqueue_stale_summaries(self) -> None:
         """Boot-time recovery: queue sessions whose summary refresh was lost.
 
@@ -1105,6 +1196,12 @@ class SessionManagerWrapper:
         # the same ❯ on every chunk.
         # done 상태에서 pending 없으면 같은 ❯에 매번 매칭되지 않게 비움.
         self.output_buffer = b""
+
+        # A fresh prompt with nothing else in flight means the previous turn
+        # finished — the one safe point to measure dialogue growth.
+        # 진행 중인 동작 없이 새 프롬프트가 떴다는 것은 직전 턴이 끝났다는
+        # 뜻이다 — 대화 증가량을 재기에 안전한 유일한 지점.
+        self._check_summary_refresh()
 
     def _handle_user_line(self, line: bytes) -> None:
         return

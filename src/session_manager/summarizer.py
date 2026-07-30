@@ -72,7 +72,7 @@ from typing import Any
 from session_manager import debug_log
 from session_manager.claude_conversation import encode_cwd
 from session_manager.storage.file_store import SessionStore
-from session_manager.transcript_excerpt import extract_full_text
+from session_manager.transcript_excerpt import dialogue_length, extract_full_text
 
 # ---- Queue layout --------------------------------------------------------
 # 큐 배치.
@@ -554,6 +554,13 @@ def _process_task(
     # 백그라운드 갱신은 사용자 접근이 아니며, 갱신하면 놀고 있는 세션이
     # 라우터에게 방금 쓴 세션처럼 보인다.
     session.summary_updated_at = _utc_now_iso()
+    # Baseline for periodic refresh: how much dialogue this summary covers.
+    # Scoped to the conversation it was measured in (see the model's field
+    # comment for why the pairing matters).
+    # 주기 갱신 기준값 — 이 요약이 포괄하는 대화의 양. 측정한 conversation
+    # 범위로 한정한다 (쌍으로 두는 이유는 모델 필드 주석 참조).
+    session.summary_dialogue_chars = dialogue_length(jsonl_path)
+    session.summary_dialogue_conversation_id = task.conversation_id
     store.save_session(session)
     debug_log.log(
         "SUMMARIZER",

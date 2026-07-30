@@ -86,6 +86,13 @@ USAGE_KEY_CACHE_READ = "cache_read_input_tokens"
 USAGE_KEY_CACHE_CREATION = "cache_creation_input_tokens"
 USAGE_KEY_OUTPUT = "output_tokens"
 
+# How much dialogue a single summarisation reads. Also the yardstick for
+# "has enough new dialogue accumulated to be worth re-summarising?" —
+# both must be the same number, so both read it from here.
+# 한 번의 요약이 읽는 대화의 양. 동시에 "재요약할 만큼 새 대화가 쌓였는가"
+# 의 잣대이기도 하다 — 두 값은 같아야 하므로 양쪽 모두 여기서 참조한다.
+EXCERPT_MAX_CHARS = 30_000
+
 
 def read_tail_events(jsonl_path: Path, max_lines: int = 100) -> list[dict]:
     """Parse up to the last *max_lines* lines of a conversation JSONL.
@@ -235,7 +242,80 @@ def extract_dialogue(
     )
 
 
-def extract_full_text(jsonl_path: Path, max_chars: int = 30000) -> str:
+def scan_dialogue_growth(
+    jsonl_path: Path, offset: int = 0, total: int = 0
+) -> tuple[int, int]:
+    """Resume a dialogue-length scan from *offset*; return (new offset, total).
+
+    *offset* 부터 대화 길이 스캔을 이어서 수행하고 (새 offset, 총 길이) 반환.
+
+    Measures how much *dialogue* a transcript holds — the same filtered
+    text a summary is built from, so tool results and thinking blocks
+    don't count. The scan is incremental because it runs at the end of
+    every turn: a full re-scan of a tens-of-MB transcript would stall the
+    wrapper's I/O loop for hundreds of milliseconds each time.
+
+    transcript 에 담긴 *대화* 의 양을 잰다 — 요약이 만들어지는 것과 동일한
+    필터를 거친 텍스트이므로 도구 결과·thinking 은 세지 않는다. 매 턴 종료
+    시 실행되므로 증분 방식이다: 수십 MB transcript 를 매번 전체 재스캔하면
+    래퍼 I/O 루프가 그때마다 수백 ms 멈춘다.
+
+    Only whole lines are consumed, so a half-written final line is
+    re-read on the next call rather than parsed as garbage. A file that
+    shrank (or vanished and was recreated) resets the scan.
+
+    완결된 줄만 소비하므로, 쓰다 만 마지막 줄은 쓰레기로 파싱되지 않고 다음
+    호출에서 다시 읽힌다. 파일이 줄어들었으면 (또는 사라졌다 다시 생겼으면)
+    스캔을 리셋한다.
+    """
+    try:
+        size = jsonl_path.stat().st_size
+    except OSError:
+        return (0, 0)
+    if size < offset:
+        offset, total = 0, 0
+    if size == offset:
+        return (offset, total)
+    try:
+        with jsonl_path.open("rb") as fp:
+            fp.seek(offset)
+            data = fp.read(size - offset)
+    except OSError:
+        return (offset, total)
+    end = data.rfind(b"\n")
+    if end == -1:
+        return (offset, total)
+    for raw in data[: end + 1].split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        pair = _dialogue_text(event)
+        if pair is not None:
+            total += len(pair[1])
+    return (offset + end + 1, total)
+
+
+def dialogue_length(jsonl_path: Path) -> int:
+    """Total dialogue length of a transcript, scanned from the start.
+
+    transcript 전체의 대화 길이 (처음부터 스캔).
+
+    Shares its counting rule with ``scan_dialogue_growth`` by calling it —
+    the recorded baseline and the running measurement must agree exactly
+    or the growth comparison is meaningless.
+
+    ``scan_dialogue_growth`` 를 호출해 계수 규칙을 공유한다 — 기록된 기준값과
+    진행 중 측정값이 정확히 같은 규칙이어야 증가량 비교가 의미를 갖는다.
+    """
+    return scan_dialogue_growth(jsonl_path)[1]
+
+
+def extract_full_text(jsonl_path: Path, max_chars: int = EXCERPT_MAX_CHARS) -> str:
     """Extract the whole dialogue (tail-truncated to *max_chars*) for summarising.
 
     요약 생성용 — 대화 전체를 같은 필터로 추출하고 뒤에서부터 *max_chars*

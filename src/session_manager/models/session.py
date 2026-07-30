@@ -84,6 +84,19 @@ class SessionMetadata:
     # summary 가 마지막으로 갱신된 시각. 부팅 시 ``last_accessed`` 와
     # 비교해 강제 종료로 요약이 누락된 세션을 찾는다 (R1-C3).
     summary_updated_at: str | None = None
+    # Dialogue length the last summary was built from, and the conversation
+    # it was measured in. The pair is what makes periodic refresh work:
+    # growth is measured against this baseline, and the conversation id
+    # scopes it — after a rollover or switch the new conversation starts
+    # from zero, so comparing against the old one would make the growth
+    # negative and silence the trigger for a long time.
+    # 마지막 요약이 대상으로 한 대화 길이와, 그것을 측정한 conversation.
+    # 이 쌍이 주기 갱신을 성립시킨다: 증가량을 이 기준값과 비교하며,
+    # conversation id 가 그 범위를 한정한다 — 롤오버·전환 후 새 conversation
+    # 은 0 에서 시작하므로 옛 기준과 비교하면 증가량이 음수가 되어 트리거가
+    # 오랫동안 침묵한다.
+    summary_dialogue_chars: int = 0
+    summary_dialogue_conversation_id: str | None = None
     # Rich context for second-pass routing (key files, decisions,
     # detailed state). Populated from R2 onwards.
     # 2차 라우팅 판정용 리치 컨텍스트 (핵심 파일, 결정 사항, 상세 상태).
@@ -116,6 +129,8 @@ class SessionMetadata:
             "requirements": list(self.requirements),
             "summary_updated_at": self.summary_updated_at,
             "profile": self.profile,
+            "summary_dialogue_chars": self.summary_dialogue_chars,
+            "summary_dialogue_conversation_id": self.summary_dialogue_conversation_id,
         }
 
     @classmethod
@@ -140,6 +155,10 @@ class SessionMetadata:
             requirements=list(data.get("requirements", [])),
             summary_updated_at=data.get("summary_updated_at"),
             profile=data.get("profile"),
+            summary_dialogue_chars=data.get("summary_dialogue_chars", 0),
+            summary_dialogue_conversation_id=data.get(
+                "summary_dialogue_conversation_id"
+            ),
         )
 
     def touch(self) -> None:
