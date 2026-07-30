@@ -180,6 +180,43 @@ class TestProcessQueue:
         assert run.prompts[0].startswith("[대화 기록 시작]")
         assert "user: 라우터를 고쳐줘" in run.prompts[0]
 
+    def test_success_persists_requirements_and_freshness(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        store = SessionStore(project)
+        before = store.load_session_by_name("work")
+        assert before is not None
+        summarizer.enqueue(project, _task())
+        run = RunRecorder([GOOD_RESPONSE])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        session = store.load_session_by_name("work")
+        assert session is not None
+        assert session.requirements == ["테스트 필수"]
+        assert session.summary_updated_at is not None
+        # A background refresh is not a user access — last_accessed must
+        # stay untouched so idle sessions don't look freshly used.
+        # 백그라운드 갱신은 사용자 접근이 아니다 — last_accessed 는 그대로
+        # 유지되어야 놀고 있는 세션이 방금 쓴 것처럼 보이지 않는다.
+        assert session.last_accessed == before.last_accessed
+
+    def test_non_string_requirements_entries_dropped(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        summarizer.enqueue(project, _task())
+        response = json.dumps(
+            {
+                "summary": "요약.",
+                "requirements": ["유효한 항목", 42, "  ", None],
+                "title": "제목",
+            },
+            ensure_ascii=False,
+        )
+        run = RunRecorder([response])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        session = SessionStore(project).load_session_by_name("work")
+        assert session is not None
+        assert session.requirements == ["유효한 항목"]
+
     def test_code_fenced_response_accepted(
         self, project: Path, transcripts: Path
     ) -> None:

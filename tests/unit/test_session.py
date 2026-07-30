@@ -82,6 +82,38 @@ class TestSessionMetadataRoundtrip:
         assert restored.title == ""
 
 
+class TestSessionMetadataR1C6Fields:
+    """New fields: requirements / summary_updated_at / profile.
+
+    신규 필드 — requirements / summary_updated_at / profile.
+    """
+
+    def test_new_defaults(self) -> None:
+        session = SessionMetadata.new(name="auth-fix", title="인증 수정")
+        assert session.requirements == []
+        assert session.summary_updated_at is None
+        assert session.profile is None
+
+    def test_roundtrip_preserves_new_fields(self) -> None:
+        original = SessionMetadata.new(name="auth-fix", title="인증 수정")
+        original.requirements = ["이 작업은 테스트 필수", "커밋은 사용자가 직접"]
+        original.summary_updated_at = "2026-07-30T12:00:00+00:00"
+        original.profile = "핵심 파일: auth.py — JWT 검증 재작성 중"
+        restored = _roundtrip(original)
+        assert restored == original
+
+    def test_legacy_file_without_new_fields_loads_with_defaults(self) -> None:
+        # A session JSON written before R1-C6 has none of the new keys.
+        # R1-C6 이전에 작성된 세션 JSON 에는 신규 키가 하나도 없다.
+        legacy = SessionMetadata.new(name="old", title="옛 세션").to_dict()
+        for key in ("requirements", "summary_updated_at", "profile"):
+            del legacy[key]
+        restored = SessionMetadata.from_dict(legacy)
+        assert restored.requirements == []
+        assert restored.summary_updated_at is None
+        assert restored.profile is None
+
+
 class TestSessionMetadataTouch:
     def test_touch_updates_last_accessed(self) -> None:
         session = SessionMetadata.new(name="auth-fix", title="인증 수정")
