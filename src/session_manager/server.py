@@ -97,6 +97,29 @@ async def send_channel_notification(
     await write_stream.send(SessionMessage(message=JSONRPCMessage(notif)))
 
 
+def _set_current_session(app: AppContext, name: str | None) -> None:
+    """Set the current session and tell the wrapper about it.
+
+    현재 세션을 설정하고 래퍼에 통보한다.
+
+    The handshake only flows wrapper→MCP, so without this push the wrapper
+    never learns the session name on a plain ``ccode`` start — and every
+    wrapper-side trigger scoped to a session (/clear summary, periodic
+    refresh) silently does nothing. Send failures are non-fatal: the
+    wrapper degrades to skipping those triggers, exactly as before.
+
+    핸드셰이크는 래퍼→MCP 단방향이므로, 이 push 가 없으면 래퍼는 인자 없는
+    ``ccode`` 시작에서 세션 이름을 끝내 알지 못한다 — 세션 단위 래퍼 트리거
+    (/clear 요약, 주기 갱신) 가 조용히 무효화된다. 전송 실패는 치명적이지
+    않다: 래퍼는 그 트리거들을 건너뛰는 기존 동작으로 degrade 한다.
+    """
+    app.state.set_current_session(name)
+    try:
+        app.socket_client.send_signal({"action": "current_session", "name": name})
+    except (OSError, RuntimeError) as exc:
+        logger.warning("Failed to notify wrapper of current session: %s", exc)
+
+
 def _log_tool_call(
     tool: str, app: AppContext | None, args: dict[str, Any]
 ) -> str:
@@ -209,7 +232,9 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
                 state.set_current_session(current)
                 logger.info("Handshake OK — current session: %s", current)
             else:
-                resolved = state.resolve_from_store(session_store)
+                resolved = state.resolve_from_store(
+                    session_store, get_active_conversation_id(project_path)
+                )
                 if resolved is not None:
                     state.set_current_session(resolved)
                 logger.info(
@@ -229,7 +254,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     # Clean up expired sessions at startup.
     # 서버 시작 시 만료된 세션을 정리한다.
     period = get_cleanup_period_days()
-    deleted = cleanup_expired_sessions(session_store, period)
+    deleted = cleanup_expired_sessions(session_store, period, project_path)
     if deleted:
         logger.info("Startup cleanup: removed %d expired session(s)", len(deleted))
 
@@ -247,6 +272,18 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         session_store.save_session(default)
         state.set_current_session(_DEFAULT_SESSION_NAME)
         logger.info("Auto-registered default session")
+
+    # Tell the wrapper which session we settled on. Without this the
+    # wrapper's mirror stays None on a plain `ccode` start and its
+    # session-scoped triggers never fire (see _set_current_session).
+    # 확정된 세션을 래퍼에 알린다. 이 통보가 없으면 인자 없는 `ccode` 시작에서
+    # 래퍼 미러가 None 으로 남아 세션 단위 트리거가 발동하지 않는다.
+    settled = state.get_current_session()
+    if settled is not None:
+        try:
+            client.send_signal({"action": "current_session", "name": settled})
+        except (OSError, RuntimeError) as exc:
+            logger.warning("Failed to notify wrapper of current session: %s", exc)
 
     # Build instructions dynamically — add a project-context.md hint
     # when the file does not exist yet so the LLM creates it.
@@ -525,7 +562,7 @@ def session_register(name: str, title: str, ctx: Context, summary: str | None = 
     if conv_id is not None:
         session.link_conversation(conv_id)
     app.session_store.save_session(session)
-    app.state.set_current_session(name)
+    _set_current_session(app, name)
     return _log_tool_return(
         "session_register",
         event_id,
@@ -608,7 +645,11 @@ def session_switch(
         "user_prompt": user_prompt,
     })
 
-    app.state.set_current_session(target)
+    # The wrapper already mirrors the target from the switch signal above;
+    # this keeps both processes in sync through one path.
+    # 래퍼는 위 switch 신호로 이미 target 을 미러링하지만, 두 프로세스가 한
+    # 경로로 동기화되도록 여기서도 통보한다.
+    _set_current_session(app, target)
 
     # Link the same active conversation to the target session as well so
     # routing matches it on the next turn even before the wrapper's
@@ -657,7 +698,7 @@ def session_create(
     # Clean up expired sessions when creating a new one.
     # 새 세션 생성 시 만료된 세션을 정리한다.
     period = get_cleanup_period_days()
-    deleted = cleanup_expired_sessions(app.session_store, period)
+    deleted = cleanup_expired_sessions(app.session_store, period, app.project_path)
     if deleted:
         logger.info("Pre-create cleanup: removed %d expired session(s)", len(deleted))
 
@@ -697,7 +738,7 @@ def session_create(
         "user_prompt": user_prompt,
     })
 
-    app.state.set_current_session(new_session_name)
+    _set_current_session(app, new_session_name)
     return _log_tool_return(
         "session_create",
         event_id,
@@ -742,7 +783,7 @@ def session_end(summary: str, ctx: Context) -> dict:
             current.touch()
             app.session_store.save_session(current)
 
-    app.state.set_current_session(None)
+    _set_current_session(app, None)
 
     # If this session_end is the response to an active intercept, notify
     # the wrapper so it drains the queued user command. The wrapper itself

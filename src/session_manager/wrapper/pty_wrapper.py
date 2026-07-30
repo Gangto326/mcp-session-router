@@ -33,13 +33,18 @@ import termios
 import time
 import tty
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
 import pexpect
 
 from session_manager import debug_log, summarizer
-from session_manager.claude_conversation import get_active_conversation_id
+from session_manager.claude_conversation import (
+    get_active_conversation_id,
+    get_conversation_activity,
+)
+from session_manager.lifecycle import get_cleanup_period_days
 from session_manager.storage.file_store import SessionStore
 from session_manager.summarizer import SummarizerWorker, SummaryTask
 from session_manager.wrapper.command_matcher import (
@@ -828,34 +833,42 @@ class SessionManagerWrapper:
 
         부팅 시 복구 — 요약 갱신이 유실된 세션들을 큐에 넣는다.
 
-        A session is stale when it was accessed after its summary was last
-        refreshed (or never refreshed at all). Sessions already waiting in
-        the queue (from a crashed previous run) are not double-queued.
-        Never raises — a recovery failure must not block wrapper startup.
+        A session is stale when its transcript was written to after the
+        summary was last refreshed (or was never summarised). The predicate
+        uses transcript mtime, not ``last_accessed``: the latter is written
+        only by tool calls that touch the session, so it neither proves use
+        nor proves idleness. Duplicate enqueues are prevented by the queue
+        itself. Never raises — a recovery failure must not block startup.
 
-        summary 갱신 시각보다 나중에 접근된 (또는 한 번도 갱신 안 된)
-        세션이 stale. 이전 실행이 크래시로 남긴 대기 작업과는 중복 적재
-        하지 않는다. 복구 실패가 래퍼 시작을 막지 않도록 예외를 내지 않는다.
+        transcript 가 마지막 summary 갱신 이후에 쓰였으면 (또는 한 번도 요약된
+        적 없으면) stale. 술어는 ``last_accessed`` 가 아니라 transcript mtime 을
+        쓴다 — 전자는 세션을 건드리는 도구 호출 시에만 기록되어 사용도 유휴도
+        증명하지 못한다. 중복 적재는 큐 자체가 막는다. 복구 실패가 래퍼 시작을
+        막지 않도록 예외를 내지 않는다.
         """
         try:
             project = Path(self.project_path)
-            pending_names = {
-                task.session_name
-                for _, task in summarizer.load_pending_tasks(project)
-            }
+            # Failed and crash-orphaned queue files are never removed by the
+            # normal path — clear the old ones here (same retention period
+            # the project already uses for sessions).
+            # 실패·크래시 고아 큐 파일은 정상 경로에서 지워지지 않는다 —
+            # 오래된 것을 여기서 정리한다 (세션에 이미 쓰는 보존 기간 재사용).
+            summarizer.sweep_stale_queue_files(project, get_cleanup_period_days())
             queued = 0
             for session in SessionStore(project).list_sessions():
-                if session.name in pending_names:
-                    continue
                 if not session.claude_conversation_ids:
                     continue
-                # ISO-8601 UTC strings from the same generator — lexicographic
-                # comparison is chronologically correct.
-                # 같은 생성기가 만든 ISO-8601 UTC 문자열 — 사전순 비교가 곧
-                # 시간순 비교다.
-                if (
-                    session.summary_updated_at is not None
-                    and session.summary_updated_at >= session.last_accessed
+                activity = get_conversation_activity(
+                    project, session.claude_conversation_ids
+                )
+                if activity is None:
+                    # Transcripts gone (Claude Code's own cleanup) — nothing
+                    # left to summarise.
+                    # transcript 가 사라짐 (Claude Code 자체 정리) — 요약할
+                    # 대상이 없다.
+                    continue
+                if session.summary_updated_at is not None and activity <= (
+                    datetime.fromisoformat(session.summary_updated_at)
                 ):
                     continue
                 summarizer.enqueue(
@@ -1123,6 +1136,26 @@ class SessionManagerWrapper:
             user_prompt_val = handoff.get("user_prompt", "")
             user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
             self._handle_new(rename_current, new_session_name, handoff, user_prompt)
+        elif action == "current_session":
+            # MCP resolved or changed the current session. The wrapper has
+            # no other way to learn it — the handshake only flows
+            # wrapper→MCP, so on a plain `ccode` start (no --resume) the
+            # mirror would stay None and every session-scoped trigger
+            # (/clear summary, periodic refresh) would silently no-op.
+            # MCP 가 현재 세션을 확정·변경했다. 래퍼는 이를 알 방법이 달리
+            # 없다 — 핸드셰이크는 래퍼→MCP 단방향이라, 인자 없는 `ccode`
+            # 시작에서는 미러가 None 으로 남아 세션 단위 트리거 (/clear 요약,
+            # 주기 갱신) 가 조용히 무효화된다.
+            name = message.get("name")
+            if name is None or isinstance(name, str):
+                before = self._current_session_name
+                self._current_session_name = name
+                debug_log.log(
+                    "CURRENT_SESSION",
+                    "MCP_TOOL",
+                    {"before": before, "after": name},
+                    session=name,
+                )
         elif action == "intercept_done":
             # MCP 측에서 session_end 처리가 끝났다는 응답. 가로채기 상태일
             # 때만 종료하고 큐잉된 명령을 흘려보낸다 (그 외 상태에서는 무시).

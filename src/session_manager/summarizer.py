@@ -85,6 +85,12 @@ from session_manager.transcript_excerpt import extract_full_text
 _SESSION_MANAGER_DIRNAME = ".session-manager"
 QUEUE_DIRNAME = "summary-queue"
 
+# Suffix appended when a worker claims a task. Claimed files fall out of
+# the ``*.json`` listing, which is what hides them from other workers.
+# 워커가 작업을 선점할 때 붙이는 접미사. 선점된 파일은 ``*.json`` 목록에서
+# 빠지며, 그것이 다른 워커에게서 감추는 메커니즘이다.
+CLAIM_SUFFIX = ".processing"
+
 # Task kinds. departed/active are handled identically today (excerpt
 # path unified by the PoC); the split is kept because R3 attaches a
 # rooting-check question to active-refresh tasks.
@@ -565,6 +571,65 @@ def _process_task(
     return None
 
 
+def _claim(path: Path) -> Path | None:
+    """Atomically claim a queue file; return the claimed path or None.
+
+    큐 파일을 원자적으로 선점한다. 성공 시 선점된 경로, 실패 시 None.
+
+    Two ccode instances on the same project share this queue, and paying
+    twice for the same summary is real money. ``rename`` is atomic on
+    POSIX, so exactly one claimant wins. Claimed files no longer match the
+    ``*.json`` glob, hiding them from the other worker.
+
+    같은 프로젝트에서 ccode 두 개가 이 큐를 공유하며, 같은 요약을 두 번
+    결제하는 것은 실제 비용이다. POSIX 에서 ``rename`` 은 원자적이므로 정확히
+    한 쪽만 선점에 성공한다. 선점된 파일은 ``*.json`` glob 에 걸리지 않아
+    다른 워커에게서 감춰진다.
+    """
+    claimed = path.with_name(path.name + CLAIM_SUFFIX)
+    try:
+        path.rename(claimed)
+    except OSError:
+        return None
+    return claimed
+
+
+def sweep_stale_queue_files(project_path: Path, period_days: int) -> int:
+    """Delete failed/abandoned queue files older than *period_days*.
+
+    *period_days* 보다 오래된 실패·유기 큐 파일을 삭제하고 삭제 건수 반환.
+
+    Failed tasks are kept on disk for diagnosis and claimed files can be
+    orphaned by a crash; neither is ever cleaned by the normal path, so
+    both accumulate forever without this. Reuses the project's existing
+    retention period rather than introducing another time constant.
+
+    실패 작업은 진단용으로 디스크에 남고, 선점된 파일은 크래시로 고아가 될
+    수 있다. 정상 경로에서는 어느 쪽도 정리되지 않아 이 sweep 없이는 영원히
+    쌓인다. 새 시간 상수를 만들지 않고 프로젝트의 기존 보존 기간을 재사용한다.
+    """
+    queue_dir = _queue_dir(project_path)
+    if not queue_dir.is_dir():
+        return 0
+    cutoff = datetime.now(UTC).timestamp() - period_days * 86400
+    removed = 0
+    for path in queue_dir.iterdir():
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        debug_log.log(
+            "SUMMARIZER",
+            "WRAPPER",
+            {"op": "sweep_stale_queue_files", "removed": removed},
+        )
+    return removed
+
+
 def process_queue(
     project_path: Path,
     run: Callable[[str], str | None] = run_headless_summary,
@@ -574,23 +639,30 @@ def process_queue(
 
     대기 작업을 한 차례 전부 처리하고 요약 성공 건수를 반환.
 
-    Tasks run strictly one at a time. Each failing task is retried once
-    within the same pass, then marked failed. *run* and *transcript_dir*
-    are injectable for tests.
+    Tasks run strictly one at a time, each claimed atomically so a second
+    ccode instance on the same project cannot process it too. A failing
+    task is retried once within the same pass, then marked failed. *run*
+    and *transcript_dir* are injectable for tests.
 
-    작업은 엄격히 한 번에 하나씩 처리된다. 실패한 작업은 같은 pass 안에서
+    작업은 한 번에 하나씩 처리되며, 원자적으로 선점되어 같은 프로젝트의 두
+    번째 ccode 인스턴스가 중복 처리하지 못한다. 실패한 작업은 같은 pass 안에서
     1회 재시도 후 실패 마킹. *run* 과 *transcript_dir* 는 테스트용 주입점.
     """
     done = 0
     for path, task in load_pending_tasks(project_path):
+        claimed = _claim(path)
+        if claimed is None:
+            # Another worker took it (or it was consumed) — skip.
+            # 다른 워커가 가져갔거나 이미 소비됨 — 건너뛴다.
+            continue
         error = _process_task(project_path, task, run, transcript_dir)
         if error is not None:
             error = _process_task(project_path, task, run, transcript_dir)
         if error is None:
-            path.unlink(missing_ok=True)
+            claimed.unlink(missing_ok=True)
             done += 1
         else:
-            _mark_failed(path, task, error)
+            _mark_failed(claimed, task, error)
     return done
 
 
