@@ -445,9 +445,18 @@ def _process_task(
     title = parsed.get("title")
     if isinstance(title, str) and title.strip():
         session.title = title.strip()
-    # ``requirements`` is logged but not persisted until the model gains
-    # the field in R1-C6.
-    # ``requirements`` 는 R1-C6 에서 모델에 필드가 생기기 전까지 로그만 남긴다.
+    requirements = parsed.get("requirements")
+    if isinstance(requirements, list):
+        session.requirements = [
+            r.strip() for r in requirements if isinstance(r, str) and r.strip()
+        ]
+    # Freshness marker only — ``last_accessed`` is deliberately NOT
+    # touched: a background refresh is not a user access, and bumping it
+    # would make idle sessions look recently used to the router.
+    # 신선도 표시만 갱신 — ``last_accessed`` 는 의도적으로 건드리지 않는다.
+    # 백그라운드 갱신은 사용자 접근이 아니며, 갱신하면 놀고 있는 세션이
+    # 라우터에게 방금 쓴 세션처럼 보인다.
+    session.summary_updated_at = _utc_now_iso()
     store.save_session(session)
     debug_log.log(
         "SUMMARIZER",

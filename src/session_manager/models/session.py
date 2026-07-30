@@ -72,6 +72,23 @@ class SessionMetadata:
     # 기반 conversation 전환 감지에 사용 — active_conversation_id 가 어느
     # 세션의 이 목록에 있으면 라우팅이 명확해진다.
     claude_conversation_ids: list[str] = field(default_factory=list)
+    # Session-scoped user instructions/constraints (e.g. "tests required
+    # for this work") extracted by the background summarizer. Distinct
+    # from global conventions — these apply to this session only.
+    # 백그라운드 요약기가 추출하는 세션 한정 사용자 지시·제약 (예: "이
+    # 작업은 테스트 필수"). 전역 컨벤션과 달리 이 세션에만 적용된다.
+    requirements: list[str] = field(default_factory=list)
+    # When the summary was last refreshed. Compared against
+    # ``last_accessed`` at boot to find sessions whose summary refresh
+    # was lost to a forced exit (R1-C3).
+    # summary 가 마지막으로 갱신된 시각. 부팅 시 ``last_accessed`` 와
+    # 비교해 강제 종료로 요약이 누락된 세션을 찾는다 (R1-C3).
+    summary_updated_at: str | None = None
+    # Rich context for second-pass routing (key files, decisions,
+    # detailed state). Populated from R2 onwards.
+    # 2차 라우팅 판정용 리치 컨텍스트 (핵심 파일, 결정 사항, 상세 상태).
+    # R2 부터 채워진다.
+    profile: str | None = None
 
     @classmethod
     def new(cls, name: str, title: str, summary: str | None = None) -> SessionMetadata:
@@ -96,6 +113,9 @@ class SessionMetadata:
             "transitions": [t.to_dict() for t in self.transitions],
             "status": self.status.value,
             "claude_conversation_ids": list(self.claude_conversation_ids),
+            "requirements": list(self.requirements),
+            "summary_updated_at": self.summary_updated_at,
+            "profile": self.profile,
         }
 
     @classmethod
@@ -115,6 +135,11 @@ class SessionMetadata:
             # this field existed.
             # 이 필드 도입 전에 작성된 세션 파일과의 호환을 위해 기본값 빈 리스트.
             claude_conversation_ids=list(data.get("claude_conversation_ids", [])),
+            # Same backward-compat defaults for the R1-C6 fields.
+            # R1-C6 필드들도 같은 방식의 하위 호환 기본값.
+            requirements=list(data.get("requirements", [])),
+            summary_updated_at=data.get("summary_updated_at"),
+            profile=data.get("profile"),
         )
 
     def touch(self) -> None:
