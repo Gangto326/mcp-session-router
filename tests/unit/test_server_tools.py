@@ -330,26 +330,16 @@ class TestSessionEnd:
         assert result["ended"] == "ghost"
         assert app.state.get_current_session() is None
 
-    def test_sends_intercept_done_when_active(self, app: AppContext) -> None:
-        """intercept_active=True 일 때 session_end → 래퍼에 intercept_done 송신.
-        intercept_active=True → session_end notifies wrapper.
+    def test_does_not_ask_the_wrapper_to_forward_anything(
+        self, app: AppContext
+    ) -> None:
+        """session_end no longer participates in a slash-command handshake.
+
+        session_end 는 더 이상 슬래시 명령 핸드셰이크에 참여하지 않는다 —
+        옛 흐름에서는 래퍼가 보관한 키 입력을 흘려보내라는 신호를 보냈다.
         """
         app.session_store.save_session(SessionMetadata.new(name="s", title="S"))
         app.state.set_current_session("s")
-        app.intercept_active["value"] = True
-
-        session_end(summary="bye", ctx=_make_ctx(app))
-
-        assert _signals(app, "intercept_done") == [{"action": "intercept_done"}]
-        assert app.intercept_active["value"] is False
-
-    def test_no_intercept_done_when_inactive(self, app: AppContext) -> None:
-        """intercept_active=False 일 때 session_end → 래퍼 통보 없음.
-        intercept_active=False → no notify.
-        """
-        app.session_store.save_session(SessionMetadata.new(name="s", title="S"))
-        app.state.set_current_session("s")
-        app.intercept_active["value"] = False
 
         session_end(summary="bye", ctx=_make_ctx(app))
 

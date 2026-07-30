@@ -1,14 +1,14 @@
-"""Integration tests for the slash-command interception flow.
-슬래시 명령 가로채기 통합 테스트.
+"""Integration tests for slash-command observation.
 
-These tests verify the wrapper's interception state machine + socket
-signaling end-to-end (real PTY child, real Unix socket, real threading).
-The virtual screen is pre-populated directly so matching is deterministic
-— virtual_screen extraction itself is covered by unit tests.
+Verifies end-to-end (real PTY child, real Unix socket, real threading)
+that a session-changing command is reported to the MCP server *and* runs
+immediately — the wrapper no longer holds the keystroke.
 
-가로채기 state machine과 socket 시그널링을 end-to-end로 검증한다 (실제
-PTY child, 실제 Unix 소켓, 실제 thread). 매칭 결정성을 위해 가상 화면을
-직접 미리 채운다 — virtual_screen 추출 자체는 단위 테스트로 검증됨.
+슬래시 명령 관찰 통합 테스트.
+
+세션 변경 명령이 MCP 서버에 보고되면서 *동시에* 즉시 실행되는 것을
+end-to-end 로 검증한다 (실제 PTY child, 실제 Unix 소켓, 실제 thread) —
+래퍼는 더 이상 키 입력을 붙잡지 않는다.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ import pytest
 from session_manager.wrapper.pty_wrapper import (
     PROMPT_POINTER,
     SessionManagerWrapper,
-    _InterceptState,
 )
 
 _MOCK_CLAUDE = str(Path(__file__).parent / "mock_claude.py")
@@ -118,8 +117,36 @@ def _seed_prompt_line(wrapper: SessionManagerWrapper, text: str) -> None:
 
     가상 화면에 텍스트를 주입해 다음 \\r에서 매칭되도록 한다. mock_claude의
     PTY redraw에 의존하지 않고 매칭 결정성을 확보.
+
+    Settles first: the child redraws its prompt on startup, and a redraw
+    landing after the seed would overwrite it and break the match.
+    먼저 출력이 안정되기를 기다린다 — 자식은 시작 시 프롬프트를 다시 그리며,
+    시드 이후에 도착한 redraw 는 시드를 덮어써 매칭을 깨뜨린다.
     """
-    wrapper.virtual_screen.feed(PROMPT_POINTER + b" " + text.encode())
+    _settle(wrapper)
+    # Carriage return + erase-line first: the child has already drawn its
+    # own prompt on this line, and appending would produce "❯ ❯ /resume foo".
+    # 먼저 캐리지 리턴 + 줄 지우기 — 자식이 이미 이 줄에 자기 프롬프트를 그려
+    # 두었으므로, 그냥 덧붙이면 "❯ ❯ /resume foo" 가 된다.
+    wrapper.virtual_screen.feed(b"\r\x1b[2K" + PROMPT_POINTER + b" " + text.encode())
+
+
+def _settle(wrapper: SessionManagerWrapper, quiet_for: float = 0.4) -> None:
+    """Wait until the child's output has been quiet for *quiet_for* seconds.
+
+    자식 출력이 *quiet_for* 초간 잠잠해질 때까지 기다린다.
+    """
+    deadline = time.monotonic() + _TIMEOUT
+    last = None
+    quiet_since = time.monotonic()
+    while time.monotonic() < deadline:
+        snapshot = tuple(wrapper.virtual_screen._safe_display())
+        if snapshot != last:
+            last = snapshot
+            quiet_since = time.monotonic()
+        elif time.monotonic() - quiet_since >= quiet_for:
+            return
+        time.sleep(0.05)
 
 
 def _wait_until(predicate, timeout: float = _TIMEOUT) -> bool:
@@ -145,18 +172,21 @@ def _cleanup(wrapper: SessionManagerWrapper) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_intercept_signal_sent_on_matching_cr(tmp_path: Path) -> None:
-    """Virtual screen has /resume foo, user sends \\r → MCP gets intercept signal.
-    가상 화면에 /resume foo, 사용자 \\r → MCP가 intercept 신호 받음.
+def test_session_command_signal_sent_and_key_forwarded(tmp_path: Path) -> None:
+    """/resume observed: MCP is notified and the keystroke goes straight through.
+
+    /resume 관찰 — MCP 에 통보하고 키 입력은 곧바로 통과한다.
+
+    The old flow held the \\r here while the in-session LLM was asked for a
+    summary. Nothing is held now, so the command executes with no delay.
+    옛 흐름은 여기서 \\r 을 보관한 채 세션 안 LLM 에게 요약을 부탁했다. 이제는
+    아무것도 붙잡지 않으므로 명령이 지연 없이 실행된다.
     """
     wrapper = _make_wrapper(tmp_path)
     _start_wrapper(wrapper)
     try:
         sock = _connect(wrapper.socket_path)
         _handshake(sock)
-
-        # Wait until wrapper is in I/O loop (handshake reply happened).
-        # wrapper가 I/O 루프 진입했음을 핸드셰이크 응답으로 확인.
         assert _wait_until(
             lambda: wrapper.pty_fd >= 0 and wrapper.child is not None
         )
@@ -166,201 +196,75 @@ def test_intercept_signal_sent_on_matching_cr(tmp_path: Path) -> None:
 
         sig = _recv_json(sock)
         assert sig == {
-            "action": "intercept",
+            "action": "session_command",
             "command": "resume",
             "args": "foo",
         }
-        # _intercept_state 활성
-        assert _wait_until(lambda: wrapper._intercept_state is not None)
+        # Nothing is held back: a follow-up command still reaches the child.
+        # The old flow dropped every keystroke until the LLM replied.
+        # 아무것도 붙잡지 않는다 — 뒤이은 명령이 자식에게 도달한다. 옛 흐름은
+        # LLM 응답이 올 때까지 모든 키 입력을 버렸다.
+        os.write(wrapper._fake_stdin_w, b"hello")  # type: ignore[attr-defined]
+        os.write(wrapper._fake_stdin_w, b"\r")  # type: ignore[attr-defined]
+        assert _wait_until(
+            lambda: wrapper.virtual_screen.contains("Echo: hello"),
+            timeout=3.0,
+        )
         sock.close()
     finally:
         _cleanup(wrapper)
 
 
 def test_no_signal_for_non_matching_cr(tmp_path: Path) -> None:
-    """Virtual screen has /path/to/file, \\r → no intercept signal, normal forward.
-    가상 화면이 화이트리스트 외 → 가로채기 신호 없음, 정상 forward.
+    """A non-session command is forwarded with no signal at all.
+
+    세션 명령이 아니면 신호 없이 그대로 forward 된다.
     """
     wrapper = _make_wrapper(tmp_path)
     _start_wrapper(wrapper)
     try:
         sock = _connect(wrapper.socket_path)
         _handshake(sock)
-
-        assert _wait_until(lambda: wrapper.pty_fd >= 0)
+        assert _wait_until(
+            lambda: wrapper.pty_fd >= 0 and wrapper.child is not None
+        )
 
         _seed_prompt_line(wrapper, "/path/to/file")
         os.write(wrapper._fake_stdin_w, b"\r")  # type: ignore[attr-defined]
 
-        # 0.5초 안에 신호 안 옴
-        try:
-            msg = _recv_json(sock, timeout=0.5)
-            pytest.fail(f"unexpected signal: {msg}")
-        except TimeoutError:
-            pass
-
-        # 가로채기 활성 안 됨
-        assert wrapper._intercept_state is None
+        sock.settimeout(1.0)
+        with pytest.raises((TimeoutError, socket.timeout)):
+            _recv_json(sock)
         sock.close()
     finally:
         _cleanup(wrapper)
 
 
-def test_intercept_done_finishes_and_forwards_cr(tmp_path: Path) -> None:
-    """After intercept, MCP sends intercept_done → state cleared + \\r forwarded.
-    intercept_done 응답 → state 정리 + \\r forward.
+def test_ordinary_keys_are_never_dropped(tmp_path: Path) -> None:
+    """Typing after a session command still reaches the child.
+
+    세션 명령 이후에 친 키도 자식에게 그대로 도달한다 — 옛 흐름은 가로채기
+    중 사용자 입력을 통째로 버렸다.
     """
     wrapper = _make_wrapper(tmp_path)
     _start_wrapper(wrapper)
     try:
         sock = _connect(wrapper.socket_path)
         _handshake(sock)
-
-        assert _wait_until(lambda: wrapper.pty_fd >= 0)
-
-        _seed_prompt_line(wrapper, "/resume foo")
-        os.write(wrapper._fake_stdin_w, b"\r")  # type: ignore[attr-defined]
-
-        sig = _recv_json(sock)
-        assert sig["action"] == "intercept"
-
-        # MCP가 intercept_done 송신
-        _send_json(sock, {"action": "intercept_done"})
-
-        # state 정리 확인
-        assert _wait_until(lambda: wrapper._intercept_state is None)
-        sock.close()
-    finally:
-        _cleanup(wrapper)
-
-
-def test_intercept_timeout_clears_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """When MCP doesn't respond within INTERCEPT_TIMEOUT_SEC, state is cleared.
-    INTERCEPT_TIMEOUT_SEC 안에 응답 없으면 state 정리.
-    """
-    monkeypatch.setattr(
-        "session_manager.wrapper.pty_wrapper.INTERCEPT_TIMEOUT_SEC", 0.5
-    )
-    wrapper = _make_wrapper(tmp_path)
-    _start_wrapper(wrapper)
-    try:
-        sock = _connect(wrapper.socket_path)
-        _handshake(sock)
-
-        assert _wait_until(lambda: wrapper.pty_fd >= 0)
-
-        _seed_prompt_line(wrapper, "/resume foo")
-        os.write(wrapper._fake_stdin_w, b"\r")  # type: ignore[attr-defined]
-
-        sig = _recv_json(sock)
-        assert sig["action"] == "intercept"
-
-        # 응답 안 함 → 0.5초 후 timeout으로 state 정리
         assert _wait_until(
-            lambda: wrapper._intercept_state is None, timeout=2.0
+            lambda: wrapper.pty_fd >= 0 and wrapper.child is not None
         )
-        sock.close()
-    finally:
-        _cleanup(wrapper)
-
-
-def test_ctrl_c_cancels_intercept(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Ctrl+C during intercept → state cleared (cancel before timeout).
-    가로채기 중 Ctrl+C → state 정리 (timeout 전에 취소).
-    """
-    # Long timeout so cancel beats it.
-    # cancel이 timeout보다 먼저 일어나도록 timeout 연장.
-    monkeypatch.setattr(
-        "session_manager.wrapper.pty_wrapper.INTERCEPT_TIMEOUT_SEC", 5.0
-    )
-    wrapper = _make_wrapper(tmp_path)
-    _start_wrapper(wrapper)
-    try:
-        sock = _connect(wrapper.socket_path)
-        _handshake(sock)
-
-        assert _wait_until(lambda: wrapper.pty_fd >= 0)
 
         _seed_prompt_line(wrapper, "/resume foo")
         os.write(wrapper._fake_stdin_w, b"\r")  # type: ignore[attr-defined]
+        _recv_json(sock)
 
-        sig = _recv_json(sock)
-        assert sig["action"] == "intercept"
-
-        # Ctrl+C
-        os.write(wrapper._fake_stdin_w, b"\x03")  # type: ignore[attr-defined]
-
-        # state 정리, but BEFORE the 5s timeout — so within ~1s
-        assert _wait_until(
-            lambda: wrapper._intercept_state is None, timeout=1.0
-        )
-        sock.close()
-    finally:
-        _cleanup(wrapper)
-
-
-def test_ordinary_keys_during_intercept_are_dropped(tmp_path: Path) -> None:
-    """During intercept, non-Ctrl-C stdin is dropped — state stays active.
-    가로채기 중 Ctrl+C 아닌 stdin은 drop — state 유지.
-    """
-    wrapper = _make_wrapper(tmp_path)
-    _start_wrapper(wrapper)
-    try:
-        sock = _connect(wrapper.socket_path)
-        _handshake(sock)
-
-        assert _wait_until(lambda: wrapper.pty_fd >= 0)
-
-        _seed_prompt_line(wrapper, "/resume foo")
-        os.write(wrapper._fake_stdin_w, b"\r")  # type: ignore[attr-defined]
-
-        sig = _recv_json(sock)
-        assert sig["action"] == "intercept"
-
-        # 활성 상태에서 일반 텍스트 보냄
         os.write(wrapper._fake_stdin_w, b"hello")  # type: ignore[attr-defined]
-        time.sleep(0.3)
-
-        # 여전히 활성. input_queue 적재 안 됨 (drop이라).
-        assert wrapper._intercept_state is not None
-        assert wrapper.input_queue == b""
-        sock.close()
-    finally:
-        _cleanup(wrapper)
-
-
-def test_intercept_state_dataclass_carries_command_args(tmp_path: Path) -> None:
-    """The dataclass payload received by the wrapper preserves args.
-    wrapper 측 _InterceptState가 command/args를 정확히 보관.
-    """
-    wrapper = _make_wrapper(tmp_path)
-    _start_wrapper(wrapper)
-    try:
-        sock = _connect(wrapper.socket_path)
-        _handshake(sock)
-
-        assert _wait_until(lambda: wrapper.pty_fd >= 0)
-
-        _seed_prompt_line(wrapper, "/rename my_session")
         os.write(wrapper._fake_stdin_w, b"\r")  # type: ignore[attr-defined]
-
-        sig = _recv_json(sock)
-        assert sig == {
-            "action": "intercept",
-            "command": "rename",
-            "args": "my_session",
-        }
-
-        assert _wait_until(lambda: wrapper._intercept_state is not None)
-        state = wrapper._intercept_state
-        assert isinstance(state, _InterceptState)
-        assert state.command == "rename"
-        assert state.args == "my_session"
-        assert state.deadline > 0
+        assert _wait_until(
+            lambda: wrapper.virtual_screen.contains("Echo: hello"),
+            timeout=3.0,
+        )
         sock.close()
     finally:
         _cleanup(wrapper)

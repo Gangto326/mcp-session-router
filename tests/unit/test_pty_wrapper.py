@@ -22,14 +22,11 @@ from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS
 from session_manager.wrapper.pty_wrapper import (
     AUTO_CONFIRM_PATTERNS,
     CLEAR_COMMAND_RE,
-    CTRL_C,
-    INTERCEPT_TIMEOUT_SEC,
     INVERSE_VIDEO_START,
     OUTPUT_BUFFER_CAP,
     OUTPUT_BUFFER_TAIL_KEEP,
     PROMPT_POINTER,
     SessionManagerWrapper,
-    _InterceptState,
     _PendingAction,
 )
 
@@ -554,50 +551,41 @@ class TestVirtualScreenIntegration:
         assert len(wrapper.virtual_screen._screen.display[0]) == 120
 
 
-class TestStdinSubmitInterception:
-    """Submit detection (stdin \\r) and intercept entry/exit.
-    submit 감지 (stdin \\r) + 가로채기 진입/종료.
+class TestSessionCommandObservation:
+    """Session-changing slash commands are observed, never held.
+
+    세션 변경 슬래시 명령은 관찰만 하고 붙잡지 않는다.
+
+    The old flow withheld the \\r while asking the in-session LLM for a
+    summary, freezing the input line for up to 15 seconds. The background
+    summariser removed that dependency.
+    옛 흐름은 세션 안 LLM 에게 요약을 부탁하는 동안 \\r 을 보관해 입력란을
+    최대 15초 얼렸다. 백그라운드 요약기가 그 의존을 없앴다.
     """
 
-    def test_submit_with_match_starts_intercept(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Lone \\r with matching prompt text → state set + MCP signal.
-        \\r 단독 + 매칭 가능한 prompt → state 설정 + MCP 신호.
-        Mode/queue는 변경되지 않음 (큐잉 없이 \\r은 _intercept_state로만 보관).
-        """
-        wrapper.virtual_screen.feed("❯ /resume foo".encode())
-        sent: list[dict] = []
+    @pytest.fixture(autouse=True)
+    def _fixed_conversation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            wrapper.socket_server, "send",
-            lambda msg: sent.append(msg) or True,
+            "session_manager.wrapper.pty_wrapper.get_active_conversation_id",
+            lambda _cwd: "conv-active",
         )
-        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
-        wrapper._stdin_fd = 0
 
-        wrapper._handle_stdin_readable()
-
-        assert wrapper.mode == "passthrough"  # filtering mode 사용 안 함
-        assert wrapper.input_queue == b""  # 큐잉 안 함
-        assert wrapper._intercept_state is not None
-        assert wrapper._intercept_state.command == "resume"
-        assert wrapper._intercept_state.args == "foo"
-        assert sent == [
-            {"action": "intercept", "command": "resume", "args": "foo"}
+    def _pending(self, wrapper: SessionManagerWrapper) -> list:
+        return [
+            task
+            for _, task in summarizer.load_pending_tasks(Path(wrapper.project_path))
         ]
 
-    def test_submit_no_match_passes_through(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_command_forwarded_immediately_and_summarised(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Lone \\r with non-command prompt → forward as normal.
-        \\r 단독이지만 prompt가 명령 아님 → 정상 forward.
-        """
-        wrapper.virtual_screen.feed("❯ hello".encode())
+        wrapper._current_session_name = "work"
+        wrapper.virtual_screen.feed("❯ /resume foo".encode())
+        sent: list[dict] = []
         writes: list[bytes] = []
+        monkeypatch.setattr(
+            wrapper.socket_server, "send", lambda msg: sent.append(msg) or True
+        )
         monkeypatch.setattr("os.read", lambda fd, n: b"\r")
         monkeypatch.setattr(
             "os.write", lambda fd, data: writes.append(data) or len(data)
@@ -607,23 +595,55 @@ class TestStdinSubmitInterception:
 
         wrapper._handle_stdin_readable()
 
-        assert wrapper.mode == "passthrough"
-        assert wrapper._intercept_state is None
+        # The keystroke goes through in the same call — no holding, no delay.
+        # 키 입력이 같은 호출 안에서 통과한다 — 보관도 지연도 없다.
         assert writes == [b"\r"]
+        assert wrapper.mode == "passthrough"
+        assert wrapper.input_queue == b""
+        # The departing conversation is queued for a background summary.
+        # 떠나는 conversation 이 백그라운드 요약 큐에 들어간다.
+        tasks = self._pending(wrapper)
+        assert len(tasks) == 1
+        assert tasks[0].session_name == "work"
+        assert tasks[0].kind == summarizer.KIND_ACTIVE
+        # The MCP server is told its session pointer is now stale.
+        # MCP 서버에 세션 포인터가 낡았음을 알린다.
+        assert sent == [
+            {"action": "session_command", "command": "resume", "args": "foo"}
+        ]
 
-    def test_non_submit_chunk_skips_match_attempt(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_exit_without_args_observed(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Non-\\r chunk bypasses match attempt entirely (forwarded as typing).
-        \\r 아닌 chunk는 매칭 시도 자체가 없음 (타이핑으로 forward).
+        wrapper._current_session_name = "work"
+        wrapper.virtual_screen.feed("❯ /exit".encode())
+        sent: list[dict] = []
+        monkeypatch.setattr(
+            wrapper.socket_server, "send", lambda msg: sent.append(msg) or True
+        )
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
+        monkeypatch.setattr("os.write", lambda fd, data: len(data))
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+
+        wrapper._handle_stdin_readable()
+
+        assert sent == [
+            {"action": "session_command", "command": "exit", "args": ""}
+        ]
+
+    def test_unknown_session_still_forwards(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Observation failure must never block the user's command.
+
+        관찰 실패가 사용자 명령을 막으면 안 된다.
         """
-        # Even with a matchable prompt, a non-\r chunk must not trigger.
-        # 매칭 가능한 prompt가 있어도 \r 아닌 chunk는 trigger되면 안 됨.
+        wrapper._current_session_name = None
         wrapper.virtual_screen.feed("❯ /resume foo".encode())
         writes: list[bytes] = []
-        monkeypatch.setattr("os.read", lambda fd, n: b"a")
+        monkeypatch.setattr(wrapper.socket_server, "send", lambda msg: True)
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
         monkeypatch.setattr(
             "os.write", lambda fd, data: writes.append(data) or len(data)
         )
@@ -632,22 +652,20 @@ class TestStdinSubmitInterception:
 
         wrapper._handle_stdin_readable()
 
-        assert wrapper.mode == "passthrough"
-        assert wrapper._intercept_state is None
-        assert writes == [b"a"]
+        assert writes == [b"\r"]
+        assert self._pending(wrapper) == []
 
-    def test_intercept_active_drops_user_stdin(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_submit_no_match_passes_through(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Once in intercept, additional stdin is dropped (no PTY write,
-        no queue accumulation).
-        가로채기 중 추가 stdin은 drop — PTY write 없음, 큐 적재 없음.
-        """
-        wrapper._intercept_state = _InterceptState(command="resume", args="foo")
+        wrapper._current_session_name = "work"
+        wrapper.virtual_screen.feed("❯ hello".encode())
+        sent: list[dict] = []
         writes: list[bytes] = []
-        monkeypatch.setattr("os.read", lambda fd, n: b"hello")
+        monkeypatch.setattr(
+            wrapper.socket_server, "send", lambda msg: sent.append(msg) or True
+        )
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
         monkeypatch.setattr(
             "os.write", lambda fd, data: writes.append(data) or len(data)
         )
@@ -656,230 +674,51 @@ class TestStdinSubmitInterception:
 
         wrapper._handle_stdin_readable()
 
-        assert writes == []
-        assert wrapper.input_queue == b""
-        assert wrapper.mode == "passthrough"
+        assert writes == [b"\r"]
+        assert sent == []
+        assert self._pending(wrapper) == []
 
-    def test_filtering_mode_still_queues_for_switch_new(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_non_submit_chunk_is_not_observed(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """SWITCH/NEW filtering mode keeps the original queueing behaviour
-        (separate from interception drop).
-        SWITCH/NEW의 filtering mode는 기존 큐잉 동작 유지 (가로채기 drop과 별개).
+        """Typing the command text is not submitting it.
+
+        명령 텍스트를 타이핑하는 것은 제출이 아니다.
+        """
+        wrapper._current_session_name = "work"
+        wrapper.virtual_screen.feed("❯ /resume foo".encode())
+        sent: list[dict] = []
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            wrapper.socket_server, "send", lambda msg: sent.append(msg) or True
+        )
+        monkeypatch.setattr("os.read", lambda fd, n: b"o")
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+
+        wrapper._handle_stdin_readable()
+
+        assert writes == [b"o"]
+        assert sent == []
+        assert self._pending(wrapper) == []
+
+    def test_filtering_mode_still_queues_input(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SWITCH/NEW injection still buffers user keystrokes.
+
+        SWITCH/NEW 주입 중에는 여전히 사용자 키 입력을 큐잉한다.
         """
         wrapper.mode = "filtering"
-        wrapper.input_queue = b""
-        monkeypatch.setattr("os.read", lambda fd, n: b"hello")
+        monkeypatch.setattr("os.read", lambda fd, n: b"typed")
         wrapper._stdin_fd = 0
 
         wrapper._handle_stdin_readable()
 
-        assert wrapper.input_queue == b"hello"
-
-    def test_intercept_done_signal_finishes_intercept(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """`intercept_done` from MCP forwards a single \\r to the PTY.
-        MCP의 intercept_done → PTY로 \\r 한 번 forward (큐 없음).
-        """
-        wrapper._intercept_state = _InterceptState(command="resume", args="foo")
-        writes: list[bytes] = []
-        monkeypatch.setattr(
-            "os.write", lambda fd, data: writes.append(data) or len(data)
-        )
-        wrapper.pty_fd = 1
-
-        wrapper._handle_mcp_signal({"action": "intercept_done"})
-
-        assert wrapper._intercept_state is None
-        assert writes == [b"\r"]
-
-    def test_intercept_done_ignored_when_not_active(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        """intercept_done with no active state is a no-op.
-        intercept_state가 없을 때 intercept_done은 no-op.
-        """
-        wrapper._intercept_state = None
-        wrapper.mode = "passthrough"
-
-        wrapper._handle_mcp_signal({"action": "intercept_done"})
-
-        assert wrapper.mode == "passthrough"
-        assert wrapper._intercept_state is None
-
-
-class TestInterceptTimeoutAndCancel:
-    """Timeout (15s) and Ctrl+C cancellation of an active interception.
-    가로채기 timeout (15초) 및 Ctrl+C 취소.
-    """
-
-    def test_start_intercept_sets_deadline(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """_start_intercept set a deadline INTERCEPT_TIMEOUT_SEC ahead.
-        _start_intercept가 INTERCEPT_TIMEOUT_SEC 후로 deadline 설정.
-        """
-        from session_manager.wrapper.command_matcher import InterceptedCommand
-
-        # Freeze time at a known value
-        # 시간 고정
-        monkeypatch.setattr(
-            "session_manager.wrapper.pty_wrapper.time.monotonic",
-            lambda: 1000.0,
-        )
-        monkeypatch.setattr(
-            wrapper.socket_server, "send", lambda msg: True
-        )
-
-        wrapper._start_intercept(InterceptedCommand("resume", "foo"))
-
-        assert wrapper._intercept_state is not None
-        assert wrapper._intercept_state.deadline == 1000.0 + INTERCEPT_TIMEOUT_SEC
-
-    def test_check_timeout_no_op_when_inactive(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """_check_intercept_timeout no-op when no intercept active.
-        가로채기 비활성 시 _check_intercept_timeout은 no-op.
-        """
-        wrapper._intercept_state = None
-        writes: list[bytes] = []
-        monkeypatch.setattr(
-            "os.write", lambda fd, data: writes.append(data) or len(data)
-        )
-
-        wrapper._check_intercept_timeout()
-        assert writes == []
-
-    def test_check_timeout_no_op_before_deadline(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Before deadline, _check_intercept_timeout does nothing.
-        deadline 전에는 _check_intercept_timeout이 아무것도 안 함.
-        """
-        monkeypatch.setattr(
-            "session_manager.wrapper.pty_wrapper.time.monotonic",
-            lambda: 100.0,
-        )
-        wrapper._intercept_state = _InterceptState(
-            command="resume", args="foo", deadline=200.0
-        )
-        writes: list[bytes] = []
-        monkeypatch.setattr(
-            "os.write", lambda fd, data: writes.append(data) or len(data)
-        )
-
-        wrapper._check_intercept_timeout()
-
-        assert writes == []
-        assert wrapper._intercept_state is not None  # 그대로 활성
-
-    def test_check_timeout_forwards_cr_after_deadline(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """After deadline: state cleared, notice on stdout, \\r forwarded to PTY.
-        deadline 이후: state 정리, stdout 안내, PTY로 \\r forward.
-        """
-        monkeypatch.setattr(
-            "session_manager.wrapper.pty_wrapper.time.monotonic",
-            lambda: 300.0,
-        )
-        wrapper._intercept_state = _InterceptState(
-            command="resume", args="foo", deadline=200.0
-        )
-        wrapper.pty_fd = 1
-        wrapper._stdout_fd = 2
-        writes: list[tuple[int, bytes]] = []
-        monkeypatch.setattr(
-            "os.write",
-            lambda fd, data: writes.append((fd, data)) or len(data),
-        )
-
-        wrapper._check_intercept_timeout()
-
-        assert wrapper._intercept_state is None
-        # stdout과 pty 모두 write 발생
-        fds_written = [fd for fd, _ in writes]
-        assert wrapper._stdout_fd in fds_written
-        assert wrapper.pty_fd in fds_written
-        # stdout에는 안내 메시지, pty에는 \r
-        stdout_data = b"".join(d for fd, d in writes if fd == wrapper._stdout_fd)
-        pty_data = b"".join(d for fd, d in writes if fd == wrapper.pty_fd)
-        assert b"timeout" in stdout_data
-        assert pty_data == b"\r"
-
-    def test_ctrl_c_during_intercept_cancels(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Ctrl+C (b\"\\x03\") while intercepting: state cleared, \\x03 forwarded.
-        가로채기 중 Ctrl+C: state 정리, PTY로 \\x03 forward (보관 \\r은 폐기).
-        """
-        wrapper._intercept_state = _InterceptState(
-            command="resume", args="foo", deadline=999.0
-        )
-        wrapper.pty_fd = 1
-        writes: list[bytes] = []
-        monkeypatch.setattr("os.read", lambda fd, n: CTRL_C)
-        monkeypatch.setattr(
-            "os.write", lambda fd, data: writes.append(data) or len(data)
-        )
-        wrapper._stdin_fd = 0
-
-        wrapper._handle_stdin_readable()
-
-        assert wrapper._intercept_state is None
-        assert writes == [CTRL_C]
-        # \r은 forward되지 않음 — 명령 실행 X
-        assert b"\r" not in writes
-
-    def test_non_ctrl_c_during_intercept_dropped(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Regular keys during intercept are dropped (state stays active).
-        가로채기 중 일반 키는 drop (state 그대로 활성 유지).
-        """
-        wrapper._intercept_state = _InterceptState(
-            command="resume", args="foo", deadline=999.0
-        )
-        wrapper.pty_fd = 1
-        writes: list[bytes] = []
-        monkeypatch.setattr("os.read", lambda fd, n: b"hello")
-        monkeypatch.setattr(
-            "os.write", lambda fd, data: writes.append(data) or len(data)
-        )
-        wrapper._stdin_fd = 0
-
-        wrapper._handle_stdin_readable()
-
-        assert wrapper._intercept_state is not None  # 활성 유지
-        assert writes == []
-
-    def test_cancel_intercept_helper(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """_cancel_intercept clears state and forwards Ctrl+C to PTY.
-        _cancel_intercept가 state 정리하고 PTY로 \\x03 forward.
-        """
-        wrapper._intercept_state = _InterceptState(
-            command="exit", args="", deadline=999.0
-        )
-        wrapper.pty_fd = 1
-        writes: list[bytes] = []
-        monkeypatch.setattr(
-            "os.write", lambda fd, data: writes.append(data) or len(data)
-        )
-
-        wrapper._cancel_intercept()
-
-        assert wrapper._intercept_state is None
-        assert writes == [CTRL_C]
+        assert wrapper.input_queue == b"typed"
 
 
 class TestAutoAcceptConfirmations:
@@ -1111,10 +950,9 @@ class TestSummaryTriggers:
         assert len(tasks) == 1
         assert tasks[0].session_name == "frontend"
         assert tasks[0].kind == summarizer.KIND_ACTIVE
-        # Observation, not interception: the \r is forwarded untouched.
-        # 가로채기가 아닌 관찰 — \r 은 그대로 forward 된다.
+        # Observed, not held: the \r is forwarded untouched.
+        # 붙잡지 않고 관찰만 — \r 은 그대로 forward 된다.
         assert writes == [b"\r"]
-        assert wrapper._intercept_state is None
 
     def test_clear_with_unknown_session_skips_but_forwards(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch

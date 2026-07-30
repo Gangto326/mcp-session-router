@@ -1,5 +1,14 @@
-"""Tests for ChannelFastMCP capability + channel notification + intercept handler.
-ChannelFastMCP capability + channel notification + intercept handler 테스트.
+"""Tests for the ChannelFastMCP capability and channel notification.
+
+The intercept flow that used these was removed — slash commands are now
+observed, not held (see test_wrapper_signal_handler.py). The channel
+plumbing itself is removed in the next commit.
+
+ChannelFastMCP capability 와 channel notification 테스트.
+
+이를 사용하던 가로채기 흐름은 제거되었다 — 슬래시 명령은 이제 붙잡지 않고
+관찰만 한다 (test_wrapper_signal_handler.py 참조). channel 배관 자체는 다음
+커밋에서 제거된다.
 """
 
 from __future__ import annotations
@@ -10,11 +19,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from session_manager.models.session import SessionMetadata
 from session_manager.server import (
     AppContext,
     ChannelFastMCP,
-    _make_intercept_handler,
     send_channel_notification,
 )
 from session_manager.state import SessionManagerState
@@ -94,98 +101,3 @@ class TestSendChannelNotification:
         round_tripped = json.loads(json.dumps(payload))
         assert round_tripped["params"]["content"] == "x"
         assert round_tripped["params"]["meta"] == {"k": "v"}
-
-
-class TestInterceptHandler:
-    """The handler returned by _make_intercept_handler converts wrapper signals
-    into channel notifications.
-
-    _make_intercept_handler가 반환한 핸들러가 래퍼 신호를 channel notification으로 변환.
-    """
-
-    @pytest.mark.asyncio
-    async def test_intercept_signal_pushes_channel_notification(
-        self, app: AppContext
-    ) -> None:
-        app.session_store.save_session(SessionMetadata.new(name="cur", title="Cur"))
-        app.state.set_current_session("cur")
-
-        stream = _FakeStream()
-        server = MagicMock()
-        server._channel_write_stream = stream
-
-        handler = _make_intercept_handler(server, app)
-        await handler({"action": "intercept", "command": "resume", "args": "foo"})
-
-        assert len(stream.sent) == 1
-        notif = stream.sent[0].message.root
-        assert notif.method == "notifications/claude/channel"
-        # 명령이 본문과 meta 양쪽에 들어가는지
-        assert "/resume foo" in notif.params["content"]
-        assert "cur" in notif.params["content"]
-        assert notif.params["meta"]["command"] == "resume"
-        assert notif.params["meta"]["args"] == "foo"
-        assert notif.params["meta"]["current_session"] == "cur"
-        # intercept_active 플래그가 True로 set
-        assert app.intercept_active["value"] is True
-
-    @pytest.mark.asyncio
-    async def test_non_intercept_action_ignored(self, app: AppContext) -> None:
-        stream = _FakeStream()
-        server = MagicMock()
-        server._channel_write_stream = stream
-
-        handler = _make_intercept_handler(server, app)
-        await handler({"action": "something_else"})
-
-        assert stream.sent == []
-        assert app.intercept_active["value"] is False
-
-    @pytest.mark.asyncio
-    async def test_missing_write_stream_logs_and_returns(
-        self, app: AppContext
-    ) -> None:
-        """If the channel write_stream is not yet wired, handler is a no-op.
-        write_stream 미설정 시 handler는 no-op (warning만).
-        """
-        server = MagicMock()
-        server._channel_write_stream = None
-
-        handler = _make_intercept_handler(server, app)
-        # Should not raise
-        # 예외 없이 정상 반환해야
-        await handler({"action": "intercept", "command": "exit", "args": ""})
-        assert app.intercept_active["value"] is False
-
-    @pytest.mark.asyncio
-    async def test_invalid_command_field_ignored(self, app: AppContext) -> None:
-        """Non-string command/args are dropped silently.
-        command/args가 문자열이 아니면 무시.
-        """
-        stream = _FakeStream()
-        server = MagicMock()
-        server._channel_write_stream = stream
-
-        handler = _make_intercept_handler(server, app)
-        await handler({"action": "intercept", "command": 123, "args": "foo"})
-
-        assert stream.sent == []
-        assert app.intercept_active["value"] is False
-
-    @pytest.mark.asyncio
-    async def test_no_args_for_exit_command(self, app: AppContext) -> None:
-        """/exit (no args) renders without trailing space.
-        /exit (인자 없음) → 끝에 공백 없이 렌더링.
-        """
-        stream = _FakeStream()
-        server = MagicMock()
-        server._channel_write_stream = stream
-
-        handler = _make_intercept_handler(server, app)
-        await handler({"action": "intercept", "command": "exit", "args": ""})
-
-        assert len(stream.sent) == 1
-        notif = stream.sent[0].message.root
-        assert "/exit" in notif.params["content"]
-        # /exit가 trailing 공백 없이
-        assert "/exit." in notif.params["content"] or "/exit " in notif.params["content"]
