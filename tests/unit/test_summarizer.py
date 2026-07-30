@@ -17,6 +17,7 @@ headless CLI call is mocked throughout except for its own envelope tests.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -90,6 +91,24 @@ def _task(kind: str = summarizer.KIND_DEPARTED) -> summarizer.SummaryTask:
     )
 
 
+def _failed_records(project: Path) -> list[dict[str, Any]]:
+    """Read every failure-marked queue record.
+
+    실패 마킹된 큐 레코드를 모두 읽는다. 처리 중 선점으로 파일명이 바뀌므로
+    이름이 아니라 내용으로 찾는다.
+    """
+    queue_dir = project / ".session-manager" / "summary-queue"
+    records: list[dict[str, Any]] = []
+    for path in queue_dir.iterdir():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("failed_at"):
+            records.append(data)
+    return records
+
+
 class RunRecorder:
     """Mock for the headless call recording prompts, replaying canned answers.
 
@@ -141,6 +160,7 @@ class TestQueue:
 
     def test_failed_marked_tasks_excluded(self, project: Path) -> None:
         path = summarizer.enqueue(project, _task())
+        assert path is not None
         summarizer._mark_failed(path, _task(), "boom")
         assert summarizer.load_pending_tasks(project) == []
         # The file itself stays on disk for diagnosis.
@@ -262,12 +282,15 @@ class TestProcessQueue:
     def test_persistent_failure_marks_task(
         self, project: Path, transcripts: Path
     ) -> None:
-        task_path = summarizer.enqueue(project, _task())
+        summarizer.enqueue(project, _task())
         run = RunRecorder([None])
         assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 0
         assert len(run.prompts) == 2  # original + one retry / 원 호출 + 재시도 1회
-        data = json.loads(task_path.read_text(encoding="utf-8"))
-        assert data["error"] == "headless_call_failed"
+        failed = _failed_records(project)
+        assert [r["error"] for r in failed] == ["headless_call_failed"]
+        # A failed task must not be retried forever on every pass.
+        # 실패한 작업이 매 pass 마다 무한 재시도되면 안 된다.
+        assert summarizer.load_pending_tasks(project) == []
 
     def test_bad_response_never_saved(self, project: Path, transcripts: Path) -> None:
         summarizer.enqueue(project, _task())
@@ -291,33 +314,30 @@ class TestProcessQueue:
     def test_missing_transcript_fails_without_calling_model(
         self, project: Path, tmp_path: Path
     ) -> None:
-        task_path = summarizer.enqueue(project, _task())
+        summarizer.enqueue(project, _task())
         run = RunRecorder([GOOD_RESPONSE])
         empty_dir = tmp_path / "no-transcripts"
         assert summarizer.process_queue(project, run=run, transcript_dir=empty_dir) == 0
         assert run.prompts == []
-        data = json.loads(task_path.read_text(encoding="utf-8"))
-        assert data["error"] == "empty_excerpt"
+        assert [r["error"] for r in _failed_records(project)] == ["empty_excerpt"]
 
     def test_unsupported_kind_fails_without_calling_model(
         self, project: Path, transcripts: Path
     ) -> None:
-        task_path = summarizer.enqueue(project, _task(kind=summarizer.KIND_ROOTING_CHECK))
+        summarizer.enqueue(project, _task(kind=summarizer.KIND_ROOTING_CHECK))
         run = RunRecorder([GOOD_RESPONSE])
         assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 0
         assert run.prompts == []
-        data = json.loads(task_path.read_text(encoding="utf-8"))
-        assert data["error"].startswith("unsupported_kind")
+        assert _failed_records(project)[0]["error"].startswith("unsupported_kind")
 
     def test_unknown_session_marks_task(self, project: Path, transcripts: Path) -> None:
         task = summarizer.SummaryTask(
             session_name="ghost", conversation_id=CONV_ID, kind="departed"
         )
-        task_path = summarizer.enqueue(project, task)
+        summarizer.enqueue(project, task)
         run = RunRecorder([GOOD_RESPONSE])
         assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 0
-        data = json.loads(task_path.read_text(encoding="utf-8"))
-        assert data["error"].startswith("session_not_found")
+        assert _failed_records(project)[0]["error"].startswith("session_not_found")
 
 
 # ---- run_headless_summary (subprocess envelope handling) -----------------
@@ -460,12 +480,14 @@ class TestSummarizerWorker:
         try:
             summarizer.enqueue(project, _task())
             worker.wake()
+            store = SessionStore(project)
             deadline = time.monotonic() + 5.0
+            session = None
             while time.monotonic() < deadline:
-                if summarizer.load_pending_tasks(project) == []:
+                session = store.load_session_by_name("work")
+                if session is not None and session.summary != "이전 요약":
                     break
                 time.sleep(0.05)
-            session = SessionStore(project).load_session_by_name("work")
             assert session is not None
             assert session.summary == "라우터 개선 작업을 진행했다."
         finally:
@@ -477,3 +499,63 @@ class TestSummarizerWorker:
         worker.start()
         worker.stop()
         assert worker._thread is None
+
+
+class TestClaimAndSweep:
+    """Multi-instance safety (claim) and queue-file retention (sweep).
+
+    다중 인스턴스 안전성 (claim) 과 큐 파일 보존 정책 (sweep).
+    """
+
+    def test_claimed_task_hidden_from_other_workers(self, project: Path) -> None:
+        """Two ccode instances must not pay for the same summary twice.
+
+        같은 프로젝트의 ccode 두 개가 같은 요약을 두 번 결제하면 안 된다.
+        """
+        path = summarizer.enqueue(project, _task())
+        assert path is not None
+        claimed = summarizer._claim(path)
+        assert claimed is not None
+        assert claimed.name.endswith(summarizer.CLAIM_SUFFIX)
+        assert summarizer.load_pending_tasks(project) == []
+
+    def test_claim_loses_race_returns_none(self, project: Path) -> None:
+        path = summarizer.enqueue(project, _task())
+        assert path is not None
+        assert summarizer._claim(path) is not None
+        # Second claimant finds the file gone — rename fails, no crash.
+        # 두 번째 선점자는 파일이 사라진 것을 본다 — rename 실패, 크래시 없음.
+        assert summarizer._claim(path) is None
+
+    def test_concurrent_pass_processes_task_once(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        """A second pass over the same queue must find nothing left to run.
+
+        같은 큐에 대한 두 번째 pass 는 실행할 작업을 찾지 못해야 한다.
+        """
+        summarizer.enqueue(project, _task())
+        pending_snapshot = summarizer.load_pending_tasks(project)
+        run = RunRecorder([GOOD_RESPONSE])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        # Simulate the racing worker that had already listed the task.
+        # 이미 목록을 확보한 채 경합하던 워커를 재현.
+        assert all(summarizer._claim(p) is None for p, _ in pending_snapshot)
+        assert len(run.prompts) == 1
+
+    def test_sweep_removes_old_files_only(self, project: Path) -> None:
+        queue_dir = project / ".session-manager" / "summary-queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        old = queue_dir / "old.json.processing"
+        old.write_text("{}", encoding="utf-8")
+        old_ts = time.time() - 31 * 86400
+        os.utime(old, (old_ts, old_ts))
+        recent = queue_dir / "recent.json"
+        recent.write_text("{}", encoding="utf-8")
+
+        assert summarizer.sweep_stale_queue_files(project, 30) == 1
+        assert not old.exists()
+        assert recent.exists()
+
+    def test_sweep_without_queue_dir(self, tmp_path: Path) -> None:
+        assert summarizer.sweep_stale_queue_files(tmp_path, 30) == 0

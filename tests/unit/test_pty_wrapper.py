@@ -7,6 +7,8 @@ PTY 래퍼의 내부 로직 단위 테스트. PTY 의존 메서드는 monkeypatc
 
 from __future__ import annotations
 
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1136,28 +1138,84 @@ class TestSummaryTriggers:
         assert not CLEAR_COMMAND_RE.match("/clearall")
         assert not CLEAR_COMMAND_RE.match("say /clear")
 
+    def _fake_transcripts(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
+        """Redirect transcript lookups to a tmp dir the test can control.
+
+        transcript 조회를 테스트가 제어 가능한 tmp 디렉토리로 우회시킨다.
+        """
+        transcripts = Path(wrapper.project_path) / "transcripts"
+        transcripts.mkdir(parents=True, exist_ok=True)
+
+        def fake_activity(_cwd: Path, conv_ids: object) -> datetime | None:
+            newest: float | None = None
+            for conv_id in conv_ids:  # type: ignore[union-attr]
+                path = transcripts / f"{conv_id}.jsonl"
+                if not path.exists():
+                    continue
+                mtime = path.stat().st_mtime
+                if newest is None or mtime > newest:
+                    newest = mtime
+            return (
+                datetime.fromtimestamp(newest, tz=UTC) if newest is not None else None
+            )
+
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.get_conversation_activity",
+            fake_activity,
+        )
+        return transcripts
+
+    def _write_transcript(self, transcripts: Path, conv_id: str, when: str) -> None:
+        path = transcripts / f"{conv_id}.jsonl"
+        path.write_text("{}\n", encoding="utf-8")
+        ts = datetime.fromisoformat(when).timestamp()
+        os.utime(path, (ts, ts))
+
     def test_boot_recovery_enqueues_only_stale_sessions(
-        self, wrapper: SessionManagerWrapper
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Staleness is decided by transcript mtime, not last_accessed.
+
+        stale 판정은 last_accessed 가 아니라 transcript mtime 으로 한다 —
+        last_accessed 는 세션을 건드리는 도구 호출 시에만 기록되어 사용 중인
+        세션에서도 낡을 수 있다.
+        """
+        transcripts = self._fake_transcripts(wrapper, monkeypatch)
         project = Path(wrapper.project_path)
         store = SessionStore(project)
         store.init_project()
 
+        # Summarised yesterday, transcript written today → stale.
+        # 어제 요약, 오늘 transcript 기록 → stale.
         stale = SessionMetadata.new(name="stale", title="요약 유실")
         stale.claude_conversation_ids = ["conv-stale"]
         stale.summary_updated_at = "2026-07-29T00:00:00+00:00"
-        stale.last_accessed = "2026-07-30T00:00:00+00:00"
         store.save_session(stale)
+        self._write_transcript(transcripts, "conv-stale", "2026-07-30T00:00:00+00:00")
 
         never = SessionMetadata.new(name="never", title="요약 없음")
         never.claude_conversation_ids = ["conv-never"]
         store.save_session(never)
+        self._write_transcript(transcripts, "conv-never", "2026-07-30T00:00:00+00:00")
 
+        # last_accessed is stale but the summary postdates the transcript —
+        # the old predicate would have re-summarised this needlessly.
+        # last_accessed 는 낡았지만 요약이 transcript 보다 최신 — 옛 술어라면
+        # 불필요하게 재요약했을 세션.
         fresh = SessionMetadata.new(name="fresh", title="요약 최신")
         fresh.claude_conversation_ids = ["conv-fresh"]
-        fresh.last_accessed = "2026-07-29T00:00:00+00:00"
+        fresh.last_accessed = "2026-07-01T00:00:00+00:00"
         fresh.summary_updated_at = "2026-07-30T00:00:00+00:00"
         store.save_session(fresh)
+        self._write_transcript(transcripts, "conv-fresh", "2026-07-29T00:00:00+00:00")
+
+        # Transcript removed by Claude Code's own cleanup — nothing to summarise.
+        # Claude Code 자체 정리로 transcript 소멸 — 요약할 대상 없음.
+        gone = SessionMetadata.new(name="gone", title="대화 파일 소멸")
+        gone.claude_conversation_ids = ["conv-gone"]
+        store.save_session(gone)
 
         no_conv = SessionMetadata.new(name="no-conv", title="대화 없음")
         store.save_session(no_conv)
@@ -1166,21 +1224,21 @@ class TestSummaryTriggers:
 
         names = sorted(t.session_name for t in self._pending(wrapper))
         assert names == ["never", "stale"]
-        # The stale session's latest conversation is the summarised one.
-        # stale 세션의 가장 최근 conversation 이 요약 대상이 된다.
         by_name = {t.session_name: t for t in self._pending(wrapper)}
         assert by_name["stale"].conversation_id == "conv-stale"
         assert by_name["stale"].kind == summarizer.KIND_DEPARTED
 
     def test_boot_recovery_does_not_double_queue(
-        self, wrapper: SessionManagerWrapper
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        transcripts = self._fake_transcripts(wrapper, monkeypatch)
         project = Path(wrapper.project_path)
         store = SessionStore(project)
         store.init_project()
         stale = SessionMetadata.new(name="stale", title="요약 유실")
         stale.claude_conversation_ids = ["conv-stale"]
         store.save_session(stale)
+        self._write_transcript(transcripts, "conv-stale", "2026-07-30T00:00:00+00:00")
 
         wrapper._enqueue_stale_summaries()
         wrapper._enqueue_stale_summaries()

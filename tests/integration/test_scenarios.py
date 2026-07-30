@@ -72,6 +72,19 @@ def app(tmp_path: Path) -> AppContext:
 # ---------------------------------------------------------------------------
 
 
+def _last_signal(app, action: str) -> dict:
+    """The most recent socket signal of *action*.
+
+    가장 최근의 *action* 신호. 도구는 세션 변경 시 current_session 통보를 함께
+    보내므로, 마지막 호출이 아니라 action 으로 찾아야 한다.
+    """
+    for call in reversed(app.socket_client.send_signal.call_args_list):
+        payload = call[0][0] if call[0] else None
+        if isinstance(payload, dict) and payload.get("action") == action:
+            return payload
+    raise AssertionError(f"no {action!r} signal was sent")
+
+
 class TestClearTopicSwitch:
     def test_switch_updates_outgoing_and_transitions_to_target(
         self, app: AppContext
@@ -119,8 +132,7 @@ class TestClearTopicSwitch:
 
         # Socket signal sent to wrapper.
         # 래퍼에 소켓 신호가 전송되어야 한다.
-        signal = app.socket_client.send_signal.call_args[0][0]
-        assert signal["action"] == "switch"
+        signal = _last_signal(app, "switch")
         assert signal["target"] == "backend"
 
 
@@ -231,8 +243,7 @@ class TestNewTopicCreatesSession:
 
         # Socket signal should carry NEW action.
         # 소켓 신호에 NEW action이 포함되어야 한다.
-        signal = app.socket_client.send_signal.call_args[0][0]
-        assert signal["action"] == "new"
+        signal = _last_signal(app, "new")
         assert signal["new_session_name"] == "ci-pipeline"
         assert signal["rename_current"] == "frontend"
 
@@ -277,7 +288,14 @@ class TestStayInCurrentSession:
         # Verify state is unchanged.
         # 상태가 변하지 않았는지 검증.
         assert app.state.get_current_session() == "frontend"
-        app.socket_client.send_signal.assert_not_called()
+        # Only the current-session mirror update — no switch/new signal.
+        # 현재 세션 미러 갱신뿐 — switch/new 신호는 없다.
+        actions = [
+            call[0][0].get("action")
+            for call in app.socket_client.send_signal.call_args_list
+            if call[0] and isinstance(call[0][0], dict)
+        ]
+        assert set(actions) <= {"current_session"}
 
 
 # ---------------------------------------------------------------------------
@@ -489,9 +507,17 @@ class TestMultiSessionRoundTrip:
         assert len(api.transitions) == 1
         assert api.transitions[0].to_session == "auth"
 
-        # Three socket signals should have been sent.
-        # 소켓 신호가 3번 전송되어야 한다.
-        assert app.socket_client.send_signal.call_count == 3
+        # Three switch signals should have been sent (each also mirrors the
+        # current session to the wrapper).
+        # switch 신호가 3번 전송되어야 한다 (각각 현재 세션 미러 통보를 동반).
+        switch_signals = [
+            call[0][0]
+            for call in app.socket_client.send_signal.call_args_list
+            if call[0]
+            and isinstance(call[0][0], dict)
+            and call[0][0].get("action") == "switch"
+        ]
+        assert len(switch_signals) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +556,6 @@ class TestNewFromFirstSessionRenameNull:
         assert result["rename_current"] is None
         assert app.state.get_current_session() == "first-real"
 
-        signal = app.socket_client.send_signal.call_args[0][0]
-        assert signal["action"] == "new"
+        signal = _last_signal(app, "new")
         assert signal["rename_current"] is None
         assert signal["new_session_name"] == "first-real"

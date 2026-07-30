@@ -59,6 +59,19 @@ def app(tmp_path: Path) -> AppContext:
 # ---------------------------------------------------------------- check_session
 
 
+def _signals(app, action: str) -> list[dict]:
+    """All socket signals of *action* sent during the call.
+
+    호출 중 전송된 *action* 신호 전부. 도구는 세션 변경 시 current_session
+    통보를 함께 보내므로, 특정 신호는 마지막 호출이 아니라 action 으로 찾는다.
+    """
+    return [
+        call[0][0]
+        for call in app.socket_client.send_signal.call_args_list
+        if call[0] and isinstance(call[0][0], dict) and call[0][0].get("action") == action
+    ]
+
+
 class TestCheckSession:
     def test_empty_store_returns_null_current_and_empty_list(
         self, app: AppContext
@@ -152,8 +165,9 @@ class TestSessionSwitch:
 
         # Socket signal should have been sent.
         # 소켓 신호가 전송되어야 한다.
-        app.socket_client.send_signal.assert_called_once()
-        signal = app.socket_client.send_signal.call_args[0][0]
+        switch_signals = _signals(app, "switch")
+        assert len(switch_signals) == 1
+        signal = switch_signals[0]
         assert signal["action"] == "switch"
         assert signal["target"] == "dst"
         assert signal["user_prompt"] == "work on dst"
@@ -189,7 +203,7 @@ class TestSessionSwitch:
         )
 
         assert result["switched_to"] == "real"
-        app.socket_client.send_signal.assert_called_once()
+        assert len(_signals(app, "switch")) == 1
 
     def test_switch_from_null_current(self, app: AppContext) -> None:
         result = session_switch(
@@ -236,7 +250,7 @@ class TestSessionCreate:
 
         # Socket signal should carry rename_current.
         # 소켓 신호에 rename_current가 포함되어야 한다.
-        signal = app.socket_client.send_signal.call_args[0][0]
+        signal = _signals(app, "new")[0]
         assert signal["action"] == "new"
         assert signal["rename_current"] == "old"
         assert signal["new_session_name"] == "fresh"
@@ -258,7 +272,7 @@ class TestSessionCreate:
 
         assert result["rename_current"] is None
 
-        signal = app.socket_client.send_signal.call_args[0][0]
+        signal = _signals(app, "new")[0]
         assert signal["rename_current"] is None
 
     def test_creates_from_null_current(self, app: AppContext) -> None:
@@ -281,7 +295,7 @@ class TestSessionCreate:
             user_prompt="p",
             ctx=_make_ctx(app),
         )
-        signal = app.socket_client.send_signal.call_args[0][0]
+        signal = _signals(app, "new")[0]
         assert signal["handoff"]["new_session_title"] == "New Title"
 
 
@@ -326,9 +340,7 @@ class TestSessionEnd:
 
         session_end(summary="bye", ctx=_make_ctx(app))
 
-        app.socket_client.send_signal.assert_called_once_with(
-            {"action": "intercept_done"}
-        )
+        assert _signals(app, "intercept_done") == [{"action": "intercept_done"}]
         assert app.intercept_active["value"] is False
 
     def test_no_intercept_done_when_inactive(self, app: AppContext) -> None:
@@ -341,7 +353,7 @@ class TestSessionEnd:
 
         session_end(summary="bye", ctx=_make_ctx(app))
 
-        app.socket_client.send_signal.assert_not_called()
+        assert _signals(app, "intercept_done") == []
 
 
 # --------------------------------------------------------------- update_static
@@ -409,3 +421,66 @@ class TestProjectContextTools:
         result = update_project_context(content="v2", ctx=_make_ctx(app))
         assert result["updated"] is True
         assert app.project_context_store.read() == "v2"
+
+
+class TestCurrentSessionNotification:
+    """The wrapper is told the current session on every change (F4).
+
+    현재 세션이 바뀔 때마다 래퍼에 통보한다 (F4).
+
+    Without this the wrapper never learns the session name on a plain
+    `ccode` start — the handshake only flows wrapper→MCP — and its
+    session-scoped triggers (/clear summary, periodic refresh) no-op.
+    이 통보가 없으면 인자 없는 `ccode` 시작에서 래퍼는 세션 이름을 알지 못해
+    세션 단위 트리거가 무효화된다.
+    """
+
+    def test_register_notifies(self, app: AppContext) -> None:
+        session_register(name="alpha", title="첫 세션", ctx=_make_ctx(app))
+        assert _signals(app, "current_session") == [
+            {"action": "current_session", "name": "alpha"}
+        ]
+
+    def test_switch_notifies_target(self, app: AppContext) -> None:
+        app.session_store.save_session(SessionMetadata.new(name="src", title="s"))
+        app.session_store.save_session(SessionMetadata.new(name="dst", title="d"))
+        app.state.set_current_session("src")
+        session_switch(
+            target="dst",
+            summary="요약",
+            user_prompt="다음 작업",
+            ctx=_make_ctx(app),
+        )
+        assert _signals(app, "current_session") == [
+            {"action": "current_session", "name": "dst"}
+        ]
+
+    def test_create_notifies_new_session(self, app: AppContext) -> None:
+        session_create(
+            new_session_name="fresh",
+            title="새 세션",
+            handoff_summary="요약",
+            user_prompt="시작",
+            ctx=_make_ctx(app),
+        )
+        assert _signals(app, "current_session") == [
+            {"action": "current_session", "name": "fresh"}
+        ]
+
+    def test_end_notifies_none(self, app: AppContext) -> None:
+        app.session_store.save_session(SessionMetadata.new(name="solo", title="s"))
+        app.state.set_current_session("solo")
+        session_end(summary="마무리", ctx=_make_ctx(app))
+        assert _signals(app, "current_session") == [
+            {"action": "current_session", "name": None}
+        ]
+
+    def test_send_failure_does_not_break_the_tool(self, app: AppContext) -> None:
+        """A dead socket must not fail the tool call — triggers just stay off.
+
+        소켓이 죽어도 도구 호출은 실패하지 않아야 한다 — 트리거만 꺼질 뿐.
+        """
+        app.socket_client.send_signal.side_effect = OSError("socket gone")
+        result = session_register(name="alpha", title="첫 세션", ctx=_make_ctx(app))
+        assert result["registered"] == "alpha"
+        assert app.state.get_current_session() == "alpha"

@@ -132,3 +132,49 @@ class TestHandshakeScenarios:
             state.set_current_session(state.resolve_from_store(store))
 
         assert state.get_current_session() is None
+
+
+class TestResolveWithActiveConversation:
+    """Active-conversation match beats the last_accessed scan (F14).
+
+    활성 conversation 매칭이 last_accessed 스캔보다 우선한다 (F14).
+
+    ``last_accessed`` is written only by tool calls that touch a session,
+    so the newest timestamp is not evidence of where the user actually is.
+    Conversation ownership is a direct fact.
+    ``last_accessed`` 는 세션을 건드리는 도구 호출 시에만 기록되므로 최신
+    타임스탬프가 사용자의 현 위치를 증명하지 못한다. conversation 소유는
+    직접적인 사실이다.
+    """
+
+    def test_conversation_owner_wins_over_newer_timestamp(
+        self, tmp_path: Path
+    ) -> None:
+        store = SessionStore(tmp_path)
+        store.init_project()
+        owner = SessionMetadata.new(name="owner", title="실제 위치")
+        owner.last_accessed = "2026-07-01T00:00:00+00:00"
+        owner.claude_conversation_ids = ["conv-here"]
+        store.save_session(owner)
+        newer = SessionMetadata.new(name="newer", title="타임스탬프만 최신")
+        newer.last_accessed = "2026-07-30T00:00:00+00:00"
+        store.save_session(newer)
+
+        state = SessionManagerState()
+        assert state.resolve_from_store(store, "conv-here") == "owner"
+
+    def test_falls_back_to_last_accessed_when_unmatched(
+        self, tmp_path: Path
+    ) -> None:
+        store = SessionStore(tmp_path)
+        store.init_project()
+        old = SessionMetadata.new(name="old", title="예전")
+        old.last_accessed = "2026-07-01T00:00:00+00:00"
+        store.save_session(old)
+        recent = SessionMetadata.new(name="recent", title="최근")
+        recent.last_accessed = "2026-07-30T00:00:00+00:00"
+        store.save_session(recent)
+
+        state = SessionManagerState()
+        assert state.resolve_from_store(store, "conv-unknown") == "recent"
+        assert state.resolve_from_store(store, None) == "recent"

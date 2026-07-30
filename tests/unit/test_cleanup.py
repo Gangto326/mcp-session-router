@@ -7,11 +7,16 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import shutil
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from session_manager.claude_conversation import encode_cwd
 from session_manager.lifecycle.cleanup import (
     _DEFAULT_CLEANUP_PERIOD_DAYS,
     cleanup_expired_sessions,
@@ -217,3 +222,92 @@ class TestCleanupExpiredSessions:
         deleted = cleanup_expired_sessions(session_store, period_days=7)
         assert deleted == ["task-a"]
         assert len(session_store.list_sessions()) == 1
+
+
+class TestActivityAwareCleanup:
+    """A session in daily use must not be deleted (F16).
+
+    매일 쓰는 세션이 삭제되면 안 된다 (F16).
+
+    ``last_accessed`` is only written by tool calls that touch a session —
+    a switch touches the session being left, not the one entered. Someone
+    working in one session for a month keeps a month-old ``last_accessed``
+    while their transcript is written to every day.
+    ``last_accessed`` 는 세션을 건드리는 도구 호출 시에만 기록된다 — 전환은
+    떠나는 세션만 touch 한다. 한 세션에서 한 달간 작업하는 사용자는
+    ``last_accessed`` 가 한 달 전인 채로 남지만 transcript 는 매일 기록된다.
+    """
+
+    def _link(self, tmp_path: Path, conv_id: str, when_days_ago: float) -> None:
+        project_dir = (
+            Path.home() / ".claude" / "projects" / encode_cwd(tmp_path)
+        )
+        project_dir.mkdir(parents=True, exist_ok=True)
+        path = project_dir / f"{conv_id}.jsonl"
+        path.write_text("{}\n", encoding="utf-8")
+        ts = time.time() - when_days_ago * 86400
+        os.utime(path, (ts, ts))
+
+    @pytest.fixture
+    def project(self, tmp_path: Path) -> Iterator[Path]:
+        """A project dir whose ~/.claude transcript dir is cleaned up after.
+
+        테스트 후 ~/.claude transcript 디렉토리를 정리하는 프로젝트 디렉토리.
+        """
+        yield tmp_path
+        shutil.rmtree(
+            Path.home() / ".claude" / "projects" / encode_cwd(tmp_path),
+            ignore_errors=True,
+        )
+
+    def test_in_use_session_survives_stale_last_accessed(
+        self, project: Path
+    ) -> None:
+        store = SessionStore(project)
+        store.init_project()
+        session = SessionMetadata.new(name="daily", title="매일 쓰는 세션")
+        session.last_accessed = _days_ago_iso(60)
+        session.claude_conversation_ids = ["conv-daily"]
+        store.save_session(session)
+        self._link(project, "conv-daily", when_days_ago=0.5)
+
+        assert cleanup_expired_sessions(store, 30, project) == []
+        assert store.load_session_by_name("daily") is not None
+
+    def test_truly_idle_session_still_deleted(self, project: Path) -> None:
+        store = SessionStore(project)
+        store.init_project()
+        session = SessionMetadata.new(name="idle", title="방치된 세션")
+        session.last_accessed = _days_ago_iso(60)
+        session.claude_conversation_ids = ["conv-idle"]
+        store.save_session(session)
+        self._link(project, "conv-idle", when_days_ago=45)
+
+        assert cleanup_expired_sessions(store, 30, project) == ["idle"]
+
+    def test_missing_transcript_falls_back_to_metadata(
+        self, project: Path
+    ) -> None:
+        """Claude Code may have removed the transcript — fall back safely.
+
+        Claude Code 가 transcript 를 지웠을 수 있다 — 메타데이터로 fallback.
+        """
+        store = SessionStore(project)
+        store.init_project()
+        session = SessionMetadata.new(name="gone", title="대화 파일 소멸")
+        session.last_accessed = _days_ago_iso(60)
+        session.claude_conversation_ids = ["conv-missing"]
+        store.save_session(session)
+
+        assert cleanup_expired_sessions(store, 30, project) == ["gone"]
+
+    def test_without_project_path_behaves_as_before(self, project: Path) -> None:
+        store = SessionStore(project)
+        store.init_project()
+        session = SessionMetadata.new(name="legacy", title="구 동작")
+        session.last_accessed = _days_ago_iso(60)
+        session.claude_conversation_ids = ["conv-legacy"]
+        store.save_session(session)
+        self._link(project, "conv-legacy", when_days_ago=0.5)
+
+        assert cleanup_expired_sessions(store, 30) == ["legacy"]
