@@ -24,7 +24,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -189,9 +189,6 @@ class AppContext:
     project_context_store: ProjectContextStore
     socket_client: WrapperSocketClient
     project_path: Path
-    # Tracks whether session_end was the response to an active intercept.
-    # session_end가 활성 가로채기에 대한 응답인지 추적.
-    intercept_active: dict[str, bool] = field(default_factory=lambda: {"value": False})
 
 
 @asynccontextmanager
@@ -304,15 +301,15 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         project_path=project_path,
     )
 
-    # Start the wrapper → MCP receive loop so slash-command intercepts get
-    # forwarded to the LLM as <channel> messages. Only spawn when the socket
-    # is actually connected (no-op for tool tests / standalone runs).
-    # 슬래시 명령 가로채기 신호를 LLM에게 <channel> 메시지로 forward하기 위해
-    # 래퍼 → MCP receive 루프 시작. 소켓이 연결된 경우에만 spawn.
+    # Start the wrapper → MCP receive loop so observed slash commands can
+    # invalidate the cached session pointer. Only spawn when the socket is
+    # actually connected (no-op for tool tests / standalone runs).
+    # 관찰된 슬래시 명령이 캐시된 세션 포인터를 무효화할 수 있도록 래퍼 →
+    # MCP receive 루프 시작. 소켓이 연결된 경우에만 spawn.
     recv_task: asyncio.Task[None] | None = None
     if socket_path and client._sock is not None:
         recv_task = asyncio.create_task(
-            client.recv_loop(_make_intercept_handler(server, ctx))
+            client.recv_loop(_make_wrapper_signal_handler(ctx))
         )
 
     try:
@@ -327,58 +324,44 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         client.close()
 
 
-def _make_intercept_handler(
-    server: FastMCP, app: AppContext
+def _make_wrapper_signal_handler(
+    app: AppContext,
 ) -> Callable[[dict[str, Any]], Awaitable[None]]:
-    """Build the on_message callback that converts wrapper signals into
-    channel notifications.
+    """Build the on_message callback for signals the wrapper observes.
 
-    래퍼가 보낸 가로채기 신호를 LLM의 <channel> 메시지로 변환하는
-    on_message 콜백을 만든다. server는 ChannelFastMCP 인스턴스 — 그 안의
-    _channel_write_stream을 이용해 stdio write_stream에 직접 push한다.
+    래퍼가 관찰한 신호를 처리하는 on_message 콜백을 만든다.
+
+    The wrapper reports session-changing slash commands the user typed
+    directly (``/resume``, ``/exit``, ``/rename``, ``/new``). Nothing is
+    asked of the LLM — the background summariser handles the summary — so
+    the only thing to do here is drop the cached session pointer, which the
+    user has just invalidated by moving elsewhere by hand. The next tool
+    call re-resolves it from the active conversation.
+
+    래퍼는 사용자가 직접 입력한 세션 변경 슬래시 명령을 보고한다. LLM 에게
+    요구하는 것은 없다 — 요약은 백그라운드 요약기가 맡는다 — 따라서 여기서
+    할 일은 캐시된 세션 포인터를 버리는 것뿐이다. 사용자가 손수 다른 곳으로
+    이동해 그 포인터를 무효화했기 때문이며, 다음 도구 호출이 활성
+    conversation 으로부터 다시 해석한다.
     """
 
     async def handler(msg: dict[str, Any]) -> None:
-        action = msg.get("action")
-        if action != "intercept":
+        if msg.get("action") != "session_command":
             return
         command = msg.get("command")
-        args = msg.get("args", "")
-        if not isinstance(command, str) or not isinstance(args, str):
+        if not isinstance(command, str):
             return
-
-        write_stream = getattr(server, "_channel_write_stream", None)
-        if write_stream is None:
-            logger.warning("intercept signal received but no channel write_stream")
-            return
-
-        current = app.state.get_current_session() or "(none)"
-        full_cmd = f"/{command}" + (f" {args}" if args else "")
-        content = (
-            f"User typed slash command directly: {full_cmd}. "
-            f"This bypasses the LLM-mediated session switch flow, so the "
-            f"current session ('{current}') summary will NOT be updated "
-            f"unless you act now. Call session_end with a 2-3 sentence "
-            f"summary of work done in '{current}'. After session_end "
-            f"completes, the original command will be auto-forwarded to "
-            f"Claude Code — do not call any other tool."
-        )
-        meta = {
-            "command": command,
-            "args": args,
-            "current_session": current,
-        }
-        # Mark intercept active so session_end knows to notify the wrapper.
-        # 가로채기 활성 표시 — session_end가 래퍼 통보 여부 판단에 사용.
         debug_log.log(
-            "INTERCEPT_RECEIVED",
+            "SESSION_COMMAND_RECEIVED",
             "USER",
-            {"command": command, "args": args, "current_session": current},
-            session=current,
+            {
+                "command": command,
+                "args": msg.get("args", ""),
+                "invalidated_session": app.state.get_current_session(),
+            },
+            session=app.state.get_current_session(),
         )
-        app.intercept_active["value"] = True
-        await send_channel_notification(write_stream, content, meta)
-        logger.info("Pushed intercept channel notification: %s", full_cmd)
+        app.state.set_current_session(None)
 
     return handler
 
@@ -429,15 +412,7 @@ When input contains [handoff]...[/handoff]:
 When switching or ending a session, write a 2-3 sentence summary: \
 where (files/areas touched), what (work performed), status \
 (done / in-progress / remaining). Update the title if it has evolved.
-
-## Channel Intercept
-If you receive a <channel source="session-manager"> tag asking you to call \
-session_end, that's a slash-command intercept (the user typed /resume, \
-/exit, /rename, or /new directly). Call session_end immediately with a \
-2-3 sentence summary of the current session's work. The wrapper will then \
-auto-forward the original command. Do NOT call any other tool, do NOT \
-ask the user for confirmation, do NOT respond with text — just call \
-session_end and stop.\
+\
 """
 
 _INIT_PROJECT_HINT = """
@@ -756,9 +731,9 @@ def session_end(summary: str, ctx: Context) -> dict:
     Archive the current session with a final summary.
 
     현재 세션을 종료한다. 최종 요약을 저장하고 상태를 ARCHIVED로 변경한다.
-    가로채기 흐름 (사용자가 /resume·/exit·/rename·/new를 직접 입력)에서 LLM이
-    호출하면 래퍼에 intercept_done 신호를 보내 큐잉된 사용자 명령을 forward
-    하게 한다.
+    LLM 이 자발적으로 세션을 마감할 때 호출한다 — 사용자가 /resume·/exit 등을
+    직접 입력하는 경우의 요약은 백그라운드 요약기가 담당하므로 이 도구를
+    거치지 않는다.
     """
     app = _get_app_ctx(ctx)
     event_id = _log_tool_call(
@@ -784,20 +759,6 @@ def session_end(summary: str, ctx: Context) -> dict:
             app.session_store.save_session(current)
 
     _set_current_session(app, None)
-
-    # If this session_end is the response to an active intercept, notify
-    # the wrapper so it drains the queued user command. The wrapper itself
-    # ignores intercept_done when no intercept is active, so an extra send
-    # is harmless.
-    # 활성 가로채기 응답이면 래퍼에 intercept_done 신호를 보내 큐잉된 사용자
-    # 명령을 forward하게 한다. 래퍼는 비활성 시 무시하므로 안전.
-    if app.intercept_active.get("value"):
-        try:
-            app.socket_client.send_signal({"action": "intercept_done"})
-        except (OSError, RuntimeError) as exc:
-            logger.warning("Failed to send intercept_done: %s", exc)
-        app.intercept_active["value"] = False
-
     return _log_tool_return("session_end", event_id, app, {"ended": current_name})
 
 

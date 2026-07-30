@@ -3,7 +3,7 @@ PTY wrapper that mediates between the user terminal and Claude Code.
 
 Provides the I/O loop skeleton on which additional handlers hang
 SWITCH/NEW logic, MCP socket integration, and stdin slash-command
-interception. By itself it is a transparent passthrough: spawns Claude
+observation. By itself it is a transparent passthrough: spawns Claude
 Code on a PTY, forwards stdin to the PTY master, forwards PTY output to
 stdout, and detects the input prompt so the rest of the wrapper can pick
 a safe moment to inject text.
@@ -12,7 +12,7 @@ a safe moment to inject text.
 중계하는 PTY 래퍼 모듈이다.
 
 이 모듈은 I/O 루프의 골격만 제공한다. 세션 전환(SWITCH/NEW) 처리,
-MCP 소켓 통합, stdin 슬래시 커맨드 가로채기 같은 상위 로직은 별도의
+MCP 소켓 통합, stdin 슬래시 커맨드 관찰 같은 상위 로직은 별도의
 핸들러로 이 골격 위에 얹어 확장한다.
 
 단독으로 사용할 경우 투명한 패스스루로 동작한다. Claude Code를 PTY에
@@ -32,7 +32,7 @@ import sys
 import termios
 import time
 import tty
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -91,14 +91,6 @@ AUTO_CONFIRM_PATTERNS: tuple[str, ...] = (
     "Use this MCP server",  # MCP server 등록, 옵션 2 (1번과 별도 매칭)
 )
 
-# Slash-command interception timeout. If the LLM doesn't call session_end
-# within this window, the held \r is forwarded anyway (graceful degradation
-# = same outcome as not intercepting, plus a one-line notice).
-# 슬래시 명령 가로채기 timeout. LLM이 이 시간 안에 session_end를 호출하지
-# 않으면 보관한 \r을 그냥 forward (graceful degradation = 가로채기 안 한
-# 것과 같은 결과 + 한 줄 안내).
-INTERCEPT_TIMEOUT_SEC = 15.0
-
 # AGENT_GUIDE.md sits in the package root (one level above wrapper/). The
 # wrapper @-attaches this manual on session start so the LLM gets the full
 # operational rules in conversation history without relying on initialize
@@ -108,17 +100,11 @@ INTERCEPT_TIMEOUT_SEC = 15.0
 # 전체를 LLM 컨텍스트에 박는다.
 AGENT_GUIDE_PATH = (Path(__file__).parent.parent / "AGENT_GUIDE.md").resolve()
 
-# Ctrl+C bytes from raw-mode stdin (terminal sends \x03 instead of SIGINT
-# because tty.setraw clears ISIG).
-# raw mode stdin에서 Ctrl+C — tty.setraw가 ISIG를 끄므로 SIGINT 대신
-# \x03 바이트로 옴.
-CTRL_C = b"\x03"
-
-# /clear observation (not interception): the conversation content is about
+# /clear observation: the conversation content is about
 # to be wiped, so this is the last chance to summarise the active session.
 # The command itself is forwarded untouched.
-# /clear 관찰 (가로채기 아님) — 대화 내용이 곧 지워지므로 활성 세션을
-# 요약할 마지막 기회다. 명령 자체는 손대지 않고 그대로 통과시킨다.
+# /clear 관찰 — 대화 내용이 곧 지워지므로 활성 세션을 요약할 마지막
+# 기회다. 명령 자체는 손대지 않고 그대로 통과시킨다.
 CLEAR_COMMAND_RE = re.compile(r"^/clear(\s|$)")
 
 Mode = Literal["passthrough", "filtering"]
@@ -168,23 +154,6 @@ class _PendingAction:
     new_session_name: str = ""
 
 
-@dataclass
-class _InterceptState:
-    """
-    In-progress slash-command interception waiting for the MCP response.
-
-    사용자가 직접 친 슬래시 명령(`/resume`, `/exit` 등)을 가로채고 MCP에서
-    session_end 처리가 끝났다는 응답이 오기를 기다리는 상태를 보관한다.
-    응답이 늦으면 ``deadline`` 시점에 graceful degradation으로 종료한다.
-    """
-
-    command: str  # one of KNOWN_COMMANDS
-    args: str
-    # time.monotonic() value at which this interception times out.
-    # 가로채기가 timeout되는 time.monotonic() 시각. 0.0이면 미설정.
-    deadline: float = field(default=0.0)
-
-
 class SessionManagerWrapper:
     def __init__(
         self,
@@ -224,7 +193,6 @@ class SessionManagerWrapper:
         self.virtual_screen = VirtualScreen()
 
         self._pending_action: _PendingAction | None = None
-        self._intercept_state: _InterceptState | None = None
 
         # Confirmation patterns already auto-accepted in the current child.
         # Reset on each spawn so a respawned child re-arms the auto-accept.
@@ -491,13 +459,6 @@ class SessionManagerWrapper:
             if client_fd >= 0 and client_fd in readable:
                 self.socket_server.handle_client_readable()
 
-            # Time out an active interception if the LLM hasn't responded
-            # within INTERCEPT_TIMEOUT_SEC. select's 100ms tick gives us
-            # ~100ms timeout granularity — accurate enough.
-            # 활성 가로채기가 INTERCEPT_TIMEOUT_SEC 안에 응답 못 받으면
-            # timeout. select 100ms 틱이라 ~100ms 정확도 — 충분.
-            self._check_intercept_timeout()
-
         self._drain_pty()
 
     def _handle_pty_readable(self) -> bool:
@@ -582,7 +543,6 @@ class SessionManagerWrapper:
             "USER",
             {
                 "mode": self.mode,
-                "intercept_active": self._intercept_state is not None,
                 "chunk": debug_log.mask_stdin_chunk(chunk),
             },
         )
@@ -605,17 +565,6 @@ class SessionManagerWrapper:
             )
             return
 
-        # During slash-command interception, drop user input — the visible
-        # input line stays as-is (we held \r, not the typed text), and the
-        # held \r is forwarded when the MCP responds. Ctrl+C is the only
-        # exception: it cancels the command outright.
-        # 슬래시 명령 가로채기 중에는 사용자 입력을 drop — 입력란은 그대로
-        # 유지된다. 단 Ctrl+C는 예외로 처리해 명령 자체를 취소한다.
-        if self._intercept_state is not None:
-            if chunk == CTRL_C:
-                self._cancel_intercept()
-            return
-
         # Submit detection: Ink's parseKeypress only treats a lone \r as
         # Return (s === '\r'). Multi-byte chunks are typed text, not submit.
         # submit 감지 — Ink parseKeypress는 단독 \r만 Return으로 인정
@@ -629,14 +578,11 @@ class SessionManagerWrapper:
             )
             matched = match_intercept_command(prompt_text)
             if matched is not None:
-                self._start_intercept(matched)
-                return
-            # /clear observation: the conversation is about to be wiped —
-            # queue a summary of the current session, then let the command
-            # through untouched (observation, not interception).
-            # /clear 관찰 — 대화가 곧 지워지므로 현재 세션 요약을 큐에 넣고,
-            # 명령은 그대로 통과시킨다 (가로채기가 아니라 관찰).
-            if prompt_text and CLEAR_COMMAND_RE.match(prompt_text.strip()):
+                self._observe_session_command(matched)
+            elif prompt_text and CLEAR_COMMAND_RE.match(prompt_text.strip()):
+                # /clear wipes the conversation — summarise it while it's
+                # still there.
+                # /clear 는 대화를 지운다 — 아직 남아 있을 때 요약한다.
                 self._enqueue_active_summary()
 
         self.stdin_line_buffer += chunk
@@ -648,121 +594,57 @@ class SessionManagerWrapper:
         # Ink가 실시간으로 렌더링할 수 있도록 키 입력을 PTY로 즉시 전달.
         os.write(self.pty_fd, chunk)
 
-    # ------------------------------------------------------- Slash interception
-    # 슬래시 명령 가로채기 ------------------------------------------------------
+    # --------------------------------------------------- Slash observation
+    # 슬래시 명령 관찰 ----------------------------------------------------------
 
-    def _start_intercept(self, matched: InterceptedCommand) -> None:
-        """Begin a slash-command interception flow.
+    def _observe_session_command(self, matched: InterceptedCommand) -> None:
+        """Record a session-changing slash command and let it through.
 
-        슬래시 명령 가로채기 흐름 시작 — \\r은 PTY로 forward하지 않고 보관,
-        MCP에 가로채기 신호 송신. 가로채기 중 들어오는 사용자 stdin은
-        _handle_stdin_readable에서 drop된다 (입력란은 그대로 유지). MCP 응답
-        도착 시 _finish_intercept가 \\r을 forward해 명령을 실행한다.
-        ``deadline`` 시점까지 응답이 없으면 _check_intercept_timeout이
-        graceful degradation으로 종료한다.
+        세션을 바꾸는 슬래시 명령을 기록만 하고 그대로 통과시킨다.
+
+        These commands (``/resume``, ``/exit``, ``/rename``, ``/new``) leave
+        the current conversation, so the summary must be refreshed — but
+        the wrapper no longer holds the keystroke to arrange that. It used
+        to: the \r was withheld while the in-session LLM was asked to write
+        a summary, freezing the user's input line for up to 15 seconds and
+        failing outright whenever the LLM was busy or the reply never came.
+        The background summariser removes that dependency entirely, so the
+        command runs at once and the summary is produced afterwards from
+        the transcript.
+
+        이 명령들 (``/resume``, ``/exit``, ``/rename``, ``/new``) 은 현재
+        conversation 을 떠나므로 summary 갱신이 필요하다 — 하지만 래퍼는 더
+        이상 그것을 위해 키 입력을 붙잡지 않는다. 예전에는 세션 안의 LLM 에게
+        요약을 부탁하는 동안 \r 을 보관해 사용자 입력란이 최대 15초간 얼었고,
+        LLM 이 바쁘거나 응답이 오지 않으면 그대로 실패했다. 백그라운드 요약기가
+        그 의존을 없앴으므로, 명령은 즉시 실행되고 요약은 그 뒤에 transcript
+        로부터 만들어진다.
+
+        A missed observation (the virtual screen not yet updated, say) is
+        harmless: the transcript is still on disk, and the boot-time
+        recovery pass picks the session up on the next start.
+
+        관찰을 놓쳐도 (가상 화면이 아직 갱신되지 않은 경우 등) 무해하다 —
+        transcript 는 디스크에 남아 있고, 다음 시작 시 부팅 복구가 집어간다.
         """
         debug_log.log(
-            "INTERCEPT_START",
+            "SESSION_COMMAND_OBSERVED",
             "USER",
-            {
-                "command": matched.command,
-                "args": matched.args,
-                "deadline_sec": INTERCEPT_TIMEOUT_SEC,
-            },
+            {"command": matched.command, "args": matched.args},
+            session=self._current_session_name,
         )
-        self._intercept_state = _InterceptState(
-            command=matched.command,
-            args=matched.args,
-            deadline=time.monotonic() + INTERCEPT_TIMEOUT_SEC,
-        )
+        self._enqueue_active_summary()
+        # Tell the MCP server its current-session pointer is now stale: the
+        # user is moving to another conversation by hand.
+        # MCP 서버에 현재 세션 포인터가 낡았음을 알린다 — 사용자가 손수 다른
+        # conversation 으로 이동하는 중이다.
         self.socket_server.send(
             {
-                "action": "intercept",
+                "action": "session_command",
                 "command": matched.command,
                 "args": matched.args,
             }
         )
-
-    def _finish_intercept(self) -> None:
-        """End interception and forward the held \\r to the PTY.
-
-        가로채기 종료 — 보관한 \\r을 PTY로 forward해 입력란의 명령을
-        실행시킨다. 가로채기 중 사용자 stdin은 drop되었으므로 입력란은
-        가로채기 시점 그대로 (사용자가 친 ``/resume foo`` 등).
-        """
-        debug_log.log(
-            "INTERCEPT_FINISH",
-            "WRAPPER",
-            {"reason": "session_end_received"},
-        )
-        self._intercept_state = None
-        try:
-            debug_log.log(
-                "WRAPPER_INJECT",
-                "WRAPPER",
-                {"caller": "_finish_intercept", "raw": "\\r"},
-            )
-            os.write(self.pty_fd, b"\r")
-        except OSError:
-            pass
-
-    def _cancel_intercept(self) -> None:
-        """User pressed Ctrl+C during interception: cancel the command.
-
-        사용자가 가로채기 중 Ctrl+C를 누른 경우 — 명령 자체 취소. 보관한 \\r은
-        forward하지 않고 폐기 (명령 실행 안 함). PTY로는 \\x03을 흘려보내
-        Claude Code의 진행 중인 LLM turn (channel 응답 처리 등)을 함께
-        중단시킨다. session_end가 이미 호출 중이었다면 그 호출은 별개로
-        진행될 수 있으나 (race), wrapper는 intercept_done을 수신해도 이미
-        비활성 상태라 무시한다 (6-4의 비활성 시 no-op 동작).
-        """
-        debug_log.log("INTERCEPT_FINISH", "USER", {"reason": "user_ctrl_c"})
-        self._intercept_state = None
-        try:
-            debug_log.log(
-                "WRAPPER_INJECT",
-                "WRAPPER",
-                {"caller": "_cancel_intercept", "raw": "\\x03"},
-            )
-            os.write(self.pty_fd, CTRL_C)
-        except OSError:
-            pass
-
-    def _check_intercept_timeout(self) -> None:
-        """Time out the active interception if the deadline has passed.
-
-        활성 가로채기가 deadline을 넘기면 graceful degradation으로 종료. 한 줄
-        안내를 stdout에 출력한 뒤 보관한 \\r을 forward해 명령은 실행되도록
-        한다. summary 갱신은 누락된 채로 남는다 (옵션 E와 동일 결과).
-        """
-        state = self._intercept_state
-        if state is None:
-            return
-        if time.monotonic() < state.deadline:
-            return
-        debug_log.log(
-            "INTERCEPT_FINISH",
-            "SYSTEM",
-            {"reason": "timeout", "elapsed_sec": INTERCEPT_TIMEOUT_SEC},
-        )
-        self._intercept_state = None
-        try:
-            os.write(
-                self._stdout_fd,
-                b"\r\n[session-manager] timeout - command forwarded "
-                b"without summary update\r\n",
-            )
-        except OSError:
-            pass
-        try:
-            debug_log.log(
-                "WRAPPER_INJECT",
-                "WRAPPER",
-                {"caller": "_check_intercept_timeout", "raw": "\\r"},
-            )
-            os.write(self.pty_fd, b"\r")
-        except OSError:
-            pass
 
     # ------------------------------------------------------- Summary triggers
     # 요약 트리거 ---------------------------------------------------------------
@@ -1252,17 +1134,6 @@ class SessionManagerWrapper:
                     "MCP_TOOL",
                     {"before": before, "after": name},
                     session=name,
-                )
-        elif action == "intercept_done":
-            # MCP 측에서 session_end 처리가 끝났다는 응답. 가로채기 상태일
-            # 때만 종료하고 큐잉된 명령을 흘려보낸다 (그 외 상태에서는 무시).
-            if self._intercept_state is not None:
-                self._finish_intercept()
-            else:
-                debug_log.log(
-                    "INTERCEPT_DONE_DROPPED",
-                    "SYSTEM",
-                    {"reason": "no_active_intercept"},
                 )
 
     # ----------------------------------------------------------- Action handlers
