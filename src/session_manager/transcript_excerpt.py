@@ -59,16 +59,21 @@ EVENT_TYPE_ASSISTANT = "assistant"
 # ``tool_use`` 블록은 발췌에서 제외한다.
 BLOCK_TYPE_TEXT = "text"
 
-# A user event whose string content starts with one of these prefixes is
-# a slash-command record injected by the CLI, not something the user
-# typed as dialogue.
+# A user event whose text starts with one of these prefixes was written by
+# the CLI, not typed by the user as dialogue: slash-command records and
+# interruption markers. Confirmed against real transcripts — the marker
+# form appears as a *list* content block, which is why the list branch
+# below must filter too.
 #
-# string content 가 이 프리픽스로 시작하는 user 이벤트는 CLI 가 주입한
-# 슬래시 명령 기록이지 사용자가 대화로 입력한 것이 아니다.
+# 텍스트가 이 프리픽스로 시작하는 user 이벤트는 사용자가 대화로 입력한 것이
+# 아니라 CLI 가 쓴 것이다 — 슬래시 명령 기록과 중단 표식. 실제 transcript 로
+# 확인했으며, 중단 표식은 *list* content 블록으로 나타나므로 아래 list 분기도
+# 같은 필터를 적용해야 한다.
 NOISE_PREFIXES = (
     "<command-name>",
     "<local-command-caveat>",
     "<local-command-stdout>",
+    "[Request interrupted",
 )
 
 # ``message.usage`` keys of an assistant event. The context footprint of
@@ -144,8 +149,11 @@ def _dialogue_text(event: dict) -> tuple[str, str] | None:
     Filters applied / 적용 필터:
     - only ``user`` / ``assistant`` event types
     - ``isMeta`` user events dropped (CLI-injected meta messages)
-    - user list content dropped (``tool_result`` blocks)
-    - user string content dropped when it is a slash-command record
+    - user content: plain string *and* ``text`` blocks of a list both kept
+      (a user turn with an attached image is stored as a block list, and
+      interruption markers arrive as list-of-text) — ``tool_result`` blocks
+      dropped
+    - CLI-written text (``NOISE_PREFIXES``) dropped from either shape
     - assistant: only ``text`` blocks kept (no thinking / tool_use)
     """
     event_type = event.get("type")
@@ -158,23 +166,34 @@ def _dialogue_text(event: dict) -> tuple[str, str] | None:
         return None
     content = message.get("content")
     if event_type == EVENT_TYPE_USER:
-        if not isinstance(content, str):
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            text = _join_text_blocks(content)
+        else:
             return None
-        text = content.strip()
         if not text or text.startswith(NOISE_PREFIXES):
             return None
         return (EVENT_TYPE_USER, text)
     if not isinstance(content, list):
         return None
+    text = _join_text_blocks(content)
+    if not text:
+        return None
+    return (EVENT_TYPE_ASSISTANT, text)
+
+
+def _join_text_blocks(content: list) -> str:
+    """Concatenate the ``text`` blocks of a content list, ignoring the rest.
+
+    content 리스트에서 ``text`` 블록만 이어 붙이고 나머지는 무시.
+    """
     parts = [
         block.get("text", "")
         for block in content
         if isinstance(block, dict) and block.get("type") == BLOCK_TYPE_TEXT
     ]
-    text = "\n".join(p.strip() for p in parts if p and p.strip())
-    if not text:
-        return None
-    return (EVENT_TYPE_ASSISTANT, text)
+    return "\n".join(p.strip() for p in parts if p and p.strip())
 
 
 def extract_dialogue(
@@ -270,7 +289,18 @@ def extract_full_text(jsonl_path: Path, max_chars: int = 30000) -> str:
             },
         )
     full = "\n".join(lines)
-    return full[-max_chars:] if len(full) > max_chars else full
+    if len(full) <= max_chars:
+        return full
+    # Cut at a line boundary so the excerpt never opens mid-sentence with a
+    # half message that has lost its "user:"/"assistant:" prefix. When a
+    # single message is itself longer than the whole budget there is no
+    # boundary to cut at — keep its tail rather than returning nothing.
+    # 줄 경계에서 자른다 — 발췌가 "user:"/"assistant:" 접두사를 잃은 문장
+    # 중간부터 시작하지 않도록. 단, 메시지 하나가 예산보다 길면 자를 경계가
+    # 없으므로 빈 결과 대신 그 꼬리를 남긴다.
+    tail = full[-max_chars:]
+    newline = tail.find("\n")
+    return tail[newline + 1 :] if newline != -1 else tail
 
 
 def read_last_usage(jsonl_path: Path) -> dict[str, Any] | None:

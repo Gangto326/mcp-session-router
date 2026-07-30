@@ -58,6 +58,7 @@ is **never** saved — a stale summary is better than a wrong one.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -110,6 +111,14 @@ SUBPROCESS_TIMEOUT_SECS = 120
 # headless 호출용 중립 cwd — 정크 transcript 가 실제 프로젝트가 아니라 이
 # 디렉토리의 프로젝트 네임스페이스에 쌓이게 한다.
 _NEUTRAL_CWD = Path.home() / ".session-manager" / "headless-tmp"
+
+# Headless isolation (see run_headless_summary docstring for the measured
+# rationale). Shared by every headless call the project makes — the routing
+# judge (R2) must use these too.
+# headless 격리 (실측 근거는 run_headless_summary docstring). 프로젝트의 모든
+# headless 호출이 공유한다 — 라우팅 판정기 (R2) 도 동일하게 적용해야 한다.
+_EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
+_SOCKET_ENV_VAR = "SESSION_MANAGER_SOCKET"
 
 # Summary prompt. Rule text is verbatim from Plan.md R1-C2; the layout
 # (transcript first, instruction after, non-participant notice) follows
@@ -174,13 +183,41 @@ def _queue_dir(project_path: Path) -> Path:
     return Path(project_path) / _SESSION_MANAGER_DIRNAME / QUEUE_DIRNAME
 
 
-def enqueue(project_path: Path, task: SummaryTask) -> Path:
-    """Persist *task* as a new queue file and return its path.
+def enqueue(project_path: Path, task: SummaryTask) -> Path | None:
+    """Persist *task* as a new queue file; return its path, or None if a duplicate.
 
-    *task* 를 새 큐 파일로 영속화하고 경로를 반환.
+    *task* 를 새 큐 파일로 영속화하고 경로를 반환. 중복이면 None.
+
+    Idempotent on (session, conversation, kind): a rapid A→B→A switch would
+    otherwise queue the same work twice and pay for two identical summaries.
+    An already-queued task summarises the transcript as it stands when the
+    worker runs, so it subsumes the later request.
+
+    (세션, conversation, kind) 에 대해 멱등 — A→B→A 처럼 빠르게 오가면 같은
+    작업이 두 번 적재되어 동일 요약 비용을 두 번 낸다. 이미 대기 중인 작업은
+    워커 실행 시점의 transcript 를 요약하므로 나중 요청을 포함한다.
     """
     queue_dir = _queue_dir(project_path)
     queue_dir.mkdir(parents=True, exist_ok=True)
+    for _, pending in load_pending_tasks(project_path):
+        if (
+            pending.session_name == task.session_name
+            and pending.conversation_id == task.conversation_id
+            and pending.kind == task.kind
+        ):
+            debug_log.log(
+                "SUMMARIZER",
+                "WRAPPER",
+                {
+                    "op": "enqueue",
+                    "result": "skipped_duplicate",
+                    "kind": task.kind,
+                    "conversation_id": task.conversation_id,
+                },
+                conv_id=task.conversation_id,
+                session=task.session_name,
+            )
+            return None
     path = queue_dir / f"{uuid.uuid4()}.json"
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(
@@ -284,15 +321,43 @@ def _conversation_jsonl_path(project_path: Path, conversation_id: str) -> Path:
     )
 
 
-def _cleanup_junk_transcript(junk_session_id: str) -> None:
-    """Delete the junk transcript a headless call recorded under the neutral cwd.
+def _sweep_junk_transcripts() -> None:
+    """Delete every junk transcript left under the neutral cwd's project dir.
 
-    headless 호출이 중립 cwd 아래에 남긴 정크 transcript 를 삭제.
+    중립 cwd 프로젝트 디렉토리에 남은 정크 transcript 를 모두 삭제.
+
+    Swept before each headless call rather than after, because the response
+    envelope that carries the junk session id is unavailable on timeout or
+    parse failure — an after-only cleanup leaks transcripts containing the
+    excerpted dialogue. Unlinking a file another process still has open is
+    harmless on POSIX (that process keeps writing through its fd).
+
+    호출 "후" 가 아니라 "전" 에 쓸어낸다 — 정크 session id 를 담은 응답
+    envelope 은 타임아웃·파싱 실패 시 오지 않으므로, 사후 정리만으로는 발췌
+    대화가 담긴 transcript 가 남는다. 다른 프로세스가 열어 둔 파일을 unlink
+    해도 POSIX 에서는 무해하다 (그 프로세스는 fd 로 계속 쓴다).
     """
     junk_dir = Path.home() / ".claude" / "projects" / encode_cwd(_NEUTRAL_CWD)
-    junk_file = junk_dir / f"{junk_session_id}.jsonl"
-    junk_file.unlink(missing_ok=True)
-    shutil.rmtree(junk_dir / junk_session_id, ignore_errors=True)
+    if not junk_dir.is_dir():
+        return
+    removed = 0
+    for entry in junk_dir.iterdir():
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            # Cleanup must never break summarisation.
+            # 정리 실패가 요약을 깨뜨리지 않도록 한다.
+            continue
+    if removed:
+        debug_log.log(
+            "SUMMARIZER",
+            "WRAPPER",
+            {"op": "sweep_junk", "removed": removed, "dir": str(junk_dir)},
+        )
 
 
 def run_headless_summary(prompt: str) -> str | None:
@@ -300,13 +365,37 @@ def run_headless_summary(prompt: str) -> str | None:
 
     ``claude -p`` 를 1회 실행하고 응답의 ``result`` 텍스트를 반환. 실패 시 None.
 
-    Runs from the neutral cwd and deletes the junk transcript the call
-    leaves behind. Any subprocess/JSON failure returns None (logged).
+    Isolation applied to every headless call (measured, see below):
 
-    중립 cwd 에서 실행하고 호출이 남긴 정크 transcript 를 삭제한다.
+    - **No MCP servers.** ``claude -p`` otherwise loads user-scope MCP
+      servers regardless of cwd — including session-manager itself, whose
+      server would then connect back to the wrapper socket and whose tools
+      the summariser model could call. Measured cost of that load: 30,021
+      vs 6,750 input tokens for the same one-line prompt (~23K wasted per
+      call). ``--strict-mcp-config`` with an empty config disables it.
+    - **Socket env stripped**, so a stray MCP server spawned by any other
+      means cannot reach the wrapper's socket.
+    - **Prompt on stdin**, never argv — argv is world-readable via ``ps``
+      and the prompt carries the excerpted conversation.
+
+    모든 headless 호출에 적용하는 격리 (실측 근거 포함):
+
+    - **MCP 서버 무로드.** 그렇지 않으면 cwd 와 무관하게 user scope MCP 서버가
+      로드된다 — session-manager 자신도 포함되어, 그 서버가 래퍼 소켓에 다시
+      접속하고 요약 모델이 세션 도구를 호출할 수 있게 된다. 실측 비용: 같은 한 줄
+      프롬프트에서 입력 토큰 30,021 vs 6,750 (호출당 약 23K 낭비).
+    - **소켓 환경 변수 제거** — 다른 경로로 MCP 서버가 떠도 래퍼 소켓에 닿지 못한다.
+    - **프롬프트는 stdin** (argv 금지) — argv 는 ``ps`` 로 누구나 읽을 수 있는데
+      프롬프트에는 발췌한 대화가 들어 있다.
+
+    Any subprocess/JSON failure returns None (logged).
     subprocess/JSON 실패는 전부 None 반환 (로그 기록).
     """
     _NEUTRAL_CWD.mkdir(parents=True, exist_ok=True)
+    # Sweep before the call — see _sweep_junk_transcripts for why not after.
+    # 호출 전에 쓸어낸다 — 사후가 아닌 이유는 _sweep_junk_transcripts 참조.
+    _sweep_junk_transcripts()
+    env = {k: v for k, v in os.environ.items() if k != _SOCKET_ENV_VAR}
     try:
         proc = subprocess.run(
             [
@@ -316,9 +405,13 @@ def run_headless_summary(prompt: str) -> str | None:
                 SUMMARY_MODEL,
                 "--output-format",
                 "json",
-                prompt,
+                "--strict-mcp-config",
+                "--mcp-config",
+                _EMPTY_MCP_CONFIG,
             ],
+            input=prompt,
             cwd=_NEUTRAL_CWD,
+            env=env,
             capture_output=True,
             text=True,
             timeout=SUBPROCESS_TIMEOUT_SECS,
@@ -349,8 +442,6 @@ def run_headless_summary(prompt: str) -> str | None:
             },
         )
         return None
-    if isinstance(envelope, dict) and envelope.get("session_id"):
-        _cleanup_junk_transcript(str(envelope["session_id"]))
     if not isinstance(envelope, dict) or envelope.get("is_error"):
         debug_log.log(
             "SUMMARIZER",
