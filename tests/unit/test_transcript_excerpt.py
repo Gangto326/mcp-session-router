@@ -280,3 +280,79 @@ class TestReadLastUsage:
         path = tmp_path / "empty.jsonl"
         path.write_text("", encoding="utf-8")
         assert te.read_last_usage(path) is None
+
+
+class TestScanDialogueGrowth:
+    """Incremental dialogue measurement for the periodic refresh trigger.
+
+    주기 갱신 트리거용 증분 대화 측정.
+    """
+
+    def test_counts_dialogue_only(self, normal_jsonl: Path) -> None:
+        _, total = te.scan_dialogue_growth(normal_jsonl)
+        # Same filter as the excerpt: tool results, thinking, meta events
+        # and slash-command records don't count.
+        # 발췌와 같은 필터 — 도구 결과·thinking·메타·슬래시 명령 기록은 세지 않는다.
+        expected = sum(
+            len(line.partition(": ")[2])
+            for line in te.extract_full_text(normal_jsonl).splitlines()
+        )
+        assert total == expected
+
+    def test_matches_full_scan(self, normal_jsonl: Path) -> None:
+        assert te.dialogue_length(normal_jsonl) == te.scan_dialogue_growth(
+            normal_jsonl
+        )[1]
+
+    def test_resumes_from_offset(self, tmp_path: Path) -> None:
+        path = _write_jsonl(tmp_path / "g.jsonl", [_user("첫 질문")])
+        offset, total = te.scan_dialogue_growth(path)
+        assert total == len("첫 질문")
+
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(_user("두 번째 질문"), ensure_ascii=False) + "\n")
+        new_offset, new_total = te.scan_dialogue_growth(path, offset, total)
+        assert new_offset > offset
+        assert new_total == len("첫 질문") + len("두 번째 질문")
+
+    def test_incremental_equals_full_rescan(self, tmp_path: Path) -> None:
+        path = _write_jsonl(tmp_path / "eq.jsonl", [_user("하나")])
+        offset, total = te.scan_dialogue_growth(path)
+        for text in ("둘", "셋", "넷"):
+            with path.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(_user(text), ensure_ascii=False) + "\n")
+            offset, total = te.scan_dialogue_growth(path, offset, total)
+        assert total == te.dialogue_length(path)
+
+    def test_partial_last_line_not_consumed(self, tmp_path: Path) -> None:
+        """A half-written line is re-read next time, not parsed as garbage.
+
+        쓰다 만 줄은 쓰레기로 파싱되지 않고 다음 호출에서 다시 읽힌다.
+        """
+        path = _write_jsonl(tmp_path / "p.jsonl", [_user("완결된 줄")])
+        offset, total = te.scan_dialogue_growth(path)
+        partial = json.dumps(_user("아직 쓰는 중"), ensure_ascii=False)
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(partial[: len(partial) // 2])
+        mid_offset, mid_total = te.scan_dialogue_growth(path, offset, total)
+        assert (mid_offset, mid_total) == (offset, total)
+
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(partial[len(partial) // 2 :] + "\n")
+        _, final_total = te.scan_dialogue_growth(path, mid_offset, mid_total)
+        assert final_total == len("완결된 줄") + len("아직 쓰는 중")
+
+    def test_shrunk_file_resets_scan(self, tmp_path: Path) -> None:
+        """A replaced transcript must not keep a stale offset.
+
+        교체된 transcript 가 낡은 offset 을 물고 있으면 안 된다.
+        """
+        path = _write_jsonl(tmp_path / "s.jsonl", [_user("긴 대화" * 50)])
+        offset, total = te.scan_dialogue_growth(path)
+        _write_jsonl(tmp_path / "s.jsonl", [_user("새 대화")])
+        new_offset, new_total = te.scan_dialogue_growth(path, offset, total)
+        assert new_total == len("새 대화")
+        assert new_offset < offset
+
+    def test_missing_file_resets(self, tmp_path: Path) -> None:
+        assert te.scan_dialogue_growth(tmp_path / "nope.jsonl", 100, 500) == (0, 0)

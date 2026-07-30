@@ -7,6 +7,7 @@ PTY 래퍼의 내부 로직 단위 테스트. PTY 의존 메서드는 monkeypatc
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ import pytest
 from session_manager import summarizer
 from session_manager.models import SessionMetadata
 from session_manager.storage.file_store import SessionStore
+from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS
 from session_manager.wrapper.pty_wrapper import (
     AUTO_CONFIRM_PATTERNS,
     CLEAR_COMMAND_RE,
@@ -1253,3 +1255,141 @@ class TestSummaryTriggers:
             lambda _p: (_ for _ in ()).throw(OSError("disk gone")),
         )
         wrapper._enqueue_stale_summaries()  # must not raise / 예외 없이 통과
+
+
+class TestPeriodicSummaryRefresh:
+    """Growth-based refresh: re-summarise once new dialogue exceeds the window.
+
+    증가량 기반 갱신 — 새 대화가 발췌 창을 넘으면 재요약한다.
+    """
+
+    @pytest.fixture
+    def transcript(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
+        """Point the wrapper at a controllable transcript for "conv-1".
+
+        래퍼가 "conv-1" 에 대해 제어 가능한 transcript 를 보도록 한다.
+        """
+        # A per-test fake HOME inside the project dir, so transcripts from
+        # one test can't leak into another.
+        # 프로젝트 디렉토리 안의 테스트 전용 가짜 HOME — 한 테스트의
+        # transcript 가 다른 테스트로 새지 않게 한다.
+        fake_home = Path(wrapper.project_path) / "home"
+        target = fake_home / ".claude" / "projects" / "enc"
+        target.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.get_active_conversation_id",
+            lambda _cwd: "conv-1",
+        )
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.encode_cwd", lambda _p: "enc"
+        )
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.Path.home",
+            classmethod(lambda _cls: fake_home),
+        )
+        return target / "conv-1.jsonl"
+
+    def _append_dialogue(self, path: Path, chars: int) -> None:
+        event = {"type": "user", "message": {"content": "가" * chars}}
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _session(self, wrapper: SessionManagerWrapper, **kwargs: object) -> None:
+        store = SessionStore(Path(wrapper.project_path))
+        store.init_project()
+        session = SessionMetadata.new(name="work", title="작업")
+        for key, value in kwargs.items():
+            setattr(session, key, value)
+        store.save_session(session)
+        wrapper._current_session_name = "work"
+
+    def _pending(self, wrapper: SessionManagerWrapper) -> list:
+        return [
+            task
+            for _, task in summarizer.load_pending_tasks(Path(wrapper.project_path))
+        ]
+
+    def test_no_refresh_below_threshold(
+        self, wrapper: SessionManagerWrapper, transcript: Path
+    ) -> None:
+        self._session(wrapper)
+        self._append_dialogue(transcript, EXCERPT_MAX_CHARS - 1)
+        wrapper._check_summary_refresh()
+        assert self._pending(wrapper) == []
+
+    def test_refresh_at_threshold(
+        self, wrapper: SessionManagerWrapper, transcript: Path
+    ) -> None:
+        self._session(wrapper)
+        self._append_dialogue(transcript, EXCERPT_MAX_CHARS)
+        wrapper._check_summary_refresh()
+        tasks = self._pending(wrapper)
+        assert len(tasks) == 1
+        assert tasks[0].kind == summarizer.KIND_ACTIVE
+        assert tasks[0].session_name == "work"
+
+    def test_growth_measured_against_recorded_baseline(
+        self, wrapper: SessionManagerWrapper, transcript: Path
+    ) -> None:
+        """Only dialogue the last summary didn't see counts.
+
+        마지막 요약이 보지 못한 대화만 센다.
+        """
+        self._append_dialogue(transcript, EXCERPT_MAX_CHARS)
+        self._session(
+            wrapper,
+            summary_dialogue_chars=EXCERPT_MAX_CHARS,
+            summary_dialogue_conversation_id="conv-1",
+        )
+        wrapper._check_summary_refresh()
+        assert self._pending(wrapper) == []
+
+        self._append_dialogue(transcript, EXCERPT_MAX_CHARS)
+        wrapper._check_summary_refresh()
+        assert len(self._pending(wrapper)) == 1
+
+    def test_baseline_from_other_conversation_ignored(
+        self, wrapper: SessionManagerWrapper, transcript: Path
+    ) -> None:
+        """A baseline measured elsewhere must not silence the trigger.
+
+        다른 conversation 에서 측정한 기준값이 트리거를 침묵시키면 안 된다
+        (롤오버 후 증가량이 음수가 되는 버그 방지).
+        """
+        self._append_dialogue(transcript, EXCERPT_MAX_CHARS)
+        self._session(
+            wrapper,
+            summary_dialogue_chars=999_999,
+            summary_dialogue_conversation_id="conv-OLD",
+        )
+        wrapper._check_summary_refresh()
+        assert len(self._pending(wrapper)) == 1
+
+    def test_incremental_scan_advances(
+        self, wrapper: SessionManagerWrapper, transcript: Path
+    ) -> None:
+        """Each turn parses only what was appended since the last one.
+
+        매 턴은 직전 이후 append 된 부분만 파싱한다.
+        """
+        self._session(wrapper)
+        self._append_dialogue(transcript, 100)
+        wrapper._check_summary_refresh()
+        first_offset = wrapper._dialogue_scan_offset
+        assert wrapper._dialogue_scan_chars == 100
+
+        self._append_dialogue(transcript, 100)
+        wrapper._check_summary_refresh()
+        assert wrapper._dialogue_scan_offset > first_offset
+        assert wrapper._dialogue_scan_chars == 200
+
+    def test_skipped_without_current_session(
+        self, wrapper: SessionManagerWrapper, transcript: Path
+    ) -> None:
+        self._session(wrapper)
+        wrapper._current_session_name = None
+        self._append_dialogue(transcript, EXCERPT_MAX_CHARS)
+        wrapper._check_summary_refresh()
+        assert self._pending(wrapper) == []
