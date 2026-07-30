@@ -25,6 +25,7 @@ MCP 소켓 통합, stdin 슬래시 커맨드 가로채기 같은 상위 로직�
 from __future__ import annotations
 
 import os
+import re
 import select
 import signal
 import sys
@@ -37,7 +38,10 @@ from typing import Any, Literal
 
 import pexpect
 
-from session_manager import debug_log
+from session_manager import debug_log, summarizer
+from session_manager.claude_conversation import get_active_conversation_id
+from session_manager.storage.file_store import SessionStore
+from session_manager.summarizer import SummarizerWorker, SummaryTask
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
     match_intercept_command,
@@ -102,6 +106,13 @@ AGENT_GUIDE_PATH = (Path(__file__).parent.parent / "AGENT_GUIDE.md").resolve()
 # raw mode stdin에서 Ctrl+C — tty.setraw가 ISIG를 끄므로 SIGINT 대신
 # \x03 바이트로 옴.
 CTRL_C = b"\x03"
+
+# /clear observation (not interception): the conversation content is about
+# to be wiped, so this is the last chance to summarise the active session.
+# The command itself is forwarded untouched.
+# /clear 관찰 (가로채기 아님) — 대화 내용이 곧 지워지므로 활성 세션을
+# 요약할 마지막 기회다. 명령 자체는 손대지 않고 그대로 통과시킨다.
+CLEAR_COMMAND_RE = re.compile(r"^/clear(\s|$)")
 
 Mode = Literal["passthrough", "filtering"]
 
@@ -257,6 +268,22 @@ class SessionManagerWrapper:
             self.claude_args
         )
 
+        # Wrapper-side mirror of the current session name, used by triggers
+        # that fire without MCP involvement (e.g. /clear observation).
+        # Updated on SWITCH/NEW signals. May be None (unregistered fresh
+        # start) — triggers then skip with a log; the boot-time recovery
+        # and R2's hook architecture cover that gap.
+        # 현재 세션 이름의 래퍼 측 미러 — MCP 를 거치지 않는 트리거 (/clear
+        # 관찰 등) 가 사용한다. SWITCH/NEW 신호에서 갱신. 미등록 신규
+        # 시작이면 None 일 수 있고, 그 경우 트리거는 로그만 남기고 skip —
+        # 이 빈틈은 부팅 시 복구와 R2 hook 구조가 메운다.
+        self._current_session_name: str | None = self._initial_session_name
+
+        # Background summarizer worker (R1). Lives for the wrapper's whole
+        # lifetime; drains the file queue that the triggers below fill.
+        # 백그라운드 요약기 워커 (R1). 래퍼 전체 lifetime 동안 유지되며,
+        # 아래 트리거들이 채우는 파일 큐를 비운다.
+        self.summarizer_worker = SummarizerWorker(Path(self.project_path))
 
     def start(self) -> None:
         """
@@ -274,6 +301,13 @@ class SessionManagerWrapper:
         self._enter_raw_mode()
         self._install_winch_handler()
 
+        # Recover summaries lost to forced exits before the worker starts,
+        # so the first queue pass already sees them.
+        # 강제 종료로 누락된 요약을 워커 시작 전에 큐에 복구 — 첫 큐 pass
+        # 가 바로 집어가도록.
+        self._enqueue_stale_summaries()
+        self.summarizer_worker.start()
+
         try:
             self._spawn_child()
             self._sync_winsize()
@@ -284,6 +318,7 @@ class SessionManagerWrapper:
                 self._io_loop()
         finally:
             self._restore_terminal()
+            self.summarizer_worker.stop()
             self.socket_server.stop()
 
     def _spawn_child(self) -> None:
@@ -580,6 +615,13 @@ class SessionManagerWrapper:
             if matched is not None:
                 self._start_intercept(matched)
                 return
+            # /clear observation: the conversation is about to be wiped —
+            # queue a summary of the current session, then let the command
+            # through untouched (observation, not interception).
+            # /clear 관찰 — 대화가 곧 지워지므로 현재 세션 요약을 큐에 넣고,
+            # 명령은 그대로 통과시킨다 (가로채기가 아니라 관찰).
+            if prompt_text and CLEAR_COMMAND_RE.match(prompt_text.strip()):
+                self._enqueue_active_summary()
 
         self.stdin_line_buffer += chunk
         while b"\n" in self.stdin_line_buffer:
@@ -705,6 +747,137 @@ class SessionManagerWrapper:
             os.write(self.pty_fd, b"\r")
         except OSError:
             pass
+
+    # ------------------------------------------------------- Summary triggers
+    # 요약 트리거 ---------------------------------------------------------------
+
+    def _enqueue_departed_summary(self, session_name: object) -> None:
+        """Queue a background summary for the session being left.
+
+        떠나는 세션의 백그라운드 요약을 큐에 넣는다.
+
+        Called on SWITCH/NEW signal receipt, while the active conversation
+        is still the departing one. Skips (with a log) when the session
+        name or the active conversation cannot be determined — the boot
+        recovery pass covers those later.
+
+        SWITCH/NEW 신호 수신 시점에 호출 — 이때 활성 conversation 은 아직
+        떠나는 쪽이다. 세션 이름이나 활성 conversation 을 알 수 없으면
+        로그만 남기고 skip — 부팅 복구 pass 가 나중에 메운다.
+        """
+        if not isinstance(session_name, str) or not session_name:
+            debug_log.log(
+                "SUMMARY_TRIGGER",
+                "WRAPPER",
+                {"trigger": "departed", "skipped": "no_session_name"},
+            )
+            return
+        conv_id = get_active_conversation_id(Path(self.project_path))
+        if conv_id is None:
+            debug_log.log(
+                "SUMMARY_TRIGGER",
+                "WRAPPER",
+                {"trigger": "departed", "skipped": "no_active_conversation"},
+                session=session_name,
+            )
+            return
+        summarizer.enqueue(
+            Path(self.project_path),
+            SummaryTask(
+                session_name=session_name,
+                conversation_id=conv_id,
+                kind=summarizer.KIND_DEPARTED,
+            ),
+        )
+        self.summarizer_worker.wake()
+
+    def _enqueue_active_summary(self) -> None:
+        """Queue a background summary for the current session (e.g. on /clear).
+
+        현재 세션의 백그라운드 요약을 큐에 넣는다 (/clear 관찰 등).
+        """
+        session_name = self._current_session_name
+        if session_name is None:
+            debug_log.log(
+                "SUMMARY_TRIGGER",
+                "WRAPPER",
+                {"trigger": "active", "skipped": "unknown_current_session"},
+            )
+            return
+        conv_id = get_active_conversation_id(Path(self.project_path))
+        if conv_id is None:
+            debug_log.log(
+                "SUMMARY_TRIGGER",
+                "WRAPPER",
+                {"trigger": "active", "skipped": "no_active_conversation"},
+                session=session_name,
+            )
+            return
+        summarizer.enqueue(
+            Path(self.project_path),
+            SummaryTask(
+                session_name=session_name,
+                conversation_id=conv_id,
+                kind=summarizer.KIND_ACTIVE,
+            ),
+        )
+        self.summarizer_worker.wake()
+
+    def _enqueue_stale_summaries(self) -> None:
+        """Boot-time recovery: queue sessions whose summary refresh was lost.
+
+        부팅 시 복구 — 요약 갱신이 유실된 세션들을 큐에 넣는다.
+
+        A session is stale when it was accessed after its summary was last
+        refreshed (or never refreshed at all). Sessions already waiting in
+        the queue (from a crashed previous run) are not double-queued.
+        Never raises — a recovery failure must not block wrapper startup.
+
+        summary 갱신 시각보다 나중에 접근된 (또는 한 번도 갱신 안 된)
+        세션이 stale. 이전 실행이 크래시로 남긴 대기 작업과는 중복 적재
+        하지 않는다. 복구 실패가 래퍼 시작을 막지 않도록 예외를 내지 않는다.
+        """
+        try:
+            project = Path(self.project_path)
+            pending_names = {
+                task.session_name
+                for _, task in summarizer.load_pending_tasks(project)
+            }
+            queued = 0
+            for session in SessionStore(project).list_sessions():
+                if session.name in pending_names:
+                    continue
+                if not session.claude_conversation_ids:
+                    continue
+                # ISO-8601 UTC strings from the same generator — lexicographic
+                # comparison is chronologically correct.
+                # 같은 생성기가 만든 ISO-8601 UTC 문자열 — 사전순 비교가 곧
+                # 시간순 비교다.
+                if (
+                    session.summary_updated_at is not None
+                    and session.summary_updated_at >= session.last_accessed
+                ):
+                    continue
+                summarizer.enqueue(
+                    project,
+                    SummaryTask(
+                        session_name=session.name,
+                        conversation_id=session.claude_conversation_ids[-1],
+                        kind=summarizer.KIND_DEPARTED,
+                    ),
+                )
+                queued += 1
+            debug_log.log(
+                "SUMMARY_TRIGGER",
+                "WRAPPER",
+                {"trigger": "boot_recovery", "queued": queued},
+            )
+        except Exception as exc:
+            debug_log.log(
+                "SUMMARY_TRIGGER",
+                "WRAPPER",
+                {"trigger": "boot_recovery", "error": str(exc)},
+            )
 
     # --------------------------------------------------- Detection & injection
     # 프롬프트 감지 / 텍스트 주입 -----------------------------------------------
@@ -999,6 +1172,14 @@ class SessionManagerWrapper:
         SWITCH 액션을 등록한다. 실제 진행은 이후 프롬프트 감지 이벤트마다
         단계적으로 일어난다.
         """
+        # Queue a background summary for the departing session while its
+        # conversation is still the active one, and move the wrapper-side
+        # current-session mirror to the target.
+        # 떠나는 세션의 conversation 이 아직 활성인 시점에 백그라운드 요약을
+        # 큐에 넣고, 래퍼 측 현재 세션 미러를 target 으로 이동.
+        self._enqueue_departed_summary(handoff.get("from"))
+        self._current_session_name = target
+
         # Strip user_prompt from the JSON body so it isn't shown twice
         # (once inside [handoff], once as the prompt text below).
         # JSON 본문에서 user_prompt를 제거 — [handoff] 블록과 그 아래 본문에
@@ -1086,6 +1267,11 @@ class SessionManagerWrapper:
         NEW 액션을 등록한다. 실제 진행은 이후 프롬프트 감지 이벤트마다
         단계적으로 일어난다.
         """
+        # Same departing-session summary + mirror handling as SWITCH.
+        # SWITCH 와 동일한 떠나는 세션 요약 큐 적재 + 미러 갱신.
+        self._enqueue_departed_summary(handoff.get("from"))
+        self._current_session_name = new_session_name
+
         # Same JSON-vs-text de-duplication as SWITCH: keep user_prompt out
         # of the JSON body since it appears as plain text below.
         # SWITCH와 동일하게 JSON 본문에서는 user_prompt 제거 — 아래쪽
