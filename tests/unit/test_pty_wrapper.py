@@ -12,8 +12,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from session_manager import summarizer
+from session_manager.models import SessionMetadata
+from session_manager.storage.file_store import SessionStore
 from session_manager.wrapper.pty_wrapper import (
     AUTO_CONFIRM_PATTERNS,
+    CLEAR_COMMAND_RE,
     CTRL_C,
     INTERCEPT_TIMEOUT_SEC,
     INVERSE_VIDEO_START,
@@ -1002,3 +1006,192 @@ class TestAutoAcceptConfirmations:
         assert wrapper._handled_confirmations == set()
 
 
+
+
+class TestSummaryTriggers:
+    """Background-summary queueing on switch/new signals, /clear, and boot.
+
+    SWITCH/NEW 신호·/clear·부팅 시의 백그라운드 요약 큐 적재.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fixed_conversation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin the active conversation id resolver to a known value.
+
+        활성 conversation id 조회를 고정값으로 고정.
+        """
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.get_active_conversation_id",
+            lambda _cwd: "conv-active",
+        )
+
+    def _pending(self, wrapper: SessionManagerWrapper) -> list:
+        return [
+            task
+            for _, task in summarizer.load_pending_tasks(Path(wrapper.project_path))
+        ]
+
+    def test_switch_signal_enqueues_departed(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._handle_mcp_signal(
+            {
+                "action": "switch",
+                "target": "backend",
+                "handoff": {"from": "frontend", "message": "요약"},
+            }
+        )
+        tasks = self._pending(wrapper)
+        assert len(tasks) == 1
+        assert tasks[0].session_name == "frontend"
+        assert tasks[0].conversation_id == "conv-active"
+        assert tasks[0].kind == summarizer.KIND_DEPARTED
+        assert wrapper._current_session_name == "backend"
+        # The worker gets nudged so the task is picked up promptly.
+        # 워커가 깨워져 작업을 곧바로 집어가게 된다.
+        assert wrapper.summarizer_worker._wakeup.is_set()
+
+    def test_new_signal_enqueues_departed(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._handle_mcp_signal(
+            {
+                "action": "new",
+                "rename_current": "frontend",
+                "new_session_name": "payments",
+                "handoff": {"from": "frontend", "message": "요약"},
+            }
+        )
+        tasks = self._pending(wrapper)
+        assert len(tasks) == 1
+        assert tasks[0].session_name == "frontend"
+        assert tasks[0].kind == summarizer.KIND_DEPARTED
+        assert wrapper._current_session_name == "payments"
+
+    def test_departed_skipped_without_from_session(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        # A fresh unregistered start has handoff.from == None.
+        # 미등록 신규 시작은 handoff.from 이 None.
+        wrapper._handle_mcp_signal(
+            {"action": "switch", "target": "backend", "handoff": {"from": None}}
+        )
+        assert self._pending(wrapper) == []
+
+    def test_departed_skipped_without_active_conversation(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.get_active_conversation_id",
+            lambda _cwd: None,
+        )
+        wrapper._enqueue_departed_summary("frontend")
+        assert self._pending(wrapper) == []
+
+    def test_clear_submit_enqueues_active_and_forwards(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapper._current_session_name = "frontend"
+        wrapper.virtual_screen.feed("❯ /clear".encode())
+        writes: list[bytes] = []
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+
+        wrapper._handle_stdin_readable()
+
+        tasks = self._pending(wrapper)
+        assert len(tasks) == 1
+        assert tasks[0].session_name == "frontend"
+        assert tasks[0].kind == summarizer.KIND_ACTIVE
+        # Observation, not interception: the \r is forwarded untouched.
+        # 가로채기가 아닌 관찰 — \r 은 그대로 forward 된다.
+        assert writes == [b"\r"]
+        assert wrapper._intercept_state is None
+
+    def test_clear_with_unknown_session_skips_but_forwards(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapper._current_session_name = None
+        wrapper.virtual_screen.feed("❯ /clear".encode())
+        writes: list[bytes] = []
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+
+        wrapper._handle_stdin_readable()
+
+        assert self._pending(wrapper) == []
+        assert writes == [b"\r"]
+
+    def test_clear_regex_requires_exact_command(self) -> None:
+        assert CLEAR_COMMAND_RE.match("/clear")
+        assert CLEAR_COMMAND_RE.match("/clear  ")
+        assert not CLEAR_COMMAND_RE.match("/clearall")
+        assert not CLEAR_COMMAND_RE.match("say /clear")
+
+    def test_boot_recovery_enqueues_only_stale_sessions(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        project = Path(wrapper.project_path)
+        store = SessionStore(project)
+        store.init_project()
+
+        stale = SessionMetadata.new(name="stale", title="요약 유실")
+        stale.claude_conversation_ids = ["conv-stale"]
+        stale.summary_updated_at = "2026-07-29T00:00:00+00:00"
+        stale.last_accessed = "2026-07-30T00:00:00+00:00"
+        store.save_session(stale)
+
+        never = SessionMetadata.new(name="never", title="요약 없음")
+        never.claude_conversation_ids = ["conv-never"]
+        store.save_session(never)
+
+        fresh = SessionMetadata.new(name="fresh", title="요약 최신")
+        fresh.claude_conversation_ids = ["conv-fresh"]
+        fresh.last_accessed = "2026-07-29T00:00:00+00:00"
+        fresh.summary_updated_at = "2026-07-30T00:00:00+00:00"
+        store.save_session(fresh)
+
+        no_conv = SessionMetadata.new(name="no-conv", title="대화 없음")
+        store.save_session(no_conv)
+
+        wrapper._enqueue_stale_summaries()
+
+        names = sorted(t.session_name for t in self._pending(wrapper))
+        assert names == ["never", "stale"]
+        # The stale session's latest conversation is the summarised one.
+        # stale 세션의 가장 최근 conversation 이 요약 대상이 된다.
+        by_name = {t.session_name: t for t in self._pending(wrapper)}
+        assert by_name["stale"].conversation_id == "conv-stale"
+        assert by_name["stale"].kind == summarizer.KIND_DEPARTED
+
+    def test_boot_recovery_does_not_double_queue(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        project = Path(wrapper.project_path)
+        store = SessionStore(project)
+        store.init_project()
+        stale = SessionMetadata.new(name="stale", title="요약 유실")
+        stale.claude_conversation_ids = ["conv-stale"]
+        store.save_session(stale)
+
+        wrapper._enqueue_stale_summaries()
+        wrapper._enqueue_stale_summaries()
+
+        assert len(self._pending(wrapper)) == 1
+
+    def test_boot_recovery_survives_store_errors(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.SessionStore",
+            lambda _p: (_ for _ in ()).throw(OSError("disk gone")),
+        )
+        wrapper._enqueue_stale_summaries()  # must not raise / 예외 없이 통과
