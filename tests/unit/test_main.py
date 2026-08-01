@@ -6,7 +6,11 @@ ccode 진입점 단위 테스트.
 
 from __future__ import annotations
 
-from session_manager.wrapper.main import _ensure_channels_flag, _resolve_socket_path
+import sys
+
+import pytest
+
+from session_manager.wrapper.main import _resolve_socket_path, main
 
 
 class TestResolveSocketPath:
@@ -38,53 +42,47 @@ class TestResolveSocketPath:
         assert len(hash_part) == 12
 
 
-class TestEnsureChannelsFlag:
-    """_ensure_channels_flag prepends the dev flag when the user hasn't set one.
-    사용자가 channels 플래그를 직접 주지 않았으면 dev 플래그를 앞에 추가한다.
+class TestClaudeArgsPassthrough:
+    """ccode passes the user's arguments through untouched.
+
+    ccode 는 사용자 인자를 손대지 않고 그대로 전달한다.
+
+    The wrapper used to prepend an experimental-channels development flag,
+    which forced a confirmation prompt on every start and shut out API-key
+    users. Nothing depends on channels any more.
+    예전에는 experimental channels 개발 플래그를 앞에 붙여 매 시작마다 확인
+    창이 떴고 API key 사용자는 쓸 수 없었다. 이제 channels 의존은 없다.
     """
 
-    def test_empty_args_gets_dev_flag(self) -> None:
-        assert _ensure_channels_flag([]) == [
-            "--dangerously-load-development-channels",
-            "server:session-manager",
-        ]
+    def _run_main(self, argv: list[str], monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        captured: dict[str, list[str]] = {}
 
-    def test_user_args_preserved_after_dev_flag(self) -> None:
-        result = _ensure_channels_flag(["--resume", "foo"])
-        assert result == [
-            "--dangerously-load-development-channels",
-            "server:session-manager",
+        class _FakeWrapper:
+            def __init__(self, **kwargs: object) -> None:
+                captured["args"] = list(kwargs["claude_args"])  # type: ignore[arg-type]
+
+            def start(self) -> None:
+                return None
+
+        monkeypatch.setattr(
+            "session_manager.wrapper.main.SessionManagerWrapper", _FakeWrapper
+        )
+        monkeypatch.setattr(sys, "argv", ["ccode", *argv])
+        main()
+        return captured["args"]
+
+    def test_no_args(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._run_main([], monkeypatch) == []
+
+    def test_user_args_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._run_main(["--resume", "foo"], monkeypatch) == [
             "--resume",
             "foo",
         ]
 
-    def test_user_dev_flag_preserved_as_is(self) -> None:
-        """If the user already passed the dev flag, leave args alone.
-        사용자가 이미 dev 플래그를 줬으면 그대로 둔다.
-        """
-        args = ["--dangerously-load-development-channels", "server:custom"]
-        assert _ensure_channels_flag(args) == args
+    def test_no_channels_flag_injected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        args = self._run_main(["--model", "opus"], monkeypatch)
+        assert not any("channel" in a for a in args)
 
-    def test_user_dev_flag_with_equals_preserved(self) -> None:
-        args = ["--dangerously-load-development-channels=server:custom"]
-        assert _ensure_channels_flag(args) == args
-
-    def test_user_channels_flag_preserved(self) -> None:
-        """``--channels`` (production allowlist) is also a user opt-in.
-        ``--channels``도 사용자 의사로 간주.
-        """
-        args = ["--channels", "plugin:foo@bar"]
-        assert _ensure_channels_flag(args) == args
-
-    def test_user_channels_with_equals_preserved(self) -> None:
-        args = ["--channels=plugin:foo@bar"]
-        assert _ensure_channels_flag(args) == args
-
-    def test_input_list_not_mutated(self) -> None:
-        """Returned list is a new list (defensive copy).
-        반환 리스트는 새 리스트 (방어적 복사).
-        """
-        original = ["--resume", "x"]
-        result = _ensure_channels_flag(original)
-        assert result is not original
-        assert original == ["--resume", "x"]

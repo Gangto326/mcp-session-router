@@ -722,20 +722,20 @@ class TestSessionCommandObservation:
 
 
 class TestAutoAcceptConfirmations:
-    """Auto-accept of channels dev warning + MCP server registration prompts.
-    channels dev 경고 + MCP server 등록 prompt 자동 승인.
+    """Auto-accept of the MCP server registration prompts.
+    MCP server 등록 prompt 자동 승인.
     """
 
-    def test_injects_cr_when_channels_dev_warning_visible(
+    def test_injects_cr_when_registration_prompt_visible(
         self,
         wrapper: SessionManagerWrapper,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Channels dev warning text on screen → \\r injected once.
-        가상 화면에 channels dev 경고 텍스트가 있으면 \\r 1회 주입.
+        """Registration prompt on screen → \\r injected once.
+        가상 화면에 등록 prompt 텍스트가 있으면 \\r 1회 주입.
         """
         wrapper.virtual_screen.feed(
-            b"Some preamble\r\n  I am using this for local development\r\n  Exit"
+            b"Some preamble\r\n  Use this and all future MCP servers\r\n  Exit"
         )
         wrapper.pty_fd = 1
         writes: list[bytes] = []
@@ -746,7 +746,7 @@ class TestAutoAcceptConfirmations:
         wrapper._auto_accept_confirmations()
 
         assert b"\r" in writes
-        assert "I am using this for local development" in wrapper._handled_confirmations
+        assert "Use this and all future MCP servers" in wrapper._handled_confirmations
 
     def test_each_pattern_handled_at_most_once(
         self,
@@ -757,7 +757,7 @@ class TestAutoAcceptConfirmations:
         같은 화면으로 두 번 호출해도 \\r은 한 번만.
         """
         wrapper.virtual_screen.feed(
-            b"  I am using this for local development\r\n"
+            b"  Use this and all future MCP servers\r\n"
         )
         wrapper.pty_fd = 1
         writes: list[bytes] = []
@@ -811,19 +811,18 @@ class TestAutoAcceptConfirmations:
         wrapper._auto_accept_confirmations()
         assert writes.count(b"\r") == 1
 
-        # 같은 자식, 두 번째 화면: channels dev 경고
-        wrapper.virtual_screen.feed(
-            b"  I am using this for local development\r\n"
-        )
+        # 같은 자식, 두 번째 화면: 다른 등록 prompt 변형
+        wrapper.virtual_screen.feed(b"  Use this MCP server only\r\n")
         wrapper._auto_accept_confirmations()
         assert writes.count(b"\r") == 2
 
     def test_known_patterns_set(self) -> None:
-        """The constant lists exactly the three confirmation prompts we expect.
-        상수에 우리가 처리하는 confirmation prompt 3개가 정확히 들어있는지.
+        """Only the MCP registration prompts are auto-accepted.
+
+        MCP 등록 prompt 만 자동 승인 대상이다 — channels 개발 플래그를 더
+        이상 붙이지 않으므로 그 경고 화면은 아예 뜨지 않는다.
         """
         assert AUTO_CONFIRM_PATTERNS == (
-            "I am using this for local development",
             "Use this and all future MCP servers",
             "Use this MCP server",
         )
@@ -834,7 +833,7 @@ class TestAutoAcceptConfirmations:
         """A new spawn re-arms confirmations: the set is cleared.
         새 spawn 시 _handled_confirmations 초기화 — 자동 승인 재무장.
         """
-        wrapper._handled_confirmations.add("I am using this for local development")
+        wrapper._handled_confirmations.add("Use this and all future MCP servers")
         # _spawn_child calls pexpect.spawn — mock it.
         # _spawn_child가 pexpect.spawn 호출 — mock.
         fake_child = MagicMock()
