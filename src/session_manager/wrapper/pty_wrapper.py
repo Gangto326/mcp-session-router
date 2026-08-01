@@ -86,7 +86,6 @@ OUTPUT_BUFFER_TAIL_KEEP = 256
 # 셋 다 default가 1번이라 \r 한 번으로 OK. 일반 LLM 출력에는 잘 나오지
 # 않을 만큼 고유한 문자열로 골랐다.
 AUTO_CONFIRM_PATTERNS: tuple[str, ...] = (
-    "I am using this for local development",  # channels dev 경고
     "Use this and all future MCP servers",  # MCP server 등록, 옵션 1
     "Use this MCP server",  # MCP server 등록, 옵션 2 (1번과 별도 매칭)
 )
@@ -478,10 +477,10 @@ class SessionManagerWrapper:
         self.virtual_screen.feed(chunk)
 
         # Auto-accept any confirmation prompts that just appeared in the
-        # virtual screen (channels dev warning, MCP server registration).
+        # virtual screen (MCP server registration).
         # Each pattern is processed at most once per child.
-        # 가상 화면에 새로 등장한 confirmation prompt 자동 승인 (channels
-        # dev 경고, MCP server 등록). 자식별로 패턴당 최대 1회 처리.
+        # 가상 화면에 새로 등장한 confirmation prompt 자동 승인 (MCP server
+        # 등록). 자식별로 패턴당 최대 1회 처리.
         self._auto_accept_confirmations()
 
         # Track ❯ disappearance during the AGENT_GUIDE submitted stage so

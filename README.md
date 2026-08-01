@@ -9,7 +9,7 @@ Claude Code에서 여러 작업 주제를 **세션 단위로 분리**하여 컨�
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) 패키지 매니저
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) v2.1.80 이상
-- **claude.ai 계정** (Pro/Max/Free) 로 인증된 Claude Code — API key (`ANTHROPIC_API_KEY`) 인증은 슬래시 명령 가로채기에 쓰이는 `claude/channel` capability를 지원하지 않아 사용 불가
+- Claude Code 인증 방식은 무관 (claude.ai 계정·API key 모두 사용 가능)
 
 ## 설치
 
@@ -86,18 +86,17 @@ alias ccode='uv run --project /path/to/mcp-session-router ccode'
    - **NEW**: 사용자에게 확인 → `session_create` → 래퍼가 `/exit` + 새 Claude Code 재시작 → 새 세션 시작.
 4. 전환 시 나가는 세션의 summary가 저장되고, 들어오는 세션에 handoff 블록(이전 맥락 요약 + 읽어야 할 파일 목록)이 전달된다.
 
-### 사용자 직접 슬래시 명령 가로채기
+### 사용자 직접 슬래시 명령 관찰
 
-사용자가 `/resume`·`/exit`·`/rename`·`/new`를 직접 타이핑하고 Enter를 누르면 `ccode`가 다음 흐름을 자동 실행한다:
+사용자가 `/resume`·`/exit`·`/rename`·`/new`를 직접 타이핑하고 Enter를 누르면 `ccode`가 다음을 수행한다:
 
-1. `ccode`가 Enter(`\r`)를 가로채고 입력란에 표시된 명령을 가상 터미널에서 추출
-2. MCP 서버가 LLM 컨텍스트로 channel 메시지 push (`<channel source="session-manager" command="..." args="...">`)
-3. LLM이 instructions에 따라 `session_end` 도구를 호출 → 현재 세션 summary 갱신
-4. `ccode`가 보관해둔 `\r`을 PTY로 forward → 사용자가 친 명령 실행
+1. 입력란에 표시된 명령을 가상 터미널에서 추출해 기록
+2. 떠나는 대화를 백그라운드 요약 큐에 적재
+3. MCP 서버에 "현재 세션 포인터가 낡았다"고 통보
 
-이 메커니즘은 Claude Code의 `claude/channel` capability를 사용하므로 `ccode`가 spawn 시 자동으로 `--dangerously-load-development-channels server:session-manager` 플래그를 추가한다. 매 실행마다 뜨는 channels dev 경고와 첫 실행 시 MCP server 등록 prompt는 모두 자동 승인된다 — 사용자가 별도로 키를 누를 필요 없음.
+**Enter 키는 붙잡지 않는다.** 명령은 즉시 실행되고 요약은 뒤에서 만들어지므로 입력 지연이 없다. 관찰에 실패해도 (화면 인식 타이밍 등) 대화 기록은 디스크에 남아 있어 다음 `ccode` 시작 시 부팅 복구가 요약을 채운다.
 
-15초 안에 LLM이 응답하지 않으면 graceful degradation으로 `\r`을 그대로 forward하고 안내 메시지를 출력한다 (summary는 갱신되지 못한 채). 가로채기 중 Ctrl+C를 누르면 명령 자체가 취소 (LLM 응답 중단 + 명령 실행 안 함).
+첫 실행 시 뜨는 MCP server 등록 prompt는 자동 승인된다 — 사용자가 별도로 키를 누를 필요 없음.
 
 ### Plan Mode 동작
 
@@ -181,26 +180,11 @@ ccode --resume backend-api
 
 ## 현재 버전 한계
 
-### 사용자 직접 전환 시 summary 갱신은 LLM 신뢰도 의존
+### summary 갱신은 비동기
 
-가로채기 흐름은 LLM이 channel 메시지를 보고 `session_end`를 호출해야 작동한다. LLM이 instructions를 따르지 않으면 15초 timeout 후 명령은 그대로 실행되지만 summary는 stale로 남는다. 즉 가로채기는 "summary 갱신을 시도"이지 "보장"이 아니다.
+세션을 떠나거나 `/clear`를 입력하면 요약 작업이 큐에 적재되고 백그라운드 워커가 처리한다. 요약이 반영되기까지 수십 초가 걸릴 수 있으며, 그 사이의 라우팅 판단은 직전 summary를 기준으로 이뤄진다.
 
-또한 가로채기 동안:
-- 사용자 화면에 channel 메시지 (`← session-manager: ...`)가 1-3초간 visible
-- 가로채기 중 추가 키 입력은 무시됨 (Ctrl+C만 명령 취소로 처리)
-- 사용자가 빠르게 타이핑할 때 일부 키가 가상 화면에 누락될 가능성이 의심됨 (race) — 매칭 실패 시 명령은 그대로 실행되고 summary만 stale로 남는다
-
-### Channels research preview 의존
-
-`claude/channel` capability는 Anthropic의 research preview 단계라 미래 버전에서 protocol 변경 가능. Claude Code 업데이트 후 가로채기가 깨질 수 있으니 변경 시 issue 등록 부탁한다.
-
-### `--dangerously-load-development-channels` 자동 사용
-
-본 서버는 Anthropic 공식 channel allowlist에 등재되지 않았으므로 `ccode`가 위 development 플래그를 자동 추가한다. 이 플래그는 보안 경계를 약화시킨다는 의미를 가지며, 매 실행 시 뜨는 channels dev 경고 prompt도 자동 우회된다 — 사용자가 모르게 보안 prompt를 넘긴다는 의미. 신뢰하지 않는 환경에서는 사용을 권하지 않는다.
-
-### `/clear` 후 stale summary
-
-`/clear`는 LLM 컨텍스트만 비우고 세션 ID와 MCP 서버는 유지한다. `/clear` 후에도 세션의 summary는 마지막 전환 시점의 값 그대로이므로, 이후 서브 에이전트 매칭에서 부정확한 판단이 있을 수 있다.
+요약 자체는 별도의 `claude -p` 단발 호출로 수행되므로 호출당 비용이 발생한다 (모델 haiku 기준 건당 약 $0.1). 발동 시점은 세션 전환·`/clear`·`ccode` 부팅·대화가 발췌 창 이상 쌓였을 때다.
 
 ### 가로채기 매칭의 false positive / negative
 

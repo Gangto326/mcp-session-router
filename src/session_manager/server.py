@@ -29,9 +29,6 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.stdio import stdio_server
-from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage, JSONRPCNotification
 
 from session_manager import debug_log
 from session_manager.claude_conversation import get_active_conversation_id
@@ -46,55 +43,6 @@ from session_manager.storage import FieldStore, ProjectContextStore, SessionStor
 from session_manager.wrapper.socket_client import WrapperSocketClient
 
 logger = logging.getLogger(__name__)
-
-
-class ChannelFastMCP(FastMCP):
-    """FastMCP that declares the experimental claude/channel capability.
-
-    실험적 claude/channel capability를 선언하는 FastMCP 서브클래스.
-    Stdio 모드의 write_stream을 인스턴스 멤버로 보존해, lifespan 안에서
-    백그라운드 task가 channel notification을 push할 수 있도록 한다.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._channel_write_stream: Any = None
-
-    async def run_stdio_async(self) -> None:
-        async with stdio_server() as (read_stream, write_stream):
-            self._channel_write_stream = write_stream
-            try:
-                opts = self._mcp_server.create_initialization_options(
-                    experimental_capabilities={"claude/channel": {}},
-                )
-                await self._mcp_server.run(read_stream, write_stream, opts)
-            finally:
-                self._channel_write_stream = None
-
-
-async def send_channel_notification(
-    write_stream: Any, content: str, meta: dict[str, str]
-) -> None:
-    """Push a notifications/claude/channel JSON-RPC message to the LLM context.
-
-    LLM 컨텍스트로 ``notifications/claude/channel`` JSON-RPC 메시지를 push.
-    The message wraps as ``<channel source="session-manager" ...>content</channel>``
-    in Claude's input.
-    """
-    debug_log.log(
-        "CHANNEL_PUSH",
-        "MCP_TOOL",
-        {
-            "content": debug_log.mask_text(content),
-            "meta": meta,
-        },
-    )
-    notif = JSONRPCNotification(
-        jsonrpc="2.0",
-        method="notifications/claude/channel",
-        params={"content": content, "meta": meta},
-    )
-    await write_stream.send(SessionMessage(message=JSONRPCMessage(notif)))
 
 
 def _set_current_session(app: AppContext, name: str | None) -> None:
@@ -423,7 +371,7 @@ user's first request, briefly explore the project structure and call \
 init_project with a concise overview.\
 """
 
-mcp_server = ChannelFastMCP(
+mcp_server = FastMCP(
     "session-manager",
     lifespan=app_lifespan,
 )
