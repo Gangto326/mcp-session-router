@@ -1371,3 +1371,98 @@ class TestJudgeWiring:
         )
         wrapper._handle_mcp_signal({"action": "current_session", "name": "a"})
         assert started == [True]
+
+
+class TestRouteSwitchExecution:
+    """route_switch (hook auto path) execution on the wrapper side.
+
+    hook 자동 경로 (route_switch) 의 래퍼 측 실행 테스트.
+    """
+
+    def test_route_switch_registers_pending_with_mirror_from(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._current_session_name = "frontend"
+        wrapper._handle_mcp_signal(
+            {
+                "client": "hook",
+                "action": "route_switch",
+                "target": "backend",
+                "user_prompt": "로그인 API가 500을 뱉는다",
+                "verdict": {"action": "SWITCH", "reason": "인증 소관"},
+            }
+        )
+        pending = wrapper._pending_action
+        assert pending is not None
+        assert pending.action_type == "switch"
+        assert pending.target == "backend"
+        assert pending.user_prompt == "로그인 API가 500을 뱉는다"
+        assert pending.handoff == {"from": "frontend", "router_reason": "인증 소관"}
+        assert wrapper._current_session_name == "backend"
+
+    def test_route_switch_without_target_ignored(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._handle_mcp_signal(
+            {"client": "hook", "action": "route_switch", "user_prompt": "x"}
+        )
+        assert wrapper._pending_action is None
+
+    def test_route_switch_without_verdict_reason(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._current_session_name = None
+        wrapper._handle_mcp_signal(
+            {"client": "hook", "action": "route_switch", "target": "backend"}
+        )
+        pending = wrapper._pending_action
+        assert pending is not None
+        assert pending.handoff == {"from": None}
+        assert pending.user_prompt == ""
+
+
+class TestResolveResumeArg:
+    """Conversation-id resolution for the /resume injection (P2-h).
+
+    /resume 주입 인자의 conversation id 해석 (P2-h 실측 근거) 테스트.
+    """
+
+    def _seed(self, wrapper: SessionManagerWrapper, conv_ids: list[str]) -> None:
+        store = SessionStore(Path(wrapper.project_path))
+        store.init_project()
+        session = SessionMetadata.new(name="backend", title="API")
+        session.claude_conversation_ids = conv_ids
+        store.save_session(session)
+
+    def test_latest_conversation_id_preferred(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        self._seed(wrapper, ["conv-old", "conv-new"])
+        assert wrapper._resolve_resume_arg("backend") == "conv-new"
+
+    def test_no_ids_falls_back_to_name(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        self._seed(wrapper, [])
+        assert wrapper._resolve_resume_arg("backend") == "backend"
+
+    def test_unknown_session_falls_back_to_name(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        assert wrapper._resolve_resume_arg("ghost") == "ghost"
+
+    def test_advance_switch_injects_conversation_id(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._seed(wrapper, ["conv-a", "conv-b"])
+        injected = _capture_injects(wrapper, monkeypatch)
+        pending = _PendingAction(
+            action_type="switch",
+            target="backend",
+            handoff={},
+            user_prompt="hi",
+            stage="await_resume_prompt",
+        )
+        wrapper._pending_action = pending
+        wrapper._advance_switch(pending)
+        assert injected == [b"/resume conv-b"]

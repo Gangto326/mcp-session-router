@@ -225,6 +225,221 @@ class TestRequestJudgment:
         thread.join(timeout=2)
 
 
+class TestRouteExecution:
+    """Acting on the verdict: confirm context, auto block, pass-through.
+
+    판정에 따른 실행 테스트: confirm 컨텍스트, auto 차단, 통과.
+    """
+
+    def _reply(self, **verdict: object) -> dict:
+        return {"ok": True, "verdict": verdict}
+
+    def _routable_payload(self, project: Path, mode: str | None = None) -> dict:
+        (project / ".session-manager").mkdir(exist_ok=True)
+        if mode is not None:
+            (project / ".session-manager" / "config.json").write_text(
+                json.dumps({"routing_mode": mode}), encoding="utf-8"
+            )
+        return json.loads(_payload(project))
+
+    def test_stay_passes_silently(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(action="STAY", reason="연속 작업"),
+        )
+        hook._route(self._routable_payload(project))
+        assert capsys.readouterr().out == ""
+
+    def test_ask_passes_silently(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(action="ASK", reason="후보 다수"),
+        )
+        hook._route(self._routable_payload(project))
+        assert capsys.readouterr().out == ""
+
+    def test_failed_reply_passes_silently(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(hook, "_request_judgment", lambda _p: None)
+        hook._route(self._routable_payload(project))
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: {"ok": False, "reason": "judge_unavailable"},
+        )
+        hook._route(self._routable_payload(project))
+        assert capsys.readouterr().out == ""
+
+    def test_switch_confirm_emits_additional_context(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(
+                action="SWITCH",
+                target="backend",
+                confidence=0.9,
+                evidence="JWT 교체 완료",
+            ),
+        )
+        hook._route(self._routable_payload(project))
+        out = json.loads(capsys.readouterr().out)
+        context = out["hookSpecificOutput"]["additionalContext"]
+        assert out["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+        assert "backend" in context
+        assert "JWT 교체 완료" in context
+        assert "session_switch" in context
+        assert "AskUserQuestion" in context
+
+    def test_new_confirm_emits_session_create_instruction(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(action="NEW", reason="새 주제"),
+        )
+        hook._route(self._routable_payload(project))
+        context = json.loads(capsys.readouterr().out)["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        assert "session_create" in context
+        assert "새 주제" in context
+
+    def test_auto_without_calibration_falls_back_to_confirm(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # 보정 데이터가 없는 auto 모드는 confirm 으로 완화된다 (규칙 8)
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(
+                action="SWITCH", target="backend", confidence=0.99, evidence="e"
+            ),
+        )
+        hook._route(self._routable_payload(project, mode="auto"))
+        out = capsys.readouterr().out
+        assert "decision" not in out
+        assert "session_switch" in out
+
+    def test_auto_with_calibration_blocks_and_delegates(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        sent: list[dict] = []
+
+        def fake_round_trip(request: dict) -> dict:
+            sent.append(request)
+            return {"type": "ack", "ok": True}
+
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(
+                action="SWITCH", target="backend", confidence=0.95, evidence="e"
+            ),
+        )
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda: 0.9)
+        monkeypatch.setattr(hook, "_socket_round_trip", fake_round_trip)
+
+        hook._route(self._routable_payload(project, mode="auto"))
+
+        out = json.loads(capsys.readouterr().out)
+        assert out["decision"] == "block"
+        assert "backend" in out["reason"]
+        assert len(sent) == 1
+        assert sent[0]["action"] == "route_switch"
+        assert sent[0]["client"] == "hook"
+        assert sent[0]["target"] == "backend"
+        assert sent[0]["user_prompt"] == "다음 작업을 진행해"
+
+    def test_auto_below_threshold_falls_back_to_confirm(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(
+                action="SWITCH", target="backend", confidence=0.5, evidence="e"
+            ),
+        )
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda: 0.9)
+        hook._route(self._routable_payload(project, mode="auto"))
+        out = capsys.readouterr().out
+        assert "decision" not in out
+        assert "session_switch" in out
+
+    def test_auto_socket_failure_falls_back_to_confirm(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # 래퍼가 ack 하지 않으면 절대 block 하지 않는다 — 프롬프트를
+        # 재주입할 주체가 없기 때문
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(
+                action="SWITCH", target="backend", confidence=0.95, evidence="e"
+            ),
+        )
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda: 0.9)
+        monkeypatch.setattr(hook, "_socket_round_trip", lambda _r: None)
+        hook._route(self._routable_payload(project, mode="auto"))
+        out = capsys.readouterr().out
+        assert "decision" not in out
+        assert "session_switch" in out
+
+    def test_auto_new_never_blocks(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(action="NEW", confidence=0.99, reason="새 주제"),
+        )
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda: 0.9)
+        hook._route(self._routable_payload(project, mode="auto"))
+        out = capsys.readouterr().out
+        assert "decision" not in out
+        assert "session_create" in out
+
+
 class TestRun:
     def test_prefiltered_prompt_exits_zero(self, project: Path) -> None:
         assert hook.run(_payload(project)) == 0
