@@ -1230,3 +1230,58 @@ class TestPeriodicSummaryRefresh:
         self._append_dialogue(transcript, EXCERPT_MAX_CHARS)
         wrapper._check_summary_refresh()
         assert self._pending(wrapper) == []
+
+
+class TestSpawnEnvIsolation:
+    """The spawned claude must not inherit CLAUDE_CODE_CHILD_SESSION (F19).
+
+    spawn 된 claude 는 CLAUDE_CODE_CHILD_SESSION 을 상속하면 안 된다 (F19).
+
+    Inherited, it makes an interactive claude write no transcript JSONL —
+    silently disabling every transcript-based feature. Isolated to this
+    single variable by experiment (docs/review/2026-07-30-verification.md §5차).
+    상속되면 대화형 claude 가 transcript JSONL 을 전혀 쓰지 않아 transcript
+    기반 기능 전체가 조용히 꺼진다. 실험으로 이 변수 하나로 특정됨.
+    """
+
+    def _spawn_env(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> dict:
+        captured: dict = {}
+
+        def fake_spawn(*args: object, **kwargs: object) -> MagicMock:
+            captured.update(kwargs)
+            child = MagicMock()
+            child.fileno.return_value = 1
+            return child
+
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.pexpect.spawn", fake_spawn
+        )
+        wrapper._spawn_child()
+        return captured["env"]  # type: ignore[return-value]
+
+    def test_child_session_marker_stripped(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "true")
+        env = self._spawn_env(wrapper, monkeypatch)
+        assert "CLAUDE_CODE_CHILD_SESSION" not in env
+
+    def test_everything_else_preserved(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only the proven-harmful variable goes — nothing else (rule 8).
+
+        입증된 변수 하나만 제거한다 — 나머지는 그대로 (규칙 8).
+        """
+        monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "true")
+        monkeypatch.setenv("CLAUDECODE", "1")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent-sid")
+        monkeypatch.setenv("SESSION_MANAGER_SOCKET", "/tmp/x.sock")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        env = self._spawn_env(wrapper, monkeypatch)
+        assert env["CLAUDECODE"] == "1"
+        assert env["CLAUDE_CODE_SESSION_ID"] == "parent-sid"
+        assert env["SESSION_MANAGER_SOCKET"] == "/tmp/x.sock"
+        assert env["ANTHROPIC_API_KEY"] == "sk-test"
