@@ -318,11 +318,35 @@ class SessionManagerWrapper:
             and self._pending_action.stage == "await_handshake"
         )
 
+        # When ccode itself runs inside a Claude Code session, the spawned
+        # claude inherits CLAUDE_CODE_CHILD_SESSION and — in interactive
+        # mode only — then writes NO transcript JSONL at all, which silently
+        # disables everything built on transcripts (excerpts, summaries,
+        # boot recovery, activity-based cleanup). Isolated by experiment
+        # (2026-08-02): this single variable suppresses the transcript;
+        # CLAUDECODE, CLAUDE_CODE_SESSION_ID, SSE_PORT, ENTRYPOINT,
+        # EXECPATH, PID, EFFORT are each innocent, and headless `-p` calls
+        # are unaffected even with full inheritance. Remove exactly the
+        # proven variable, nothing more.
+        # ccode 자체가 Claude Code 세션 안에서 실행되면 spawn 된 claude 가
+        # CLAUDE_CODE_CHILD_SESSION 을 상속하고 — 대화형 모드에 한해 —
+        # transcript JSONL 을 전혀 쓰지 않는다. transcript 위에 세운 모든
+        # 기능 (발췌·요약·부팅 복구·활동 기반 정리) 이 조용히 꺼진다.
+        # 실험으로 분리 (2026-08-02): 이 변수 하나가 원인이며 CLAUDECODE,
+        # CLAUDE_CODE_SESSION_ID, SSE_PORT, ENTRYPOINT, EXECPATH, PID,
+        # EFFORT 는 각각 무해, headless `-p` 는 전체 상속에도 무관.
+        # 입증된 변수 하나만 제거한다.
+        child_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k != "CLAUDE_CODE_CHILD_SESSION"
+        }
         self.child = pexpect.spawn(
             "claude",
             self.claude_args,
             encoding=None,
             echo=False,
+            env=child_env,
         )
         self.pty_fd = self.child.fileno()
         debug_log.log(
