@@ -317,38 +317,14 @@ def _make_wrapper_signal_handler(
 _SERVER_INSTRUCTIONS = """\
 You manage multiple conversation sessions within a single Claude Code process.
 
-## Context Switch Detection
-When the user's message could shift topic, code area, file/directory scope, \
-or domain from the current session, spawn a sub-agent with this prompt:
-  "User prompt: '{prompt}'. Current session: {name}.
-
-  Call check_session to get all sessions and their summaries.
-
-  Decision rules (apply in order):
-  - If exactly one session matches → SWITCH:that_name
-  - If multiple sessions plausibly match → ASK_USER (list candidates)
-  - If the current session matches and others don't → STAY
-  - If NO session matches OR all summaries are null/missing → NEW
-  - A default-named session with null summary represents an unclaimed \
-  conversation; treat it as no match unless the prompt is a literal \
-  continuation of the current turn.
-
-  Prefer SWITCH or NEW over STAY when in doubt — keeping each session \
-  focused is cheaper than a polluted multi-topic session.
-
-  Respond as exactly: ACTION:SESSION_NAME:REASON
-  ACTION = STAY | SWITCH | NEW | ASK_USER"
-Then:
-- STAY: process normally.
-- SWITCH: confirm with user, then switch.
-- NEW: confirm with user, then create a new session.
-- ASK_USER: present candidates and let user choose.
-
-**Why dispatch eagerly**: a sub-agent call costs ~1-2s and a few hundred \
-tokens. A polluted single session costs much more — longer context every \
-turn, degraded answers, and far more total tokens over time. Skip the \
-sub-agent ONLY when the message is an obvious follow-up to the immediately \
-previous turn within the same session.
+## Routing Is Decided Outside You
+Session routing runs in a deterministic hook on every prompt submission. \
+When a switch looks right, an instruction marked [session-manager 라우터] \
+arrives in your context: follow it exactly — ask the user with \
+AskUserQuestion, and on acceptance call session_switch / session_create as \
+instructed. Without such an instruction, answer in the current session and \
+do NOT proactively route, spawn routing sub-agents, or call \
+session_switch / session_create on your own topic-shift suspicion.
 
 ## Handoff Block
 When input contains [handoff]...[/handoff]:
