@@ -54,7 +54,12 @@ class TestClaudeArgsPassthrough:
     창이 떴고 API key 사용자는 쓸 수 없었다. 이제 channels 의존은 없다.
     """
 
-    def _run_main(self, argv: list[str], monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    def _run_main(
+        self,
+        argv: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        registration_calls: list | None = None,
+    ) -> list[str]:
         captured: dict[str, list[str]] = {}
 
         class _FakeWrapper:
@@ -66,6 +71,16 @@ class TestClaudeArgsPassthrough:
 
         monkeypatch.setattr(
             "session_manager.wrapper.main.SessionManagerWrapper", _FakeWrapper
+        )
+        # Registration is unit-tested separately; keep main() hermetic.
+        # 등록 로직은 별도 단위 테스트 — main() 은 밀폐 상태로 유지.
+        monkeypatch.setattr(
+            "session_manager.wrapper.main.ensure_hook_registered",
+            lambda project: (
+                registration_calls.append(project)
+                if registration_calls is not None
+                else None
+            ),
         )
         monkeypatch.setattr(sys, "argv", ["ccode", *argv])
         main()
@@ -85,4 +100,32 @@ class TestClaudeArgsPassthrough:
     ) -> None:
         args = self._run_main(["--model", "opus"], monkeypatch)
         assert not any("channel" in a for a in args)
+
+
+class TestNoHooksFlag:
+    """--no-hooks is a ccode-only flag: stripped and skips registration.
+
+    --no-hooks 는 ccode 전용 플래그 — claude 인자에서 제거되고 등록
+    검사를 건너뛴다.
+    """
+
+    def test_flag_stripped_and_registration_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list = []
+        args = TestClaudeArgsPassthrough()._run_main(
+            ["--no-hooks", "--model", "opus"], monkeypatch, registration_calls=calls
+        )
+        assert args == ["--model", "opus"]
+        assert calls == []
+
+    def test_registration_runs_without_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list = []
+        args = TestClaudeArgsPassthrough()._run_main(
+            ["--model", "opus"], monkeypatch, registration_calls=calls
+        )
+        assert args == ["--model", "opus"]
+        assert len(calls) == 1
 

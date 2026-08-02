@@ -1,0 +1,204 @@
+"""
+Unit tests for the boot-time hook auto-registration.
+
+Focus: the user's settings.json is never damaged, consent is honored
+and remembered, and every failure degrades to a skip.
+
+부팅 시 hook 자동 등록 단위 테스트.
+
+초점: 사용자의 settings.json 을 절대 손상시키지 않고, 동의를 존중·기억
+하며, 모든 실패가 skip 으로 완화되는지.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from session_manager.hooks import registration
+
+FAKE_COMMAND = "/opt/bin/ccode-hook-user-prompt-submit"
+
+
+@pytest.fixture
+def project(tmp_path: Path) -> Path:
+    return tmp_path
+
+
+@pytest.fixture
+def which_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        registration.shutil, "which", lambda _name: FAKE_COMMAND
+    )
+
+
+def _settings_path(project: Path) -> Path:
+    return project / ".claude" / "settings.json"
+
+
+def _read_settings(project: Path) -> dict:
+    return json.loads(_settings_path(project).read_text(encoding="utf-8"))
+
+
+def _fail_ask(_prompt: str) -> str:
+    raise AssertionError("ask_user must not be called")
+
+
+class TestRegister:
+    def test_registers_with_consent(
+        self, project: Path, which_found: None
+    ) -> None:
+        status = registration.ensure_hook_registered(
+            project, ask_user=lambda _p: "y"
+        )
+        assert status == "registered"
+        settings = _read_settings(project)
+        # P2-e 실측 형식 (docs/poc/R2-hook.md §5)
+        assert settings["hooks"]["UserPromptSubmit"] == [
+            {"hooks": [{"type": "command", "command": FAKE_COMMAND}]}
+        ]
+
+    def test_preserves_existing_settings(
+        self, project: Path, which_found: None
+    ) -> None:
+        _settings_path(project).parent.mkdir(parents=True)
+        existing = {
+            "permissions": {"allow": ["Bash(ls:*)"]},
+            "hooks": {
+                "PreToolUse": [{"hooks": [{"type": "command", "command": "x"}]}],
+                "UserPromptSubmit": [
+                    {"hooks": [{"type": "command", "command": "other-hook"}]}
+                ],
+            },
+        }
+        _settings_path(project).write_text(
+            json.dumps(existing), encoding="utf-8"
+        )
+
+        status = registration.ensure_hook_registered(
+            project, ask_user=lambda _p: "yes"
+        )
+        assert status == "registered"
+        settings = _read_settings(project)
+        assert settings["permissions"] == {"allow": ["Bash(ls:*)"]}
+        assert len(settings["hooks"]["PreToolUse"]) == 1
+        commands = [
+            h["command"]
+            for entry in settings["hooks"]["UserPromptSubmit"]
+            for h in entry["hooks"]
+        ]
+        assert commands == ["other-hook", FAKE_COMMAND]
+
+    def test_already_registered_leaves_file_untouched(
+        self, project: Path, which_found: None
+    ) -> None:
+        _settings_path(project).parent.mkdir(parents=True)
+        original = json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"/x/{registration.HOOK_SCRIPT_NAME}",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+        _settings_path(project).write_text(original, encoding="utf-8")
+
+        status = registration.ensure_hook_registered(project, ask_user=_fail_ask)
+        assert status == "already_registered"
+        assert _settings_path(project).read_text(encoding="utf-8") == original
+
+
+class TestDecline:
+    def test_decline_recorded_and_not_registered(
+        self, project: Path, which_found: None
+    ) -> None:
+        status = registration.ensure_hook_registered(
+            project, ask_user=lambda _p: "n"
+        )
+        assert status == "declined"
+        assert not _settings_path(project).exists()
+        config = json.loads(
+            (project / ".session-manager" / "config.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert config["hook_registration_declined"] is True
+
+    def test_declined_previously_not_reasked(
+        self, project: Path, which_found: None
+    ) -> None:
+        registration.ensure_hook_registered(project, ask_user=lambda _p: "n")
+        status = registration.ensure_hook_registered(project, ask_user=_fail_ask)
+        assert status == "declined_previously"
+
+    def test_decline_preserves_existing_config_keys(
+        self, project: Path, which_found: None
+    ) -> None:
+        config_dir = project / ".session-manager"
+        config_dir.mkdir()
+        (config_dir / "config.json").write_text(
+            json.dumps({"routing_mode": "off"}), encoding="utf-8"
+        )
+        registration.ensure_hook_registered(project, ask_user=lambda _p: "n")
+        config = json.loads(
+            (config_dir / "config.json").read_text(encoding="utf-8")
+        )
+        assert config["routing_mode"] == "off"
+        assert config["hook_registration_declined"] is True
+
+    def test_empty_answer_means_decline(
+        self, project: Path, which_found: None
+    ) -> None:
+        assert (
+            registration.ensure_hook_registered(project, ask_user=lambda _p: "")
+            == "declined"
+        )
+
+
+class TestSkips:
+    def test_broken_settings_untouched(
+        self, project: Path, which_found: None
+    ) -> None:
+        _settings_path(project).parent.mkdir(parents=True)
+        _settings_path(project).write_text("{oops", encoding="utf-8")
+
+        status = registration.ensure_hook_registered(project, ask_user=_fail_ask)
+        assert status == "broken_settings"
+        assert _settings_path(project).read_text(encoding="utf-8") == "{oops"
+
+    def test_script_not_found_skips(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(registration.shutil, "which", lambda _n: None)
+        status = registration.ensure_hook_registered(project, ask_user=_fail_ask)
+        assert status == "script_not_found"
+        assert not _settings_path(project).exists()
+
+    def test_non_interactive_skips(
+        self, project: Path, which_found: None
+    ) -> None:
+        # pytest 의 stdin 은 tty 가 아니다 — ask_user 미지정 시 질문 없이 skip
+        status = registration.ensure_hook_registered(project, ask_user=None)
+        assert status == "non_interactive"
+
+    def test_internal_error_returns_error(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(_path: Path) -> dict | None:
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr(registration, "_load_settings", boom)
+        assert (
+            registration.ensure_hook_registered(project, ask_user=_fail_ask)
+            == "error"
+        )
