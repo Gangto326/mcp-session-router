@@ -34,11 +34,32 @@ fd·상주 client fd·모든 pending fd를 자기 메인 select() 루프에 노�
 별도 스레드 없이 PTY·stdin과 함께 다중화된다. 메시지 프레이밍은 라인 기반
 JSON이다 — 와이어상 한 줄이 곧 하나의 JSON 객체에 대응한다.
 
+Hook messages support two reply shapes:
+
+- Fire-and-forget (default): the server dispatches to ``on_message``,
+  sends the ack, and closes.
+- Deferred reply: when the ``on_hook_message`` callback is configured
+  and returns True, connection ownership transfers to the callback's
+  side (e.g. a judge worker thread). The server forgets the fd — the
+  new owner must eventually send its reply and close the socket. This
+  exists for requests whose answer takes seconds (routing judgment):
+  an immediate ack could not carry the result.
+
+hook 메시지의 회신 형태는 두 가지다:
+
+- 즉발형 (기본): 서버가 ``on_message``로 디스패치하고 ack를 보낸 뒤
+  닫는다.
+- 지연 회신형: ``on_hook_message`` 콜백이 설정되어 있고 True를 반환하면
+  연결 소유권이 콜백 측(예: 판정 워커 스레드)으로 이관된다. 서버는 해당
+  fd를 잊는다 — 새 소유자가 회신 송신과 소켓 닫기를 책임진다. 응답에
+  수 초가 걸리는 요청(라우팅 판정)을 위한 유형이다: 즉시 ack로는 결과를
+  실어 보낼 수 없다.
+
 지원하는 메시지 종류:
 - MCP → 래퍼: handshake_request, action=switch, action=new, session_end_completed
 - hook → 래퍼: client="hook"을 담은 단발 메시지 (라우팅 판정 요청 등)
 - 래퍼 → MCP: handshake_response(current_session_name), user_action
-- 래퍼 → hook: {"type": "ack", "ok": true}
+- 래퍼 → hook: {"type": "ack", "ok": true} 또는 지연 회신 (소유자가 송신)
 실제 메시지 라우팅은 호출자(SessionManagerWrapper)가 `on_message` 콜백
 안에서 처리하며, 본 모듈은 프레이밍·연결·전송 책임만 진다.
 """
@@ -72,9 +93,20 @@ class WrapperSocketServer:
         self,
         socket_path: str,
         on_message: Callable[[dict[str, Any]], None],
+        on_hook_message: Callable[[dict[str, Any], socket.socket], bool]
+        | None = None,
     ) -> None:
         self.socket_path = socket_path
         self._on_message = on_message
+        # Optional deferred-reply dispatcher for hook messages. Returning
+        # True means "I took ownership of the socket — I will reply and
+        # close it"; the socket is handed over in non-blocking mode, so
+        # the new owner should call settimeout() before writing.
+        # hook 메시지용 지연 회신 디스패처 (선택). True 반환은 "소켓
+        # 소유권을 가져갔다 — 회신과 닫기를 내가 한다"는 뜻이다. 소켓은
+        # non-blocking 상태로 이관되므로 새 소유자는 쓰기 전에
+        # settimeout()을 호출해야 한다.
+        self._on_hook_message = on_hook_message
         self._listen_sock: socket.socket | None = None
         self._client_sock: socket.socket | None = None
         self._read_buffer: bytes = b""
@@ -241,13 +273,17 @@ class WrapperSocketServer:
         self, fd: int, sock: socket.socket, message: dict[str, Any]
     ) -> None:
         """
-        Complete a short-lived exchange: dispatch the message, send the
-        ack, close the connection. Anything buffered past the first
-        message is discarded — the protocol is one message per connection.
+        Complete a short-lived exchange. Default path: dispatch the
+        message, send the ack, close the connection. Deferred path: if
+        ``on_hook_message`` takes ownership, forget the fd and let the
+        new owner reply and close. Anything buffered past the first
+        message is discarded — the protocol is one message per
+        connection.
 
-        단발 왕복을 완결한다: 메시지 디스패치 → ack 송신 → 연결 종료.
-        첫 메시지 이후 버퍼에 남은 데이터는 버린다 — 프로토콜은 연결당
-        메시지 1건이다.
+        단발 왕복을 완결한다. 기본 경로: 메시지 디스패치 → ack 송신 →
+        연결 종료. 지연 경로: ``on_hook_message``가 소유권을 가져가면
+        fd를 잊고 회신·닫기를 새 소유자에게 맡긴다. 첫 메시지 이후
+        버퍼에 남은 데이터는 버린다 — 프로토콜은 연결당 메시지 1건이다.
         """
         debug_log.log(
             "SOCKET_RECV",
@@ -259,6 +295,34 @@ class WrapperSocketServer:
                 "payload": message,
             },
         )
+        if self._on_hook_message is not None:
+            try:
+                taken = bool(self._on_hook_message(message, sock))
+            except Exception:
+                # A broken dispatcher must not crash the wrapper's I/O
+                # loop. Close without ack — the hook side times out and
+                # passes the prompt through (graceful degradation).
+                # 디스패처의 예외가 래퍼 I/O 루프를 죽여선 안 된다. ack
+                # 없이 닫는다 — hook 측은 타임아웃 후 프롬프트를
+                # 통과시킨다 (graceful degradation).
+                debug_log.log(
+                    "SOCKET_DETACH",
+                    "SYSTEM",
+                    {"client_fd": fd, "error": "hook_dispatcher_raised"},
+                )
+                self._close_pending(fd)
+                return
+            if taken:
+                # Ownership transferred — forget the fd without closing.
+                # 소유권 이관 — 닫지 않고 fd만 잊는다.
+                self._pending.pop(fd, None)
+                self._pending_buffers.pop(fd, None)
+                debug_log.log(
+                    "SOCKET_DETACH",
+                    "SYSTEM",
+                    {"client_fd": fd},
+                )
+                return
         self._on_message(message)
         try:
             payload = (
