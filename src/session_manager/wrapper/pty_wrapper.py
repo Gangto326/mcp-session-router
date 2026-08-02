@@ -45,8 +45,12 @@ from session_manager.claude_conversation import (
     get_active_conversation_id,
     get_conversation_activity,
 )
+from session_manager.hooks.user_prompt_submit import (
+    _count_active_sessions,
+    _load_routing_mode,
+)
 from session_manager.lifecycle import get_cleanup_period_days
-from session_manager.storage.file_store import SessionStore
+from session_manager.storage.file_store import _SESSION_MANAGER_DIRNAME, SessionStore
 from session_manager.summarizer import SummarizerWorker, SummaryTask
 from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS, scan_dialogue_growth
 from session_manager.wrapper.command_matcher import (
@@ -54,6 +58,7 @@ from session_manager.wrapper.command_matcher import (
     match_intercept_command,
 )
 from session_manager.wrapper.handoff_formatter import format_handoff_injection
+from session_manager.wrapper.judge_host import JudgeHost
 from session_manager.wrapper.socket_server import WrapperSocketServer
 from session_manager.wrapper.virtual_screen import VirtualScreen
 
@@ -182,6 +187,7 @@ class SessionManagerWrapper:
         self.socket_server = WrapperSocketServer(
             socket_path=socket_path,
             on_message=self._handle_mcp_signal,
+            on_hook_message=self._handle_hook_message,
         )
 
         # Virtual terminal screen mirroring Claude Code's PTY output. Used to
@@ -259,6 +265,14 @@ class SessionManagerWrapper:
         # 아래 트리거들이 채우는 파일 큐를 비운다.
         self.summarizer_worker = SummarizerWorker(Path(self.project_path))
 
+        # Resident routing-judge host (R2). Serves judge_request messages
+        # arriving over the hook socket path; started lazily by
+        # _maybe_start_judge when routing is actually possible.
+        # 상주 라우팅 판정 호스트 (R2). hook 소켓 경로로 오는 judge_request
+        # 를 처리한다. 라우팅이 실제로 가능할 때 _maybe_start_judge 가
+        # 지연 시작한다.
+        self.judge_host = JudgeHost(Path(self.project_path))
+
         # Incremental dialogue-length scan for the periodic refresh trigger.
         # Keeping the file offset means each turn parses only what was
         # appended since the last one.
@@ -290,6 +304,7 @@ class SessionManagerWrapper:
         # 가 바로 집어가도록.
         self._enqueue_stale_summaries()
         self.summarizer_worker.start()
+        self._maybe_start_judge()
 
         try:
             self._spawn_child()
@@ -302,6 +317,7 @@ class SessionManagerWrapper:
         finally:
             self._restore_terminal()
             self.summarizer_worker.stop()
+            self.judge_host.stop()
             self.socket_server.stop()
 
     def _spawn_child(self) -> None:
@@ -1117,9 +1133,50 @@ class SessionManagerWrapper:
     def _handle_user_line(self, line: bytes) -> None:
         return
 
+    def _maybe_start_judge(self) -> None:
+        """
+        Start the judge host when routing is actually possible: mode not
+        "off" and at least two active sessions (the same deterministic
+        conditions the hook prefilter checks — a judge warmed for an
+        unroutable project would only burn one warmup call per boot).
+        Idempotent; called at boot and whenever session topology may
+        have changed (MCP switch/new/current_session signals).
+
+        라우팅이 실제로 가능할 때 판정 호스트를 시작한다: 모드가 "off"가
+        아니고 활성 세션이 2개 이상 (hook 프리필터와 동일한 결정적 조건 —
+        라우팅 불가능한 프로젝트에서 웜업하면 부팅마다 웜업 호출만
+        낭비된다). 멱등이며 부팅 시와 세션 구성이 바뀔 수 있는 시점
+        (MCP switch/new/current_session 신호)마다 호출된다.
+        """
+        root = Path(self.project_path) / _SESSION_MANAGER_DIRNAME
+        if _load_routing_mode(root) == "off":
+            return
+        if _count_active_sessions(root) < 2:
+            return
+        self.judge_host.ensure_started()
+
+    def _handle_hook_message(self, message: dict, sock: Any) -> bool:
+        """
+        Deferred-reply dispatcher for hook messages (socket server
+        callback). judge_request transfers the connection to the judge
+        host; anything else falls back to the ack path.
+
+        hook 메시지의 지연 회신 디스패처 (소켓 서버 콜백). judge_request
+        는 연결을 판정 호스트로 이관하고, 그 외는 ack 경로로 돌려보낸다.
+        """
+        if message.get("action") == "judge_request":
+            return self.judge_host.handle_request(message, sock)
+        return False
+
     def _handle_mcp_signal(self, message: dict) -> None:
         if not isinstance(message, dict):
             return
+        # Any MCP signal may follow a session-topology change (register,
+        # switch, create) — cheap idempotent re-check of the judge
+        # start conditions.
+        # 모든 MCP 신호는 세션 구성 변화(register·switch·create) 뒤에 올
+        # 수 있다 — 판정기 시작 조건의 저렴한 멱등 재검사.
+        self._maybe_start_judge()
         msg_type = message.get("type")
         if msg_type == "handshake_request":
             self._handle_handshake_request()

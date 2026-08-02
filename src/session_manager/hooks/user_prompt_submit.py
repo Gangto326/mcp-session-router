@@ -27,16 +27,25 @@ Claude Code는 사용자가 프롬프트를 제출할 때마다, 프롬프트가
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sys
 from pathlib import Path
 from typing import Any
 
 from session_manager import debug_log
+from session_manager.routing.judge import HOOK_REPLY_TIMEOUT_SECS
 from session_manager.storage.file_store import (
     _CONFIG_FILENAME,
     _SESSION_MANAGER_DIRNAME,
     _SESSIONS_DIRNAME,
 )
+
+# The wrapper exports its socket path to Claude Code's env; hook
+# processes are Claude Code's children and inherit it.
+# 래퍼가 소켓 경로를 Claude Code env 로 export 하고, hook 프로세스는
+# Claude Code 의 자식이므로 이를 상속한다.
+_SOCKET_ENV_VAR = "SESSION_MANAGER_SOCKET"
 
 # Stdin field names, measured from the real UserPromptSubmit payload
 # (docs/poc/R2-hook.md §1 — Claude Code 2.1.220, headless and
@@ -138,24 +147,73 @@ def _prefilter(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _request_judgment(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    One short-lived socket round-trip to the wrapper's judge host.
+
+    Sends a thin judge_request (prompt assembly happens wrapper-side)
+    and waits for the deferred reply. Returns the reply dict, or None
+    on any failure — no socket, refused connection, timeout, bad frame.
+
+    래퍼 판정 호스트로의 단발 소켓 왕복 1회.
+
+    얇은 judge_request 를 보내고 (프롬프트 조립은 래퍼 측 담당) 지연
+    회신을 기다린다. 실패 시 None — 소켓 부재·연결 거부·타임아웃·깨진
+    프레임 전부.
+    """
+    socket_path = os.environ.get(_SOCKET_ENV_VAR, "").strip()
+    if not socket_path:
+        return None
+    request = {
+        "client": "hook",
+        "action": "judge_request",
+        "prompt": payload.get(FIELD_PROMPT),
+        "session_id": payload.get(FIELD_SESSION_ID),
+        "transcript_path": payload.get(FIELD_TRANSCRIPT_PATH),
+        "cwd": payload.get(FIELD_CWD),
+    }
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(HOOK_REPLY_TIMEOUT_SECS)
+            sock.connect(socket_path)
+            sock.sendall(
+                (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
+            )
+            buffer = b""
+            while b"\n" not in buffer:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    return None
+                buffer += chunk
+    except OSError:
+        return None
+    line = buffer.split(b"\n", 1)[0]
+    try:
+        reply = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return reply if isinstance(reply, dict) else None
+
+
 def _route(payload: dict[str, Any]) -> None:
     """
-    Judgment stage placeholder.
+    Judgment stage: ask the wrapper's resident judge over the socket.
 
-    A later commit wires the resident judge here: a short-lived socket
-    round-trip to the wrapper (which hosts the judge process). Until
-    then the prompt always passes through.
+    The verdict is only recorded for now — acting on it (block and
+    switch) is the next commit. Every outcome, including failure, exits
+    through the caller with code 0.
 
-    판정 단계 자리표시자.
+    판정 단계: 소켓 너머 래퍼의 상주 판정기에 묻는다.
 
-    후속 커밋이 여기에 상주 판정기를 연결한다: 래퍼(판정 프로세스를
-    상주시키는 쪽)로의 소켓 단발 왕복. 그 전까지 프롬프트는 항상
-    통과한다.
+    현재는 판정 결과를 기록만 한다 — 결과에 따른 실행(block·전환)은
+    다음 커밋이다. 실패를 포함한 모든 결과가 호출자에서 exit 0 으로
+    끝난다.
     """
+    reply = _request_judgment(payload)
     debug_log.log(
         "HOOK_ROUTE",
         "SYSTEM",
-        {"stage": "judge_not_implemented"},
+        {"reply": reply},
         conv_id=payload.get(FIELD_SESSION_ID),
     )
 
