@@ -453,10 +453,12 @@ class SessionManagerWrapper:
             watch_fds: list[int] = [self.pty_fd, self._stdin_fd]
             listen_fd = self.socket_server.listen_fileno
             client_fd = self.socket_server.client_fileno
+            pending_fds = self.socket_server.pending_filenos
             if listen_fd >= 0:
                 watch_fds.append(listen_fd)
             if client_fd >= 0:
                 watch_fds.append(client_fd)
+            watch_fds.extend(pending_fds)
 
             try:
                 # 100 ms timeout polls child liveness without burning CPU.
@@ -481,6 +483,10 @@ class SessionManagerWrapper:
 
             if client_fd >= 0 and client_fd in readable:
                 self.socket_server.handle_client_readable()
+
+            for fd in pending_fds:
+                if fd in readable:
+                    self.socket_server.handle_pending_readable(fd)
 
         self._drain_pty()
 

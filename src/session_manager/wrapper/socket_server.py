@@ -1,22 +1,44 @@
 """
-Unix Domain Socket server used by the wrapper to talk with the MCP process.
+Unix Domain Socket server used by the wrapper to talk with the MCP process
+and short-lived hook processes.
 
-Hosts a single-client AF_UNIX SOCK_STREAM socket. The wrapper exposes the
-listening fd (and, once connected, the client fd) to its main select() loop
-so socket I/O is multiplexed alongside PTY and stdin without an extra
-thread. Messages are line-delimited JSON: each line on the wire is one
-JSON object.
+Hosts an AF_UNIX SOCK_STREAM socket with two connection types:
 
-PTY 래퍼가 MCP 프로세스와 통신하기 위한 Unix Domain Socket 서버 모듈.
+- Resident connection (MCP process): exactly one at a time. Long-lived,
+  bidirectional. A second resident attempt is rejected (SOCKET_REJECT).
+- Short-lived connection (hook process, spawned per prompt): connect,
+  send one message carrying ``"client": "hook"``, receive an ack, close.
+  Any number may come and go without disturbing the resident slot.
 
-단일 클라이언트만 허용하는 AF_UNIX SOCK_STREAM 소켓을 호스팅한다. 래퍼는
-listen fd와 (연결된 후의) client fd를 자기 메인 select() 루프에 노출하므로,
+A newly accepted connection is held as *pending* until its first complete
+message reveals which type it is — the connection itself carries no
+identity. The wrapper exposes the listening fd, the resident client fd,
+and all pending fds to its main select() loop so socket I/O is
+multiplexed alongside PTY and stdin without an extra thread. Messages
+are line-delimited JSON: each line on the wire is one JSON object.
+
+PTY 래퍼가 MCP 프로세스·단발 hook 프로세스와 통신하기 위한 Unix Domain
+Socket 서버 모듈.
+
+두 가지 연결 유형을 지원한다:
+
+- 상주 연결 (MCP 프로세스): 동시에 정확히 1개. 장수명·양방향.
+  두 번째 상주 시도는 거부된다 (SOCKET_REJECT).
+- 단발 연결 (hook 프로세스, 매 프롬프트마다 새로 뜸): 접속 → ``"client":
+  "hook"`` 필드를 담은 메시지 1건 송신 → ack 수신 → 종료. 상주 자리를
+  건드리지 않고 얼마든지 드나들 수 있다.
+
+접속 자체에는 신원 정보가 없으므로, 새로 수락된 연결은 첫 완전한
+메시지가 유형을 드러낼 때까지 *pending* 상태로 보관한다. 래퍼는 listen
+fd·상주 client fd·모든 pending fd를 자기 메인 select() 루프에 노출하므로,
 별도 스레드 없이 PTY·stdin과 함께 다중화된다. 메시지 프레이밍은 라인 기반
 JSON이다 — 와이어상 한 줄이 곧 하나의 JSON 객체에 대응한다.
 
 지원하는 메시지 종류:
 - MCP → 래퍼: handshake_request, action=switch, action=new, session_end_completed
+- hook → 래퍼: client="hook"을 담은 단발 메시지 (라우팅 판정 요청 등)
 - 래퍼 → MCP: handshake_response(current_session_name), user_action
+- 래퍼 → hook: {"type": "ack", "ok": true}
 실제 메시지 라우팅은 호출자(SessionManagerWrapper)가 `on_message` 콜백
 안에서 처리하며, 본 모듈은 프레이밍·연결·전송 책임만 진다.
 """
@@ -32,6 +54,18 @@ from typing import Any
 
 from session_manager import debug_log
 
+# Listen backlog. Engineering parameter — theoretical max simultaneous
+# connectors is 2 (one resident MCP + one hook; hooks are serialized by the
+# TUI prompt loop), ×4 safety margin for restart races.
+# listen 백로그. 공학 파라미터 — 동시 접속 이론 최대치는 2 (상주 MCP 1 +
+# hook 1; hook은 TUI 프롬프트 루프에 의해 직렬화됨), 재시작 경합 대비 4배 여유.
+_LISTEN_BACKLOG = 8
+
+# Ack payload sent back to a short-lived (hook) client after its message
+# has been dispatched.
+# 단발(hook) 클라이언트의 메시지를 디스패치한 뒤 돌려주는 ack 페이로드.
+_ACK_MESSAGE: dict[str, Any] = {"type": "ack", "ok": True}
+
 
 class WrapperSocketServer:
     def __init__(
@@ -44,6 +78,13 @@ class WrapperSocketServer:
         self._listen_sock: socket.socket | None = None
         self._client_sock: socket.socket | None = None
         self._read_buffer: bytes = b""
+        # Accepted connections whose first message hasn't arrived yet,
+        # keyed by fd. The first message decides: hook → ack and close,
+        # otherwise → promote to the resident slot.
+        # 첫 메시지가 아직 도착하지 않은 수락된 연결 (fd 키). 첫 메시지가
+        # 유형을 결정한다: hook → ack 후 종료, 그 외 → 상주 자리로 승격.
+        self._pending: dict[int, socket.socket] = {}
+        self._pending_buffers: dict[int, bytes] = {}
 
     def start(self) -> None:
         """
@@ -62,17 +103,20 @@ class WrapperSocketServer:
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(self.socket_path)
-        sock.listen(1)
+        sock.listen(_LISTEN_BACKLOG)
         sock.setblocking(False)
         self._listen_sock = sock
 
     def stop(self) -> None:
         """
-        Close the client and listen sockets and unlink the socket file.
+        Close the client, pending, and listen sockets and unlink the
+        socket file.
 
-        클라이언트와 listen 소켓을 닫고 소켓 파일을 제거한다.
+        클라이언트·pending·listen 소켓을 닫고 소켓 파일을 제거한다.
         """
         self._close_client()
+        for fd in list(self._pending):
+            self._close_pending(fd)
         if self._listen_sock is not None:
             try:
                 self._listen_sock.close()
@@ -99,6 +143,15 @@ class WrapperSocketServer:
             return -1
         return self._client_sock.fileno()
 
+    @property
+    def pending_filenos(self) -> list[int]:
+        """
+        fds of accepted connections awaiting their first message.
+
+        첫 메시지를 기다리는 수락된 연결들의 fd 목록.
+        """
+        return list(self._pending)
+
     def has_client(self) -> bool:
         return self._client_sock is not None
 
@@ -107,10 +160,11 @@ class WrapperSocketServer:
 
     def handle_listen_readable(self) -> None:
         """
-        Accept a pending connection. Reject extra connections.
+        Accept a connection and hold it as pending until its first message
+        reveals whether it is a resident (MCP) or short-lived (hook) client.
 
-        listen 소켓에 대기 중인 연결을 수락한다. 이미 클라이언트가 있으면
-        새 연결을 거부 (단일 클라이언트 정책).
+        listen 소켓의 연결을 수락해 pending 으로 보관한다. 첫 메시지가
+        상주(MCP)인지 단발(hook)인지 드러낼 때까지 유형을 확정하지 않는다.
         """
         if self._listen_sock is None:
             return
@@ -119,26 +173,144 @@ class WrapperSocketServer:
         except (BlockingIOError, OSError):
             return
 
+        client.setblocking(False)
+        fd = client.fileno()
+        self._pending[fd] = client
+        self._pending_buffers[fd] = b""
+        debug_log.log(
+            "SOCKET_ACCEPT",
+            "SYSTEM",
+            {"client_fd": fd, "state": "pending"},
+        )
+
+    def handle_pending_readable(self, fd: int) -> None:
+        """
+        Read from a pending connection and settle its type on the first
+        complete message: ``client == "hook"`` → dispatch, ack, close;
+        otherwise → promote to the resident slot (or reject if occupied).
+
+        pending 연결에서 읽어 첫 완전한 메시지로 유형을 확정한다.
+        ``client == "hook"`` → 디스패치·ack·종료, 그 외 → 상주 자리로
+        승격 (자리가 차 있으면 거부).
+        """
+        sock = self._pending.get(fd)
+        if sock is None:
+            return
+        try:
+            chunk = sock.recv(4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            self._close_pending(fd)
+            return
+        if not chunk:
+            self._close_pending(fd)
+            return
+
+        self._pending_buffers[fd] += chunk
+        while b"\n" in self._pending_buffers[fd]:
+            line, self._pending_buffers[fd] = self._pending_buffers[fd].split(
+                b"\n", 1
+            )
+            if not line:
+                continue
+            try:
+                message = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # Same policy as the resident path: drop malformed frames.
+                # 상주 경로와 동일 정책 — 잘못된 프레임은 버린다.
+                debug_log.log(
+                    "SOCKET_RECV",
+                    "SYSTEM",
+                    {
+                        "direction": "wrapper<-pending",
+                        "dropped": True,
+                        "reason": "malformed_frame",
+                        "len": len(line),
+                    },
+                )
+                continue
+
+            if isinstance(message, dict) and message.get("client") == "hook":
+                self._settle_hook(fd, sock, message)
+            else:
+                self._settle_resident(fd, sock, message)
+            return
+
+    def _settle_hook(
+        self, fd: int, sock: socket.socket, message: dict[str, Any]
+    ) -> None:
+        """
+        Complete a short-lived exchange: dispatch the message, send the
+        ack, close the connection. Anything buffered past the first
+        message is discarded — the protocol is one message per connection.
+
+        단발 왕복을 완결한다: 메시지 디스패치 → ack 송신 → 연결 종료.
+        첫 메시지 이후 버퍼에 남은 데이터는 버린다 — 프로토콜은 연결당
+        메시지 1건이다.
+        """
+        debug_log.log(
+            "SOCKET_RECV",
+            "SYSTEM",
+            {
+                "direction": "wrapper<-hook",
+                "type": message.get("type"),
+                "action": message.get("action"),
+                "payload": message,
+            },
+        )
+        self._on_message(message)
+        try:
+            payload = (
+                json.dumps(_ACK_MESSAGE, ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+            sock.sendall(payload)
+        except OSError:
+            # The hook may have given up (its own timeout); the message was
+            # already dispatched, so there is nothing to roll back.
+            # hook 이 자체 타임아웃으로 먼저 떠났을 수 있다. 메시지는 이미
+            # 디스패치되었으므로 되돌릴 것이 없다.
+            pass
+        self._close_pending(fd)
+
+    def _settle_resident(
+        self, fd: int, sock: socket.socket, message: dict[str, Any]
+    ) -> None:
+        """
+        Promote a pending connection to the resident slot, or reject it if
+        the slot is occupied (single-resident policy).
+
+        pending 연결을 상주 자리로 승격하거나, 자리가 차 있으면 거부한다
+        (단일 상주 정책).
+        """
         if self._client_sock is not None:
-            # Single-client policy: drop the new connection so the existing
-            # MCP-wrapper session isn't disturbed.
-            # 단일 클라이언트 정책 — 기존 MCP-래퍼 세션을 흔들지 않도록 새
-            # 연결을 즉시 닫는다.
+            # Single-resident policy: drop the new connection so the
+            # existing MCP-wrapper session isn't disturbed.
+            # 단일 상주 정책 — 기존 MCP-래퍼 세션을 흔들지 않도록 새
+            # 연결을 닫는다.
             debug_log.log(
                 "SOCKET_REJECT",
                 "SYSTEM",
                 {"reason": "second_client_attempted"},
             )
-            try:
-                client.close()
-            except OSError:
-                pass
+            self._close_pending(fd)
             return
 
-        client.setblocking(False)
-        self._client_sock = client
-        self._read_buffer = b""
-        debug_log.log("SOCKET_ACCEPT", "SYSTEM", {"client_fd": client.fileno()})
+        # Carry over any bytes buffered past the first message so frames
+        # arriving in the same chunk aren't lost.
+        # 첫 메시지 뒤에 버퍼링된 바이트를 승계 — 같은 chunk 로 도착한
+        # 후속 프레임이 유실되지 않도록.
+        remainder = self._pending_buffers.pop(fd, b"")
+        del self._pending[fd]
+        self._client_sock = sock
+        self._read_buffer = remainder
+        debug_log.log(
+            "SOCKET_ACCEPT",
+            "SYSTEM",
+            {"client_fd": fd, "state": "resident"},
+        )
+        self._dispatch_resident_message(message)
+        self._drain_resident_buffer()
 
     def handle_client_readable(self) -> None:
         """
@@ -161,6 +333,14 @@ class WrapperSocketServer:
             return
 
         self._read_buffer += chunk
+        self._drain_resident_buffer()
+
+    def _drain_resident_buffer(self) -> None:
+        """
+        Parse and dispatch every complete line in the resident buffer.
+
+        상주 버퍼에 쌓인 완전한 라인을 모두 파싱해 디스패치한다.
+        """
         while b"\n" in self._read_buffer:
             line, self._read_buffer = self._read_buffer.split(b"\n", 1)
             if not line:
@@ -182,19 +362,22 @@ class WrapperSocketServer:
                     },
                 )
                 continue
-            debug_log.log(
-                "SOCKET_RECV",
-                "MCP_TOOL",
-                {
-                    "direction": "wrapper<-mcp",
-                    "type": message.get("type") if isinstance(message, dict) else None,
-                    "action": message.get("action")
-                    if isinstance(message, dict)
-                    else None,
-                    "payload": message,
-                },
-            )
-            self._on_message(message)
+            self._dispatch_resident_message(message)
+
+    def _dispatch_resident_message(self, message: Any) -> None:
+        debug_log.log(
+            "SOCKET_RECV",
+            "MCP_TOOL",
+            {
+                "direction": "wrapper<-mcp",
+                "type": message.get("type") if isinstance(message, dict) else None,
+                "action": message.get("action")
+                if isinstance(message, dict)
+                else None,
+                "payload": message,
+            },
+        )
+        self._on_message(message)
 
     # ----------------------------------------------------------------- Sender
     # 송신 ----------------------------------------------------------------------
@@ -240,3 +423,13 @@ class WrapperSocketServer:
             pass
         self._client_sock = None
         self._read_buffer = b""
+
+    def _close_pending(self, fd: int) -> None:
+        sock = self._pending.pop(fd, None)
+        self._pending_buffers.pop(fd, None)
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except OSError:
+            pass
