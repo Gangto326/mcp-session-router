@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from session_manager import debug_log
+from session_manager.models.config import DEFAULT_ROUTING_MODE
 from session_manager.routing.judge import HOOK_REPLY_TIMEOUT_SECS
 from session_manager.storage.file_store import (
     _CONFIG_FILENAME,
@@ -58,11 +59,10 @@ FIELD_TRANSCRIPT_PATH = "transcript_path"
 FIELD_CWD = "cwd"
 FIELD_PERMISSION_MODE = "permission_mode"
 
-# Default routing mode when config.json is absent or has no routing_mode
-# key. "confirm" is the Plan §1.4 default: propose, never auto-switch.
-# config.json 부재·routing_mode 키 부재 시의 기본 모드. "confirm"은
-# Plan §1.4의 기본값 — 제안만 하고 자동 전환하지 않는다.
-DEFAULT_ROUTING_MODE = "confirm"
+# The default routing mode ("confirm") is defined in models/config.py
+# and imported above — single source of truth with the Config model.
+# 기본 라우팅 모드("confirm")는 models/config.py 에 정의되어 있고 위에서
+# import 한다 — Config 모델과의 단일 출처.
 
 
 def _load_routing_mode(root: Path) -> str:

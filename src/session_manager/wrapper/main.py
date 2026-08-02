@@ -19,11 +19,19 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+from pathlib import Path
 
 from session_manager import debug_log
+from session_manager.hooks.registration import ensure_hook_registered
 from session_manager.wrapper.pty_wrapper import SessionManagerWrapper
 
 SOCKET_ENV_VAR = "SESSION_MANAGER_SOCKET"
+
+# ccode-only flag: skip the routing-hook registration check. Stripped
+# from the args passed on to Claude Code.
+# ccode 전용 플래그 — 라우팅 hook 등록 검사를 건너뛴다. Claude Code 에
+# 넘기는 인자에서는 제거된다.
+NO_HOOKS_FLAG = "--no-hooks"
 
 
 def _resolve_socket_path(project_path: str) -> str:
@@ -63,6 +71,9 @@ def main() -> int:
     # 경고 확인 창이 떴으며 API key 사용자는 아예 쓸 수 없었다. 이제 channels
     # 에 의존하는 것은 없다.
     claude_args = sys.argv[1:]
+    no_hooks = NO_HOOKS_FLAG in claude_args
+    if no_hooks:
+        claude_args = [a for a in claude_args if a != NO_HOOKS_FLAG]
     debug_log.log(
         "WRAPPER_BOOT",
         "SYSTEM",
@@ -70,9 +81,17 @@ def main() -> int:
             "project_path": project_path,
             "socket_path": socket_path,
             "claude_args": claude_args,
+            "no_hooks": no_hooks,
             "env": debug_log.mask_env(),
         },
     )
+
+    # Routing-hook registration check runs before the PTY takes over the
+    # terminal, while a plain input() prompt is still possible.
+    # 라우팅 hook 등록 검사는 PTY 가 터미널을 점유하기 전 — 평범한
+    # input() 프롬프트가 아직 가능한 시점 — 에 수행한다.
+    if not no_hooks:
+        ensure_hook_registered(Path(project_path))
 
     wrapper = SessionManagerWrapper(
         socket_path=socket_path,
