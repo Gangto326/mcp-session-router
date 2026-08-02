@@ -147,31 +147,18 @@ def _prefilter(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _request_judgment(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _socket_round_trip(request: dict[str, Any]) -> dict[str, Any] | None:
     """
-    One short-lived socket round-trip to the wrapper's judge host.
+    One short-lived socket exchange with the wrapper: send one message,
+    read one reply line. Returns the reply dict, or None on any failure
+    — no socket, refused connection, timeout, bad frame.
 
-    Sends a thin judge_request (prompt assembly happens wrapper-side)
-    and waits for the deferred reply. Returns the reply dict, or None
-    on any failure — no socket, refused connection, timeout, bad frame.
-
-    래퍼 판정 호스트로의 단발 소켓 왕복 1회.
-
-    얇은 judge_request 를 보내고 (프롬프트 조립은 래퍼 측 담당) 지연
-    회신을 기다린다. 실패 시 None — 소켓 부재·연결 거부·타임아웃·깨진
-    프레임 전부.
+    래퍼와의 단발 소켓 왕복 1회: 메시지 1건 송신, 회신 1줄 수신. 실패 시
+    None — 소켓 부재·연결 거부·타임아웃·깨진 프레임 전부.
     """
     socket_path = os.environ.get(_SOCKET_ENV_VAR, "").strip()
     if not socket_path:
         return None
-    request = {
-        "client": "hook",
-        "action": "judge_request",
-        "prompt": payload.get(FIELD_PROMPT),
-        "session_id": payload.get(FIELD_SESSION_ID),
-        "transcript_path": payload.get(FIELD_TRANSCRIPT_PATH),
-        "cwd": payload.get(FIELD_CWD),
-    }
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(HOOK_REPLY_TIMEOUT_SECS)
@@ -195,25 +182,209 @@ def _request_judgment(payload: dict[str, Any]) -> dict[str, Any] | None:
     return reply if isinstance(reply, dict) else None
 
 
+def _request_judgment(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Ask the wrapper's judge host for a routing verdict.
+
+    The request is thin — prompt assembly happens wrapper-side.
+
+    래퍼 판정 호스트에 라우팅 판정을 요청한다. 요청은 얇다 — 프롬프트
+    조립은 래퍼 측 담당.
+    """
+    return _socket_round_trip(
+        {
+            "client": "hook",
+            "action": "judge_request",
+            "prompt": payload.get(FIELD_PROMPT),
+            "session_id": payload.get(FIELD_SESSION_ID),
+            "transcript_path": payload.get(FIELD_TRANSCRIPT_PATH),
+            "cwd": payload.get(FIELD_CWD),
+        }
+    )
+
+
+def _calibrated_auto_threshold() -> float | None:
+    """
+    Confidence threshold for auto-switching, derived from the judgment
+    log's (confidence, accept/reject) history.
+
+    LLM confidence is uncalibrated, so no fixed threshold is used (rule
+    8). A later phase computes this from accumulated logs (smallest
+    confidence whose historical acceptance rate clears the target with
+    Wilson-bound sample sufficiency). Until that exists there is no
+    defensible threshold — returning None makes auto mode degrade to the
+    confirm path, i.e. auto only truly activates once data has
+    accumulated.
+
+    자동 전환용 confidence 임계 — 판정 로그의 (confidence, 수용/거부)
+    이력에서 산출한다.
+
+    LLM confidence 는 보정되지 않은 값이므로 고정 임계를 쓰지 않는다
+    (규칙 8). 후속 Phase 가 누적 로그에서 임계를 산출한다 (과거 수용률이
+    목표치를 넘는 최소 confidence, Wilson 하한으로 표본 충분성 판정).
+    그 전까지는 옹호 가능한 임계가 없다 — None 반환으로 auto 모드는
+    confirm 경로로 완화된다. 즉 auto 는 데이터가 쌓여야 실제로 켜진다.
+    """
+    return None
+
+
+# Confirm-path instruction templates. Wording follows Plan.md R2-C4
+# verbatim, except the reject_switch clause (that tool arrives in a
+# later phase) — until then "keep" asks for no tool call.
+# confirm 경로 지시 템플릿. 문구는 Plan.md R2-C4 원문을 따르되,
+# reject_switch 절만 예외 (해당 도구는 후속 Phase 에서 추가) — 그 전까지
+# "유지" 선택은 도구 호출 없음으로 지시한다.
+_CONFIRM_SWITCH_TEMPLATE = (
+    "[session-manager 라우터] 판정: {target}으로의 전환이 적합 (근거: {evidence}). "
+    "AskUserQuestion으로 사용자에게 [전환 / 현재 세션 유지]를 물은 뒤, "
+    "전환 선택 시 session_switch를 호출하라. 유지 선택 시 아무 도구도 호출하지 마라."
+)
+_CONFIRM_NEW_TEMPLATE = (
+    "[session-manager 라우터] 판정: 이 프롬프트는 기존 세션들의 소관이 아니다 "
+    "(사유: {reason}). AskUserQuestion으로 사용자에게 [새 세션 생성 / 현재 세션 유지]를 "
+    "물은 뒤, 생성 선택 시 session_create를 호출하라. 유지 선택 시 아무 도구도 "
+    "호출하지 마라."
+)
+
+
+def _emit_confirm_context(verdict: dict[str, Any]) -> None:
+    """
+    Hand the verdict to the main LLM as additionalContext (measured
+    delivery path: docs/poc/R2-hook.md §9.4). The LLM asks the user and
+    calls session_switch / session_create on acceptance.
+
+    판정을 additionalContext 로 메인 LLM 에 전달한다 (전달 경로 실측:
+    docs/poc/R2-hook.md §9.4). LLM 이 사용자에게 묻고 수락 시
+    session_switch / session_create 를 호출한다.
+    """
+    if verdict.get("action") == "SWITCH":
+        context = _CONFIRM_SWITCH_TEMPLATE.format(
+            target=verdict.get("target"),
+            evidence=verdict.get("evidence"),
+        )
+    else:
+        context = _CONFIRM_NEW_TEMPLATE.format(reason=verdict.get("reason"))
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def _execute_auto_switch(
+    payload: dict[str, Any], verdict: dict[str, Any]
+) -> bool:
+    """
+    Auto path: hand the switch to the wrapper, then block the prompt.
+
+    Order matters — the block is only emitted after the wrapper ack'd
+    the route_switch message. Blocking without a wrapper on the other
+    side would swallow the prompt with nobody left to re-inject it.
+    Returns True iff the block was emitted.
+
+    자동 경로: 전환을 래퍼에 위임한 뒤 프롬프트를 차단한다.
+
+    순서가 중요하다 — block 은 래퍼가 route_switch 메시지를 ack 한
+    뒤에만 낸다. 반대편에 래퍼가 없는 채로 차단하면 재주입할 주체 없이
+    프롬프트만 삼켜진다. block 을 냈을 때만 True 를 반환한다.
+    """
+    reply = _socket_round_trip(
+        {
+            "client": "hook",
+            "action": "route_switch",
+            "target": verdict.get("target"),
+            "user_prompt": payload.get(FIELD_PROMPT),
+            "session_id": payload.get(FIELD_SESSION_ID),
+            "verdict": verdict,
+        }
+    )
+    if reply is None or reply.get("type") != "ack":
+        return False
+    reason = (
+        f"⇄ {verdict.get('target')} 세션으로 전환합니다 "
+        f"(라우터 자동 전환 — 근거: {verdict.get('evidence')})"
+    )
+    print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
+    return True
+
+
 def _route(payload: dict[str, Any]) -> None:
     """
-    Judgment stage: ask the wrapper's resident judge over the socket.
+    Judgment stage: ask the resident judge, then act on the verdict.
 
-    The verdict is only recorded for now — acting on it (block and
-    switch) is the next commit. Every outcome, including failure, exits
-    through the caller with code 0.
+    STAY/ASK pass through. SWITCH/NEW go to the confirm path
+    (additionalContext → the LLM asks the user) by default; the auto
+    path (block + wrapper switch + re-injection) engages only in auto
+    mode once a calibrated threshold exists. Every outcome exits through
+    the caller with code 0.
 
-    판정 단계: 소켓 너머 래퍼의 상주 판정기에 묻는다.
+    판정 단계: 상주 판정기에 물은 뒤 판정에 따라 행동한다.
 
-    현재는 판정 결과를 기록만 한다 — 결과에 따른 실행(block·전환)은
-    다음 커밋이다. 실패를 포함한 모든 결과가 호출자에서 exit 0 으로
-    끝난다.
+    STAY/ASK 는 통과. SWITCH/NEW 는 기본적으로 confirm 경로
+    (additionalContext → LLM 이 사용자에게 질문)로 가고, 자동 경로
+    (block + 래퍼 전환 + 재주입)는 auto 모드에서 보정 임계가 존재할
+    때만 발동한다. 모든 결과가 호출자에서 exit 0 으로 끝난다.
     """
     reply = _request_judgment(payload)
     debug_log.log(
         "HOOK_ROUTE",
         "SYSTEM",
         {"reply": reply},
+        conv_id=payload.get(FIELD_SESSION_ID),
+    )
+    if reply is None or not reply.get("ok"):
+        return
+    verdict = reply.get("verdict")
+    if not isinstance(verdict, dict):
+        return
+    action = verdict.get("action")
+    if action not in ("SWITCH", "NEW"):
+        # STAY passes silently. ASK also passes for now: the two-stage
+        # re-judgment it feeds is defined over session profiles, which
+        # nothing populates yet.
+        # STAY 는 조용히 통과. ASK 도 당분간 통과 — ASK 가 잇는 2단
+        # 재판정은 세션 profile 위에 정의되는데 아직 아무도 채우지 않는다.
+        return
+
+    cwd = payload.get(FIELD_CWD)
+    root = (
+        Path(cwd) / _SESSION_MANAGER_DIRNAME
+        if isinstance(cwd, str) and cwd
+        else None
+    )
+    mode = _load_routing_mode(root) if root is not None else DEFAULT_ROUTING_MODE
+
+    if mode == "auto" and action == "SWITCH":
+        threshold = _calibrated_auto_threshold()
+        confidence = verdict.get("confidence")
+        if (
+            threshold is not None
+            and isinstance(confidence, int | float)
+            and confidence >= threshold
+            and _execute_auto_switch(payload, verdict)
+        ):
+            debug_log.log(
+                "HOOK_ROUTE",
+                "SYSTEM",
+                {"path": "auto_block", "verdict": verdict},
+                conv_id=payload.get(FIELD_SESSION_ID),
+            )
+            return
+    # NEW never auto-switches: creating a session needs a name decision,
+    # which stays with the user/LLM in the confirm flow.
+    # NEW 는 자동 전환하지 않는다 — 세션 생성은 이름 결정이 필요하고,
+    # 그것은 confirm 흐름의 사용자·LLM 몫이다.
+    _emit_confirm_context(verdict)
+    debug_log.log(
+        "HOOK_ROUTE",
+        "SYSTEM",
+        {"path": "confirm_context", "verdict": verdict},
         conv_id=payload.get(FIELD_SESSION_ID),
     )
 

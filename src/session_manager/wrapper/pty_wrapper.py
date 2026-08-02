@@ -1201,6 +1201,26 @@ class SessionManagerWrapper:
             user_prompt_val = handoff.get("user_prompt", "")
             user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
             self._handle_new(rename_current, new_session_name, handoff, user_prompt)
+        elif action == "route_switch":
+            # Auto-routing path (R2): the hook blocked the prompt and
+            # delegated the switch here. The hook doesn't know session
+            # names, so the departing side comes from the wrapper's own
+            # current-session mirror.
+            # 자동 라우팅 경로 (R2): hook 이 프롬프트를 차단하고 전환을
+            # 여기에 위임했다. hook 은 세션 이름을 모르므로, 떠나는 쪽은
+            # 래퍼 자신의 현재 세션 미러에서 채운다.
+            target = message.get("target")
+            if not isinstance(target, str) or not target:
+                return
+            user_prompt_val = message.get("user_prompt", "")
+            user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
+            verdict = message.get("verdict")
+            handoff = {"from": self._current_session_name}
+            if isinstance(verdict, dict):
+                reason = verdict.get("reason")
+                if isinstance(reason, str) and reason:
+                    handoff["router_reason"] = reason
+            self._handle_switch(target, handoff, user_prompt)
         elif action == "current_session":
             # MCP resolved or changed the current session. The wrapper has
             # no other way to learn it — the handshake only flows
@@ -1291,6 +1311,35 @@ class SessionManagerWrapper:
             },
         )
 
+    def _resolve_resume_arg(self, target: str) -> str:
+        """
+        Resolve what to pass to ``/resume``: the target session's latest
+        conversation id when one is recorded, else the session name.
+
+        Measured semantics (docs/poc/R2-hook.md §7): a conversation uuid
+        resumes directly; a name only matches when a ``/rename`` made
+        the conversation title equal it, otherwise the picker opens and
+        the injection stalls on user input. The id makes every path
+        deterministic.
+
+        ``/resume`` 에 넘길 인자를 결정한다: 대상 세션에 기록된 최신
+        conversation id 가 있으면 그것, 없으면 세션 이름.
+
+        실측 의미론 (docs/poc/R2-hook.md §7): conversation uuid 는 직행
+        재개되고, 이름은 ``/rename`` 으로 대화 title 이 일치할 때만
+        매칭된다 — 아니면 picker 가 열려 주입이 사용자 입력에 멈춘다.
+        id 를 쓰면 전 경로가 결정적이다.
+        """
+        try:
+            session = SessionStore(Path(self.project_path)).load_session_by_name(
+                target
+            )
+        except Exception:
+            session = None
+        if session is not None and session.claude_conversation_ids:
+            return session.claude_conversation_ids[-1]
+        return target
+
     def _advance_switch(self, pending: _PendingAction) -> None:
         if pending.stage == "await_resume_prompt":
             # First prompt after the LLM finished its turn — start filtering
@@ -1300,7 +1349,7 @@ class SessionManagerWrapper:
             # 주입이 사용자에게 보이지 않게 한 뒤 주입. 제출은
             # await_resume_submit으로 지연.
             self.mode = "filtering"
-            self._inject_text(f"/resume {pending.target}")
+            self._inject_text(f"/resume {self._resolve_resume_arg(pending.target)}")
             self._set_stage(pending, "await_resume_submit")
         elif pending.stage == "await_resume_submit":
             self._submit()
