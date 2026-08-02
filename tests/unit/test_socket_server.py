@@ -227,6 +227,112 @@ class TestHookConnection:
         finally:
             server.stop()
 
+    def test_hook_deferred_reply_transfers_ownership(
+        self, socket_path: str
+    ) -> None:
+        # on_hook_message 가 True 를 반환하면 서버는 fd 를 잊고, 새
+        # 소유자가 직접 회신·닫기를 수행한다 (지연 회신 유형)
+        taken: list[tuple[dict, socket.socket]] = []
+
+        def take(message: dict, sock: socket.socket) -> bool:
+            taken.append((message, sock))
+            return True
+
+        server = WrapperSocketServer(
+            socket_path, on_message=lambda _: None, on_hook_message=take
+        )
+        server.start()
+        try:
+            hook = _connect(socket_path)
+            server.handle_listen_readable()
+            hook.sendall(b'{"client":"hook","action":"judge_request"}\n')
+            server.handle_pending_readable(server.pending_filenos[0])
+
+            assert len(taken) == 1
+            assert taken[0][0]["action"] == "judge_request"
+            assert server.pending_filenos == []
+
+            # 새 소유자가 회신을 보내면 hook 클라이언트가 수신할 수 있다
+            owner_sock = taken[0][1]
+            owner_sock.settimeout(2.0)
+            owner_sock.sendall(b'{"action":"STAY"}\n')
+            assert hook.recv(4096) == b'{"action":"STAY"}\n'
+            owner_sock.close()
+            assert hook.recv(4096) == b""
+            hook.close()
+        finally:
+            server.stop()
+
+    def test_hook_dispatcher_declines_falls_back_to_ack(
+        self, socket_path: str
+    ) -> None:
+        # on_hook_message 가 False 를 반환하면 기본 경로 (on_message +
+        # ack + 종료) 로 처리된다
+        received: list[dict] = []
+        server = WrapperSocketServer(
+            socket_path,
+            on_message=received.append,
+            on_hook_message=lambda _m, _s: False,
+        )
+        server.start()
+        try:
+            hook = _connect(socket_path)
+            server.handle_listen_readable()
+            hook.sendall(b'{"client":"hook","n":7}\n')
+            server.handle_pending_readable(server.pending_filenos[0])
+
+            assert received == [{"client": "hook", "n": 7}]
+            assert data_is_ack(hook.recv(4096))
+            assert hook.recv(4096) == b""
+            hook.close()
+        finally:
+            server.stop()
+
+    def test_hook_dispatcher_exception_closes_without_ack(
+        self, socket_path: str
+    ) -> None:
+        received: list[dict] = []
+
+        def boom(_message: dict, _sock: socket.socket) -> bool:
+            raise RuntimeError("dispatcher crashed")
+
+        server = WrapperSocketServer(
+            socket_path, on_message=received.append, on_hook_message=boom
+        )
+        server.start()
+        try:
+            hook = _connect(socket_path)
+            server.handle_listen_readable()
+            hook.sendall(b'{"client":"hook"}\n')
+            server.handle_pending_readable(server.pending_filenos[0])
+
+            # ack 없이 즉시 EOF — on_message 로의 이중 디스패치도 없다
+            assert hook.recv(4096) == b""
+            assert received == []
+            assert server.pending_filenos == []
+            hook.close()
+        finally:
+            server.stop()
+
+    def test_resident_message_does_not_hit_hook_dispatcher(
+        self, socket_path: str
+    ) -> None:
+        hook_calls: list[dict] = []
+        received: list[dict] = []
+        server = WrapperSocketServer(
+            socket_path,
+            on_message=received.append,
+            on_hook_message=lambda m, _s: bool(hook_calls.append(m)) or True,
+        )
+        server.start()
+        try:
+            client = _connect_resident(server, socket_path)
+            assert received == [{"type": "handshake_request"}]
+            assert hook_calls == []
+            client.close()
+        finally:
+            server.stop()
+
     def test_hook_works_while_resident_connected(self, socket_path: str) -> None:
         received: list[dict] = []
         server = WrapperSocketServer(socket_path, on_message=received.append)
