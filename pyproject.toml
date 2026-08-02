@@ -12,6 +12,7 @@ dependencies = [
 [project.scripts]
 ccode = "session_manager.wrapper.main:main"
 ccode-hook-user-prompt-submit = "session_manager.hooks.user_prompt_submit:main"
+ccode-hook-pre-tool-use = "session_manager.hooks.pre_tool_use:main"
 
 [build-system]
 requires = ["hatchling"]

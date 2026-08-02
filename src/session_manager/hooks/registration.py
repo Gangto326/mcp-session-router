@@ -47,12 +47,24 @@ from session_manager.storage.file_store import (
 # Console-script name registered in pyproject [project.scripts].
 # pyproject [project.scripts] 에 등록된 콘솔 스크립트 이름.
 HOOK_SCRIPT_NAME = "ccode-hook-user-prompt-submit"
+PRE_TOOL_USE_SCRIPT_NAME = "ccode-hook-pre-tool-use"
+
+# All hooks ccode manages: (event name, matcher or None, script name).
+# One consent covers the set; a partially-registered project only gets
+# the missing entries appended.
+# ccode 가 관리하는 hook 전체: (이벤트명, matcher 또는 None, 스크립트명).
+# 동의 한 번이 세트 전체를 커버하고, 일부만 등록된 프로젝트에는 빠진
+# 항목만 추가된다.
+MANAGED_HOOKS: tuple[tuple[str, str | None, str], ...] = (
+    ("UserPromptSubmit", None, HOOK_SCRIPT_NAME),
+    ("PreToolUse", "Read|Bash", PRE_TOOL_USE_SCRIPT_NAME),
+)
 
 _SETTINGS_RELPATH = Path(".claude") / "settings.json"
 _DECLINED_KEY = "hook_registration_declined"
 
 _CONSENT_PROMPT = (
-    "session-manager: 프롬프트 라우팅을 위해 UserPromptSubmit hook 을 "
+    "session-manager: 프롬프트 라우팅과 transcript 가드를 위해 hook 을 "
     ".claude/settings.json 에 등록할까요? [y/N] "
 )
 
@@ -75,11 +87,13 @@ def _load_settings(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _already_registered(settings: dict[str, Any]) -> bool:
+def _event_has_script(
+    settings: dict[str, Any], event: str, script_name: str
+) -> bool:
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
         return False
-    entries = hooks.get("UserPromptSubmit")
+    entries = hooks.get(event)
     if not isinstance(entries, list):
         return False
     for entry in entries:
@@ -87,9 +101,23 @@ def _already_registered(settings: dict[str, Any]) -> bool:
             continue
         for hook in entry.get("hooks", []) or []:
             command = hook.get("command") if isinstance(hook, dict) else None
-            if isinstance(command, str) and HOOK_SCRIPT_NAME in command:
+            if isinstance(command, str) and script_name in command:
                 return True
     return False
+
+
+def _missing_hooks(
+    settings: dict[str, Any],
+) -> list[tuple[str, str | None, str]]:
+    """Return the managed hooks not yet present in settings.
+
+    settings 에 아직 없는 관리 대상 hook 목록을 반환한다.
+    """
+    return [
+        spec
+        for spec in MANAGED_HOOKS
+        if not _event_has_script(settings, spec[0], spec[2])
+    ]
 
 
 def _config_path(project_path: Path) -> Path:
@@ -132,15 +160,26 @@ def _record_declined(project_path: Path) -> None:
         pass
 
 
-def _register(settings: dict[str, Any], command: str, path: Path) -> None:
-    """Append our hook entry (measured format, PoC §5) and write.
+def _register(
+    settings: dict[str, Any],
+    missing: list[tuple[str, str | None, str]],
+    commands: dict[str, str],
+    path: Path,
+) -> None:
+    """Append the missing hook entries (measured format, PoC §5/§10) and write.
 
-    실측 형식 (PoC §5) 으로 hook 항목을 추가하고 저장한다. 기존 항목은
-    전부 보존된다.
+    빠진 hook 항목들을 실측 형식 (PoC §5/§10) 으로 추가하고 저장한다.
+    기존 항목은 전부 보존된다.
     """
     hooks = settings.setdefault("hooks", {})
-    entries = hooks.setdefault("UserPromptSubmit", [])
-    entries.append({"hooks": [{"type": "command", "command": command}]})
+    for event, matcher, script_name in missing:
+        entries = hooks.setdefault(event, [])
+        entry: dict[str, Any] = {
+            "hooks": [{"type": "command", "command": commands[script_name]}]
+        }
+        if matcher is not None:
+            entry = {"matcher": matcher, **entry}
+        entries.append(entry)
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(path, json.dumps(settings, ensure_ascii=False, indent=2))
 
@@ -167,22 +206,30 @@ def ensure_hook_registered(
             )
             _log("broken_settings")
             return "broken_settings"
-        if _already_registered(settings):
+        missing = _missing_hooks(settings)
+        if not missing:
             _log("already_registered")
             return "already_registered"
         if _was_declined(project_path):
             _log("declined_previously")
             return "declined_previously"
 
-        command = shutil.which(HOOK_SCRIPT_NAME)
-        if command is None:
-            print(
-                f"session-manager: '{HOOK_SCRIPT_NAME}' 스크립트를 PATH 에서 "
-                "찾지 못해 라우팅 hook 등록을 건너뜁니다.",
-                file=sys.stderr,
-            )
-            _log("script_not_found")
-            return "script_not_found"
+        # All managed scripts install together — one unresolvable script
+        # signals a broken install, so skip the whole set.
+        # 관리 스크립트들은 함께 설치된다 — 하나라도 해석 불가면 설치가
+        # 깨진 것이므로 세트 전체를 건너뛴다.
+        commands: dict[str, str] = {}
+        for _event, _matcher, script_name in missing:
+            command = shutil.which(script_name)
+            if command is None:
+                print(
+                    f"session-manager: '{script_name}' 스크립트를 PATH 에서 "
+                    "찾지 못해 hook 등록을 건너뜁니다.",
+                    file=sys.stderr,
+                )
+                _log("script_not_found", script=script_name)
+                return "script_not_found"
+            commands[script_name] = command
 
         if ask_user is None:
             if not sys.stdin.isatty():
@@ -201,9 +248,9 @@ def ensure_hook_registered(
             _log("declined")
             return "declined"
 
-        _register(settings, command, settings_path)
-        print("session-manager: 라우팅 hook 을 등록했습니다.")
-        _log("registered", command=command)
+        _register(settings, missing, commands, settings_path)
+        print("session-manager: hook 을 등록했습니다.")
+        _log("registered", events=[m[0] for m in missing])
         return "registered"
     except Exception as exc:
         # Registration is a convenience — a bug here must never stop ccode.
