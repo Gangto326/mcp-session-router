@@ -13,6 +13,9 @@ graceful degradation 계약 (어떤 오염 입력도 exit 0)과 결정적 프리
 from __future__ import annotations
 
 import json
+import socket
+import threading
+import uuid
 from pathlib import Path
 
 import pytest
@@ -146,6 +149,80 @@ class TestRoutingModeLoad:
         root.mkdir()
         (root / "config.json").write_text("{oops", encoding="utf-8")
         assert hook._load_routing_mode(root) == "confirm"
+
+
+class TestRequestJudgment:
+    @pytest.fixture
+    def hook_socket(self) -> str:
+        return f"/tmp/test-hook-{uuid.uuid4().hex[:8]}.sock"
+
+    def _serve_once(self, path: str, reply: bytes) -> threading.Thread:
+        """
+        Minimal one-shot server standing in for the wrapper socket.
+
+        래퍼 소켓을 대신하는 최소 단발 서버.
+        """
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def serve() -> None:
+            conn, _ = server.accept()
+            buffer = b""
+            while b"\n" not in buffer:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+            if reply:
+                conn.sendall(reply)
+            conn.close()
+            server.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return thread
+
+    def test_round_trip_returns_reply(
+        self, hook_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        thread = self._serve_once(
+            hook_socket, b'{"ok": true, "verdict": {"action": "STAY"}}\n'
+        )
+        monkeypatch.setenv("SESSION_MANAGER_SOCKET", hook_socket)
+        reply = hook._request_judgment(
+            {"prompt": "p", "session_id": "c", "transcript_path": "t", "cwd": "/x"}
+        )
+        thread.join(timeout=2)
+        assert reply == {"ok": True, "verdict": {"action": "STAY"}}
+
+    def test_no_env_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SESSION_MANAGER_SOCKET", raising=False)
+        assert hook._request_judgment({"prompt": "p"}) is None
+
+    def test_no_server_returns_none(
+        self, hook_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SESSION_MANAGER_SOCKET", hook_socket)
+        assert hook._request_judgment({"prompt": "p"}) is None
+
+    def test_server_closes_without_reply_returns_none(
+        self, hook_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        thread = self._serve_once(hook_socket, b"")
+        monkeypatch.setenv("SESSION_MANAGER_SOCKET", hook_socket)
+        assert hook._request_judgment({"prompt": "p"}) is None
+        thread.join(timeout=2)
+
+    def test_malformed_reply_returns_none(
+        self, hook_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        thread = self._serve_once(hook_socket, b"not json\n")
+        monkeypatch.setenv("SESSION_MANAGER_SOCKET", hook_socket)
+        assert hook._request_judgment({"prompt": "p"}) is None
+        thread.join(timeout=2)
 
 
 class TestRun:

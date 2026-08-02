@@ -1285,3 +1285,89 @@ class TestSpawnEnvIsolation:
         assert env["CLAUDE_CODE_SESSION_ID"] == "parent-sid"
         assert env["SESSION_MANAGER_SOCKET"] == "/tmp/x.sock"
         assert env["ANTHROPIC_API_KEY"] == "sk-test"
+
+
+class TestJudgeWiring:
+    """Wrapper-side wiring of the routing judge (R2-C3).
+
+    라우팅 판정기의 래퍼 측 연결 (R2-C3) 테스트.
+    """
+
+    def test_judge_request_routed_to_judge_host(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[dict, object]] = []
+        monkeypatch.setattr(
+            wrapper.judge_host,
+            "handle_request",
+            lambda message, sock: bool(calls.append((message, sock))) or True,
+        )
+        fake_sock = object()
+        message = {"client": "hook", "action": "judge_request", "prompt": "p"}
+        assert wrapper._handle_hook_message(message, fake_sock) is True
+        assert calls == [(message, fake_sock)]
+
+    def test_other_hook_messages_fall_back_to_ack(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        assert (
+            wrapper._handle_hook_message(
+                {"client": "hook", "action": "route_switch"}, object()
+            )
+            is False
+        )
+
+    def _seed_two_sessions(self, wrapper: SessionManagerWrapper) -> None:
+        store = SessionStore(Path(wrapper.project_path))
+        store.init_project()
+        store.save_session(SessionMetadata.new(name="a", title="A"))
+        store.save_session(SessionMetadata.new(name="b", title="B"))
+
+    def test_judge_starts_when_routable(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._seed_two_sessions(wrapper)
+        started: list[bool] = []
+        monkeypatch.setattr(
+            wrapper.judge_host, "ensure_started", lambda: started.append(True)
+        )
+        wrapper._maybe_start_judge()
+        assert started == [True]
+
+    def test_judge_not_started_below_two_sessions(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        started: list[bool] = []
+        monkeypatch.setattr(
+            wrapper.judge_host, "ensure_started", lambda: started.append(True)
+        )
+        wrapper._maybe_start_judge()
+        assert started == []
+
+    def test_judge_not_started_when_routing_off(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._seed_two_sessions(wrapper)
+        config_path = (
+            Path(wrapper.project_path) / ".session-manager" / "config.json"
+        )
+        config_path.write_text(
+            json.dumps({"routing_mode": "off"}), encoding="utf-8"
+        )
+        started: list[bool] = []
+        monkeypatch.setattr(
+            wrapper.judge_host, "ensure_started", lambda: started.append(True)
+        )
+        wrapper._maybe_start_judge()
+        assert started == []
+
+    def test_mcp_signal_rechecks_judge_start(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._seed_two_sessions(wrapper)
+        started: list[bool] = []
+        monkeypatch.setattr(
+            wrapper.judge_host, "ensure_started", lambda: started.append(True)
+        )
+        wrapper._handle_mcp_signal({"action": "current_session", "name": "a"})
+        assert started == [True]
