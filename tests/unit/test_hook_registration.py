@@ -20,6 +20,7 @@ import pytest
 from session_manager.hooks import registration
 
 FAKE_COMMAND = "/opt/bin/ccode-hook-user-prompt-submit"
+FAKE_GUARD_COMMAND = "/opt/bin/ccode-hook-pre-tool-use"
 
 
 @pytest.fixture
@@ -30,7 +31,7 @@ def project(tmp_path: Path) -> Path:
 @pytest.fixture
 def which_found(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        registration.shutil, "which", lambda _name: FAKE_COMMAND
+        registration.shutil, "which", lambda name: f"/opt/bin/{name}"
     )
 
 
@@ -55,10 +56,47 @@ class TestRegister:
         )
         assert status == "registered"
         settings = _read_settings(project)
-        # P2-e 실측 형식 (docs/poc/R2-hook.md §5)
+        # P2-e·§10 실측 형식 (docs/poc/R2-hook.md)
         assert settings["hooks"]["UserPromptSubmit"] == [
             {"hooks": [{"type": "command", "command": FAKE_COMMAND}]}
         ]
+        assert settings["hooks"]["PreToolUse"] == [
+            {
+                "matcher": "Read|Bash",
+                "hooks": [{"type": "command", "command": FAKE_GUARD_COMMAND}],
+            }
+        ]
+
+    def test_partial_registration_adds_only_missing(
+        self, project: Path, which_found: None
+    ) -> None:
+        # UserPromptSubmit 만 등록된 상태 → PreToolUse 만 추가돼야 한다
+        _settings_path(project).parent.mkdir(parents=True)
+        existing = {
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"/x/{registration.HOOK_SCRIPT_NAME}",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        _settings_path(project).write_text(
+            json.dumps(existing), encoding="utf-8"
+        )
+
+        status = registration.ensure_hook_registered(
+            project, ask_user=lambda _p: "y"
+        )
+        assert status == "registered"
+        settings = _read_settings(project)
+        assert len(settings["hooks"]["UserPromptSubmit"]) == 1
+        assert settings["hooks"]["PreToolUse"][0]["matcher"] == "Read|Bash"
 
     def test_preserves_existing_settings(
         self, project: Path, which_found: None
@@ -83,13 +121,19 @@ class TestRegister:
         assert status == "registered"
         settings = _read_settings(project)
         assert settings["permissions"] == {"allow": ["Bash(ls:*)"]}
-        assert len(settings["hooks"]["PreToolUse"]) == 1
         commands = [
             h["command"]
             for entry in settings["hooks"]["UserPromptSubmit"]
             for h in entry["hooks"]
         ]
         assert commands == ["other-hook", FAKE_COMMAND]
+        # 기존 PreToolUse 항목은 보존되고 우리 가드가 뒤에 추가된다
+        guard_commands = [
+            h["command"]
+            for entry in settings["hooks"]["PreToolUse"]
+            for h in entry["hooks"]
+        ]
+        assert guard_commands == ["x", FAKE_GUARD_COMMAND]
 
     def test_already_registered_leaves_file_untouched(
         self, project: Path, which_found: None
@@ -107,7 +151,20 @@ class TestRegister:
                                 }
                             ]
                         }
-                    ]
+                    ],
+                    "PreToolUse": [
+                        {
+                            "matcher": "Read|Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        f"/x/{registration.PRE_TOOL_USE_SCRIPT_NAME}"
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
                 }
             }
         )
