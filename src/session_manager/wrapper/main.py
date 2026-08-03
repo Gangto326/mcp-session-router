@@ -34,13 +34,34 @@ SOCKET_ENV_VAR = "SESSION_MANAGER_SOCKET"
 NO_HOOKS_FLAG = "--no-hooks"
 
 
+# AF_UNIX sun_path limit is 104 bytes on macOS (108 on Linux). Engineering
+# parameter: use the smaller platform limit minus a 4-byte margin.
+# AF_UNIX sun_path 한계는 macOS 104바이트 (Linux 108). 공학 파라미터 —
+# 더 작은 플랫폼 한계에서 4바이트 여유를 뺀 값.
+_SOCKET_PATH_MAX_BYTES = 100
+
+
 def _resolve_socket_path(project_path: str) -> str:
-    # Short hash keeps the path well under the AF_UNIX 108-byte limit while
-    # still giving a per-project namespace.
-    # 짧은 해시로 프로젝트별 네임스페이스를 확보하면서도 AF_UNIX 의 108바이트
-    # 경로 제한을 여유 있게 지킨다.
+    # Short hash keeps the path short while giving a per-project namespace.
+    # The socket lives under the user's home (F17): /tmp is world-readable,
+    # so on multi-user machines any user could connect and drive the
+    # wrapper (switch signals, judge requests). A 0700 run dir plus the
+    # socket's own 0600 (set at bind) closes that. Pathologically long
+    # home paths fall back to /tmp — the 0600 socket mode still applies.
+    # 짧은 해시로 프로젝트별 네임스페이스를 확보한다. 소켓은 사용자 홈
+    # 아래에 둔다 (F17): /tmp 는 모두가 접근 가능해 다중 사용자 머신에서
+    # 타 사용자가 connect 해 래퍼를 조종(전환 신호·판정 요청)할 수 있다.
+    # 0700 run 디렉토리 + 소켓 자체 0600 (bind 시 설정) 으로 차단한다.
+    # 비정상적으로 긴 홈 경로만 /tmp 로 폴백 — 그 경우에도 0600 은 적용.
     project_hash = hashlib.md5(project_path.encode("utf-8")).hexdigest()[:12]
-    return f"/tmp/session-manager-{project_hash}.sock"
+    sock_name = f"session-manager-{project_hash}.sock"
+    run_dir = Path.home() / ".session-manager" / "run"
+    candidate = run_dir / sock_name
+    if len(str(candidate).encode("utf-8")) <= _SOCKET_PATH_MAX_BYTES:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(run_dir, 0o700)
+        return str(candidate)
+    return f"/tmp/{sock_name}"
 
 
 def main() -> int:

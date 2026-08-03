@@ -135,6 +135,11 @@ class WrapperSocketServer:
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(self.socket_path)
+        # Owner-only, regardless of umask (F17): on multi-user machines a
+        # world-connectable socket would let any user drive the wrapper.
+        # umask 와 무관하게 소유자 전용 (F17) — 다중 사용자 머신에서 아무나
+        # connect 가능한 소켓은 래퍼 조종을 허용하게 된다.
+        os.chmod(self.socket_path, 0o600)
         sock.listen(_LISTEN_BACKLOG)
         sock.setblocking(False)
         self._listen_sock = sock
