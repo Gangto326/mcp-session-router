@@ -6,39 +6,73 @@ ccode 진입점 단위 테스트.
 
 from __future__ import annotations
 
+import stat
 import sys
+from pathlib import Path
 
 import pytest
 
 from session_manager.wrapper.main import _resolve_socket_path, main
 
 
+@pytest.fixture
+def fake_home(monkeypatch: pytest.MonkeyPatch) -> Path:
+    # _resolve_socket_path 는 홈 아래 run 디렉토리를 만든다 — 실제 홈을
+    # 건드리지 않도록 격리. macOS pytest tmp_path 는 100바이트 한계를
+    # 넘겨 /tmp 폴백이 발동해 버리므로 짧은 경로를 직접 만든다.
+    import shutil
+    import uuid
+
+    home = Path(f"/tmp/test-home-{uuid.uuid4().hex[:8]}")
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    yield home
+    shutil.rmtree(home, ignore_errors=True)
+
+
 class TestResolveSocketPath:
-    def test_starts_with_tmp_prefix(self) -> None:
+    def test_lives_under_home_run_dir(self, fake_home: Path) -> None:
+        # F17: /tmp 는 다중 사용자 머신에서 타 사용자 connect 를 허용한다
         path = _resolve_socket_path("/some/project")
-        assert path.startswith("/tmp/session-manager-")
+        assert path.startswith(str(fake_home / ".session-manager" / "run"))
         assert path.endswith(".sock")
 
-    def test_deterministic_for_same_input(self) -> None:
+    def test_run_dir_is_owner_only(self, fake_home: Path) -> None:
+        _resolve_socket_path("/some/project")
+        run_dir = fake_home / ".session-manager" / "run"
+        assert stat.S_IMODE(run_dir.stat().st_mode) == 0o700
+
+    def test_deterministic_for_same_input(self, fake_home: Path) -> None:
         a = _resolve_socket_path("/some/project")
         b = _resolve_socket_path("/some/project")
         assert a == b
 
-    def test_different_for_different_inputs(self) -> None:
+    def test_different_for_different_inputs(self, fake_home: Path) -> None:
         a = _resolve_socket_path("/project/a")
         b = _resolve_socket_path("/project/b")
         assert a != b
 
-    def test_within_af_unix_path_limit(self) -> None:
-        # AF_UNIX 경로는 보통 108바이트 한계 — 깊은 경로에서도 여유
+    def test_within_af_unix_path_limit(self, fake_home: Path) -> None:
+        # AF_UNIX sun_path 한계 (macOS 104B) 이내여야 한다
         path = _resolve_socket_path(
             "/very/deep/nested/path/with/many/segments/and/more/levels"
         )
-        assert len(path) < 108
+        assert len(path.encode("utf-8")) <= 100
 
-    def test_hash_length_12(self) -> None:
+    def test_pathologically_long_home_falls_back_to_tmp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        deep_home = tmp_path / ("x" * 80) / ("y" * 40)
+        deep_home.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: deep_home))
+
+        path = _resolve_socket_path("/some/project")
+        assert path.startswith("/tmp/session-manager-")
+        assert len(path.encode("utf-8")) <= 100
+
+    def test_hash_length_12(self, fake_home: Path) -> None:
         path = _resolve_socket_path("/x")
-        hash_part = path.removeprefix("/tmp/session-manager-").removesuffix(".sock")
+        hash_part = path.rsplit("session-manager-", 1)[1].removesuffix(".sock")
         assert len(hash_part) == 12
 
 

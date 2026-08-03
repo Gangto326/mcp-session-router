@@ -79,6 +79,18 @@ class TestStartStop:
         server.stop()
         assert not Path(socket_path).exists()
 
+    def test_socket_file_is_owner_only(self, socket_path: str) -> None:
+        # F17: umask 와 무관하게 0600 — 타 사용자 connect 차단
+        import stat
+
+        server = WrapperSocketServer(socket_path, on_message=lambda _: None)
+        server.start()
+        try:
+            mode = stat.S_IMODE(os.stat(socket_path).st_mode)
+            assert mode == 0o600
+        finally:
+            server.stop()
+
     def test_start_cleans_stale_socket_file(self, socket_path: str) -> None:
         # 사전에 stale 파일 만듦 — 시작 시 자동 정리되어야 함
         Path(socket_path).touch()
