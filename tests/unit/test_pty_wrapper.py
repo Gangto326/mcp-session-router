@@ -770,6 +770,62 @@ class TestAutoAcceptConfirmations:
 
         assert writes.count(b"\r") == 1
 
+    def test_window_closed_after_first_user_keystroke(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """After the user has typed, pattern on screen must NOT fire (F13).
+        사용자 입력 이후에는 화면의 패턴이 발사되면 안 된다 (F13) —
+        LLM 인용·파일 표시 오발사 방어.
+        """
+        wrapper._auto_confirm_armed = False  # 첫 키 입력이 닫은 상태
+        wrapper.virtual_screen.feed(
+            b"  Use this and all future MCP servers\r\n"
+        )
+        wrapper.pty_fd = 1
+        writes: list[bytes] = []
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+
+        wrapper._auto_accept_confirmations()
+
+        assert writes == []
+        assert wrapper._handled_confirmations == set()
+
+    def test_first_stdin_keystroke_closes_window(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A real user keystroke through stdin closes the window.
+        stdin 을 통한 실제 사용자 키 입력이 윈도우를 닫는다.
+        """
+        assert wrapper._auto_confirm_armed is True
+        wrapper.pty_fd = 1
+        monkeypatch.setattr(wrapper, "_stdin_fd", 0)
+        monkeypatch.setattr("os.read", lambda fd, n: b"h")
+        monkeypatch.setattr("os.write", lambda fd, data: len(data))
+
+        wrapper._handle_stdin_readable()
+
+        assert wrapper._auto_confirm_armed is False
+
+    def test_respawn_rearms_window(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        """NEW respawn re-opens the window for the next child's boot dialogs.
+        NEW respawn 시 다음 자식의 부팅 다이얼로그를 위해 윈도우가 다시 열린다.
+        """
+        wrapper._auto_confirm_armed = False
+        wrapper._handled_confirmations = {"Use this MCP server"}
+
+        wrapper._reset_child_detection_state()
+
+        assert wrapper._auto_confirm_armed is True
+        assert wrapper._handled_confirmations == set()
+
     def test_no_inject_when_no_pattern_visible(
         self,
         wrapper: SessionManagerWrapper,
