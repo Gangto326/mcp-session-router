@@ -234,3 +234,80 @@ class TestAtomicWrite:
         listed = store.list_sessions()
         assert len(listed) == 1
         assert listed[0] == session
+
+
+class TestMutateSession:
+    """Locked read-modify-write (F15) — lost-update prevention.
+
+    잠금 하의 read-modify-write (F15) — 동시 저장 유실 방어 테스트.
+    """
+
+    def _make(self, tmp_path: Path) -> tuple[SessionStore, SessionMetadata]:
+        store = SessionStore(tmp_path)
+        store.init_project()
+        session = SessionMetadata.new(name="s1", title="T")
+        store.save_session(session)
+        return store, session
+
+    def test_mutator_applied_and_saved(self, tmp_path: Path) -> None:
+        store, session = self._make(tmp_path)
+
+        result = store.mutate_session(
+            session.session_id, lambda s: s.requirements.append("테스트 필수")
+        )
+
+        assert result is not None
+        reloaded = store.load_session(session.session_id)
+        assert reloaded is not None
+        assert reloaded.requirements == ["테스트 필수"]
+
+    def test_missing_session_returns_none(self, tmp_path: Path) -> None:
+        store = SessionStore(tmp_path)
+        store.init_project()
+        assert store.mutate_session("ghost", lambda s: None) is None
+        assert store.mutate_session_by_name("ghost", lambda s: None) is None
+
+    def test_mutate_by_name(self, tmp_path: Path) -> None:
+        store, session = self._make(tmp_path)
+        result = store.mutate_session_by_name("s1", lambda s: s.requirements.append("r"))
+        assert result is not None
+        assert result.session_id == session.session_id
+
+    def test_concurrent_mutations_not_lost(self, tmp_path: Path) -> None:
+        # 두 스레드가 같은 세션에 각각 N회 append — 유실이 있으면 2N 미만이 된다.
+        # (flock 은 open file description 단위라 동일 프로세스의 별도 open
+        # 끼리도 상호 배제된다 — 프로세스 간 배제와 같은 메커니즘.)
+        import threading
+
+        store, session = self._make(tmp_path)
+        n = 50
+
+        def worker(tag: str) -> None:
+            for i in range(n):
+                item = f"{tag}-{i}"
+                store.mutate_session(
+                    session.session_id,
+                    lambda s, item=item: s.requirements.append(item),
+                )
+
+        t1 = threading.Thread(target=worker, args=("a",))
+        t2 = threading.Thread(target=worker, args=("b",))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        reloaded = store.load_session(session.session_id)
+        assert reloaded is not None
+        assert len(reloaded.requirements) == 2 * n
+
+    def test_delete_removes_lock_sidecar(self, tmp_path: Path) -> None:
+        store, session = self._make(tmp_path)
+        store.mutate_session(session.session_id, lambda s: None)
+        lock_path = (
+            tmp_path / ".session-manager" / "sessions" / f"{session.session_id}.json.lock"
+        )
+        assert lock_path.exists()
+
+        store.delete_session(session.session_id)
+        assert not lock_path.exists()
