@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -81,10 +83,75 @@ class SessionStore:
             results.append(SessionMetadata.from_dict(_load_json(path)))
         return results
 
+    def mutate_session(
+        self,
+        session_id: str,
+        mutator: Callable[[SessionMetadata], None],
+    ) -> SessionMetadata | None:
+        """
+        Load-modify-save under an exclusive cross-process lock (F15).
+
+        The MCP server process and the wrapper's worker threads both
+        load-modify-save session files; without a lock, concurrent saves
+        silently drop one side's field changes (atomic replace only
+        prevents torn files, not lost updates). ``flock`` on a per-session
+        sidecar lock file makes the whole read-modify-write one critical
+        section across processes. Hold time is milliseconds, so blocking
+        acquisition is fine. Returns the saved session, or None if the
+        session does not exist.
+
+        배타적 프로세스 간 잠금 아래에서 load-modify-save 를 수행한다 (F15).
+
+        MCP 서버 프로세스와 래퍼 워커 스레드가 같은 세션 파일을
+        load-modify-save 하는데, 잠금이 없으면 동시 저장에서 한쪽의 필드
+        변경이 조용히 유실된다 (atomic replace 는 파일 깨짐만 막는다).
+        세션별 사이드카 잠금 파일에 대한 ``flock`` 이 read-modify-write
+        전체를 프로세스 간 하나의 임계 구역으로 만든다. 보유 시간이 ms
+        단위라 블로킹 획득으로 충분하다. 저장된 세션을 반환하고, 세션이
+        없으면 None.
+        """
+        self._sessions_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self._sessions_dir / f"{session_id}.json.lock"
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                session = self.load_session(session_id)
+                if session is None:
+                    return None
+                mutator(session)
+                self.save_session(session)
+                return session
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    def mutate_session_by_name(
+        self,
+        name: str,
+        mutator: Callable[[SessionMetadata], None],
+    ) -> SessionMetadata | None:
+        """
+        Name-keyed variant of :meth:`mutate_session`. The name→id lookup
+        happens outside the lock — the binding is stable (rename rewrites
+        the same file), so the id-keyed critical section still protects
+        the read-modify-write.
+
+        :meth:`mutate_session` 의 이름 기반 변형. 이름→id 조회는 잠금
+        밖에서 일어나지만 그 결합은 안정적이므로 (rename 도 같은 파일을
+        다시 쓴다) id 기반 임계 구역이 read-modify-write 를 그대로
+        보호한다.
+        """
+        session = self.load_session_by_name(name)
+        if session is None:
+            return None
+        return self.mutate_session(session.session_id, mutator)
+
     def delete_session(self, session_id: str) -> None:
         path = self._sessions_dir / f"{session_id}.json"
         existed = path.exists()
         path.unlink(missing_ok=True)
+        # Remove the F15 sidecar lock as well.
+        # F15 사이드카 잠금 파일도 함께 제거.
+        (self._sessions_dir / f"{session_id}.json.lock").unlink(missing_ok=True)
         debug_log.log(
             "STORAGE_DELETE",
             "MCP_TOOL",

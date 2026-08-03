@@ -514,11 +514,13 @@ def session_switch(
     # 활성 conversation 을 한 번만 계산해 outgoing/target 세션 양쪽에 연결한다.
     active_conv_id = get_active_conversation_id(app.project_path)
 
-    # Update the outgoing session's metadata.
-    # 나가는 세션의 메타데이터를 갱신한다.
+    # Update the outgoing session's metadata under the F15 lock — the
+    # wrapper's summarizer may be saving this same session concurrently.
+    # 나가는 세션의 메타데이터를 F15 잠금 하에 갱신한다 — 래퍼의 요약기가
+    # 같은 세션을 동시에 저장하고 있을 수 있다.
     if current_name is not None:
-        current = app.session_store.load_session_by_name(current_name)
-        if current is not None:
+
+        def apply_outgoing(current: SessionMetadata) -> None:
             current.summary = summary
             if updated_title is not None:
                 current.title = updated_title
@@ -528,7 +530,8 @@ def session_switch(
             if active_conv_id is not None:
                 current.link_conversation(active_conv_id)
             current.touch()
-            app.session_store.save_session(current)
+
+        app.session_store.mutate_session_by_name(current_name, apply_outgoing)
 
     # Send SWITCH signal to the wrapper.
     # 래퍼에 SWITCH 신호를 전송한다.
@@ -557,10 +560,9 @@ def session_switch(
     # Claude Code conversation 을 실제로 바꾸기 전이라도 다음 턴에 라우팅이
     # 매칭하도록.
     if active_conv_id is not None:
-        target_session = app.session_store.load_session_by_name(target)
-        if target_session is not None:
-            target_session.link_conversation(active_conv_id)
-            app.session_store.save_session(target_session)
+        app.session_store.mutate_session_by_name(
+            target, lambda s: s.link_conversation(active_conv_id)
+        )
 
     return _log_tool_return(
         "session_switch", event_id, app, {"switched_to": target}
@@ -603,22 +605,28 @@ def session_create(
 
     current_name = app.state.get_current_session()
 
-    # Update the outgoing session's metadata (if registered).
-    # 나가는 세션의 메타데이터를 갱신한다 (등록된 경우에만).
+    # Update the outgoing session's metadata (if registered), under the
+    # F15 lock (concurrent summarizer saves).
+    # 나가는 세션의 메타데이터를 갱신한다 (등록된 경우에만) — F15 잠금
+    # 하에 (요약기 동시 저장 대비).
     rename_current: str | None = None
     if current_name is not None:
-        current = app.session_store.load_session_by_name(current_name)
-        if current is not None:
+        conv_id = get_active_conversation_id(app.project_path)
+
+        def apply_outgoing(current: SessionMetadata) -> None:
             current.summary = handoff_summary
             # Link the conversation we're leaving before the wrapper
             # respawns into a brand-new one.
             # 자식 재spawn 으로 새 conversation 으로 가기 전, 떠나는 conversation
             # 을 outgoing 세션에 연결해둔다.
-            conv_id = get_active_conversation_id(app.project_path)
             if conv_id is not None:
                 current.link_conversation(conv_id)
             current.touch()
-            app.session_store.save_session(current)
+
+        saved = app.session_store.mutate_session_by_name(
+            current_name, apply_outgoing
+        )
+        if saved is not None:
             rename_current = current_name
 
     # Send NEW signal to the wrapper.
@@ -668,19 +676,22 @@ def session_end(summary: str, ctx: Context) -> dict:
     current_name = app.state.get_current_session()
 
     if current_name is not None:
-        current = app.session_store.load_session_by_name(current_name)
-        if current is not None:
+        conv_id = get_active_conversation_id(app.project_path)
+
+        def apply_end(current: SessionMetadata) -> None:
             current.summary = summary
             current.status = SessionStatus.ARCHIVED
             # Link the conversation being archived so the metadata
             # remembers which conversation this session was inside.
             # 마감되는 시점의 conversation 을 연결해 메타데이터가 마지막으로
             # 어느 conversation 안에 있었는지 기억한다.
-            conv_id = get_active_conversation_id(app.project_path)
             if conv_id is not None:
                 current.link_conversation(conv_id)
             current.touch()
-            app.session_store.save_session(current)
+
+        # F15 lock — see session_switch.
+        # F15 잠금 — session_switch 참조.
+        app.session_store.mutate_session_by_name(current_name, apply_end)
 
     _set_current_session(app, None)
     return _log_tool_return("session_end", event_id, app, {"ended": current_name})

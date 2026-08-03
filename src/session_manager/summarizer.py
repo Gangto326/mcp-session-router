@@ -535,33 +535,39 @@ def _process_task(
     if parsed is None:
         return "unparseable_response"
     store = SessionStore(project_path)
-    session = store.load_session_by_name(task.session_name)
+
+    def apply(session: Any) -> None:
+        session.summary = parsed["summary"].strip()
+        title = parsed.get("title")
+        if isinstance(title, str) and title.strip():
+            session.title = title.strip()
+        requirements = parsed.get("requirements")
+        if isinstance(requirements, list):
+            session.requirements = [
+                r.strip() for r in requirements if isinstance(r, str) and r.strip()
+            ]
+        # Freshness marker only — ``last_accessed`` is deliberately NOT
+        # touched: a background refresh is not a user access, and bumping it
+        # would make idle sessions look recently used to the router.
+        # 신선도 표시만 갱신 — ``last_accessed`` 는 의도적으로 건드리지 않는다.
+        # 백그라운드 갱신은 사용자 접근이 아니며, 갱신하면 놀고 있는 세션이
+        # 라우터에게 방금 쓴 세션처럼 보인다.
+        session.summary_updated_at = _utc_now_iso()
+        # Baseline for periodic refresh: how much dialogue this summary covers.
+        # Scoped to the conversation it was measured in (see the model's field
+        # comment for why the pairing matters).
+        # 주기 갱신 기준값 — 이 요약이 포괄하는 대화의 양. 측정한 conversation
+        # 범위로 한정한다 (쌍으로 두는 이유는 모델 필드 주석 참조).
+        session.summary_dialogue_chars = dialogue_length(jsonl_path)
+        session.summary_dialogue_conversation_id = task.conversation_id
+
+    # Locked read-modify-write (F15) — a concurrent MCP-side save (e.g.
+    # transitions append) must not be lost under this summary update.
+    # 잠금 하의 read-modify-write (F15) — 동시에 일어나는 MCP 측 저장
+    # (transitions append 등) 이 이 요약 갱신에 유실되면 안 된다.
+    session = store.mutate_session_by_name(task.session_name, apply)
     if session is None:
         return f"session_not_found: {task.session_name}"
-    session.summary = parsed["summary"].strip()
-    title = parsed.get("title")
-    if isinstance(title, str) and title.strip():
-        session.title = title.strip()
-    requirements = parsed.get("requirements")
-    if isinstance(requirements, list):
-        session.requirements = [
-            r.strip() for r in requirements if isinstance(r, str) and r.strip()
-        ]
-    # Freshness marker only — ``last_accessed`` is deliberately NOT
-    # touched: a background refresh is not a user access, and bumping it
-    # would make idle sessions look recently used to the router.
-    # 신선도 표시만 갱신 — ``last_accessed`` 는 의도적으로 건드리지 않는다.
-    # 백그라운드 갱신은 사용자 접근이 아니며, 갱신하면 놀고 있는 세션이
-    # 라우터에게 방금 쓴 세션처럼 보인다.
-    session.summary_updated_at = _utc_now_iso()
-    # Baseline for periodic refresh: how much dialogue this summary covers.
-    # Scoped to the conversation it was measured in (see the model's field
-    # comment for why the pairing matters).
-    # 주기 갱신 기준값 — 이 요약이 포괄하는 대화의 양. 측정한 conversation
-    # 범위로 한정한다 (쌍으로 두는 이유는 모델 필드 주석 참조).
-    session.summary_dialogue_chars = dialogue_length(jsonl_path)
-    session.summary_dialogue_conversation_id = task.conversation_id
-    store.save_session(session)
     debug_log.log(
         "SUMMARIZER",
         "WRAPPER",
