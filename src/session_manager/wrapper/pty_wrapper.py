@@ -205,6 +205,24 @@ class SessionManagerWrapper:
         # 새 자식이 spawn될 때마다 초기화해 자동 승인을 재무장.
         self._handled_confirmations: set[str] = set()
 
+        # Auto-confirm matching window (F13). Confirmation dialogs only
+        # appear during child boot, before the user has typed anything —
+        # but the pattern strings can legitimately show up on screen later
+        # (LLM output quoting them, a Read of a file containing them), and
+        # matching then would inject a stray Enter. The window is therefore
+        # armed at spawn and closed at the FIRST real user keystroke of
+        # that child. Trade-off: a user typing before a boot dialog renders
+        # disarms it and confirms manually — harmless, unlike a mis-fire.
+        # 자동 승인 매칭 윈도우 (F13). confirmation 다이얼로그는 자식 부팅
+        # 구간 — 사용자가 아무것도 입력하기 전 — 에만 나타난다. 반면 패턴
+        # 문자열 자체는 이후에도 화면에 정상적으로 나타날 수 있고 (LLM 이
+        # 인용, 해당 문자열이 든 파일 Read 표시), 그때 매칭되면 엉뚱한
+        # Enter 가 주입된다. 따라서 윈도우는 spawn 시 열리고 그 자식의
+        # **첫 실제 사용자 키 입력**에서 닫힌다. 트레이드오프: 다이얼로그
+        # 표시 전에 타이핑하면 자동 승인이 꺼져 수동 확인하게 되는데,
+        # 이는 오발사와 달리 무해하다.
+        self._auto_confirm_armed: bool = True
+
         # AGENT_GUIDE.md injection stage machine. (Re)set inside _spawn_child
         # based on whether the new child receives a fresh conversation.
         # Stages must be split across separate prompt-detect cycles because
@@ -382,14 +400,7 @@ class SessionManagerWrapper:
                 "input_queue_carryover_len": len(self.input_queue),
             },
         )
-        # Reset per-child detection state so the previous session's tail
-        # bytes can't trigger a false prompt on the new child.
-        # 자식별 감지 상태 초기화 — 이전 세션의 잔여 바이트가 새 자식의
-        # 첫 프롬프트 감지를 오염시키지 않도록.
-        self.output_buffer = b""
-        # Re-arm confirmation auto-accept for the new child.
-        # 새 자식에 대해 confirmation 자동 승인 재무장.
-        self._handled_confirmations = set()
+        self._reset_child_detection_state()
 
         # Decide whether to inject AGENT_GUIDE on this child's first prompt:
         # - NEW respawn → inject (fresh conversation, no manual yet).
@@ -570,6 +581,22 @@ class SessionManagerWrapper:
             os.write(self._stdout_fd, chunk)
         return True
 
+    def _reset_child_detection_state(self) -> None:
+        """
+        Reset per-child detection state on every spawn: the previous
+        session's tail bytes can't trigger a false prompt on the new
+        child, and the confirmation auto-accept re-arms (its matching
+        window re-opens until this child's first user keystroke — F13).
+
+        spawn 마다 자식별 감지 상태를 초기화한다: 이전 세션의 잔여
+        바이트가 새 자식의 첫 프롬프트 감지를 오염시키지 않게 하고,
+        confirmation 자동 승인을 재무장한다 (매칭 윈도우는 이 자식의
+        첫 사용자 키 입력까지 다시 열린다 — F13).
+        """
+        self.output_buffer = b""
+        self._handled_confirmations = set()
+        self._auto_confirm_armed = True
+
     def _handle_stdin_readable(self) -> None:
         try:
             chunk = os.read(self._stdin_fd, 4096)
@@ -577,6 +604,20 @@ class SessionManagerWrapper:
             return
         if not chunk:
             return
+
+        # First real user keystroke closes the auto-confirm window (F13):
+        # boot dialogs are behind us, so any later pattern match on screen
+        # would be a quote/file view, not a dialog.
+        # 첫 실제 사용자 키 입력이 자동 승인 윈도우를 닫는다 (F13). 부팅
+        # 다이얼로그 구간은 지났으므로 이후의 패턴 매칭은 다이얼로그가
+        # 아니라 인용·파일 표시다.
+        if self._auto_confirm_armed:
+            self._auto_confirm_armed = False
+            debug_log.log(
+                "AUTO_CONFIRM",
+                "WRAPPER",
+                {"window": "closed", "reason": "first_user_keystroke"},
+            )
 
         # USER_KEY checkpoint — every real user keystroke arrives here.
         # The mask helper redacts content by default; users can opt in to
@@ -959,8 +1000,11 @@ class SessionManagerWrapper:
         가상 화면에 알려진 confirmation prompt 텍스트가 나타나면 \\r 주입.
         모든 prompt의 default가 1번이라 단순 Enter로 승인된다. 한 번 처리한
         패턴은 ``_handled_confirmations``에 기록해 같은 자식에서 다시 매칭
-        되지 않는다.
+        되지 않는다. 매칭은 시작 윈도우(첫 사용자 키 입력 전)에서만
+        동작한다 (F13 — 이후의 화면 노출은 인용·파일 표시일 수 있다).
         """
+        if not self._auto_confirm_armed:
+            return
         for pattern in AUTO_CONFIRM_PATTERNS:
             if pattern in self._handled_confirmations:
                 continue
