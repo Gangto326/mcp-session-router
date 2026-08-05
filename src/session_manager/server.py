@@ -30,7 +30,7 @@ from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from session_manager import debug_log
+from session_manager import debug_log, summarizer
 from session_manager.claude_conversation import get_active_conversation_id
 from session_manager.lifecycle import cleanup_expired_sessions, get_cleanup_period_days
 from session_manager.models.session import (
@@ -761,11 +761,47 @@ def reject_switch(rejected_target: str, prompt_gist: str, ctx: Context) -> dict:
             app,
             {"recorded": False, "reason": "session_not_found"},
         )
+
+    # R3-C2: a rejection means the current session just absorbed a topic
+    # its summary doesn't cover yet — refresh it now (EXTRA_FROM_REJECT
+    # keeps the rooting check off this too-early refresh), and queue a
+    # rooting check that rides the *next* refresh. The queue is
+    # file-based, so the wrapper's worker picks both up on its poll.
+    # R3-C2 — 거부는 현재 세션에 summary 가 아직 모르는 주제가 방금
+    # 들어왔다는 뜻이다. 즉시 갱신을 적재하고 (EXTRA_FROM_REJECT 로 이
+    # 너무 이른 갱신에는 정착 확인이 편승하지 못하게 표시), *다음* 갱신에
+    # 편승할 정착 확인을 함께 적재한다. 큐는 파일 기반이라 래퍼 워커가
+    # 폴링으로 둘 다 집어간다.
+    conv_id = get_active_conversation_id(app.project_path)
+    if conv_id is not None:
+        summarizer.enqueue(
+            app.project_path,
+            summarizer.SummaryTask(
+                session_name=current_name,
+                conversation_id=conv_id,
+                kind=summarizer.KIND_ACTIVE,
+                extra={summarizer.EXTRA_FROM_REJECT: True},
+            ),
+        )
+        summarizer.enqueue(
+            app.project_path,
+            summarizer.SummaryTask(
+                session_name=current_name,
+                conversation_id=conv_id,
+                kind=summarizer.KIND_ROOTING_CHECK,
+                extra={summarizer.EXTRA_REJECTED_TOPIC: prompt_gist},
+            ),
+        )
     return _log_tool_return(
         "reject_switch",
         event_id,
         app,
-        {"recorded": True, "kept_in": current_name, "rejected": rejected_target},
+        {
+            "recorded": True,
+            "kept_in": current_name,
+            "rejected": rejected_target,
+            "refresh_enqueued": conv_id is not None,
+        },
     )
 
 

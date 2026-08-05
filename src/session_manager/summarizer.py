@@ -91,17 +91,39 @@ QUEUE_DIRNAME = "summary-queue"
 # 빠지며, 그것이 다른 워커에게서 감추는 메커니즘이다.
 CLAIM_SUFFIX = ".processing"
 
-# Task kinds. departed/active are handled identically today (excerpt
-# path unified by the PoC); the split is kept because R3 attaches a
-# rooting-check question to active-refresh tasks.
+# Task kinds. departed/active run standalone through the excerpt path;
+# rooting_check (R3-C2) never runs standalone — it waits in the queue
+# and rides the next active refresh of the same session (see
+# process_queue).
 #
-# 작업 종류. departed/active 는 현재 동일하게 처리되지만 (PoC 로 발췌
-# 경로 단일화), R3 가 active 갱신 작업에 정착 확인 질문을 붙이므로 구분은
-# 유지한다.
+# 작업 종류. departed/active 는 발췌 경로로 단독 처리된다. rooting_check
+# (R3-C2) 는 단독 처리되지 않는다 — 큐에서 대기하다가 같은 세션의 다음
+# active 갱신에 편승한다 (process_queue 참조).
 KIND_DEPARTED = "departed"
 KIND_ACTIVE = "active"
 KIND_ROOTING_CHECK = "rooting_check"
 _SUPPORTED_KINDS = (KIND_DEPARTED, KIND_ACTIVE)
+
+# Extra-field keys (R3-C2).
+#
+# ``EXTRA_FROM_REJECT`` marks the immediate active refresh enqueued by
+# reject_switch. A rooting check never rides that task: at rejection
+# time the rejected topic has just appeared, so "continued beyond a
+# single exchange" cannot be true yet — the check rides the *next*
+# refresh instead (periodic growth / /clear), which is the "거부 N턴 후"
+# of the plan without introducing a numeric constant (rule 8).
+# ``EXTRA_REJECTED_TOPIC`` carries the topic the rooting check asks about.
+#
+# extra 필드 키 (R3-C2).
+#
+# ``EXTRA_FROM_REJECT`` 는 reject_switch 가 즉시 적재한 active 갱신 표시.
+# 정착 확인은 그 작업에 편승하지 않는다 — 거부 시점엔 거부된 주제가 방금
+# 나타나 "단발 문답을 넘어 이어졌는가"가 참일 수 없으므로, *다음* 갱신
+# (주기 증가량 / /clear) 에 편승한다. 이것이 수치 상수 없이 (규칙 8) 계획의
+# "거부 N턴 후"를 구현하는 방식이다.
+# ``EXTRA_REJECTED_TOPIC`` 은 정착 확인이 묻는 주제를 담는다.
+EXTRA_FROM_REJECT = "from_reject"
+EXTRA_REJECTED_TOPIC = "rejected_topic"
 
 # ---- Headless call parameters -------------------------------------------
 # headless 호출 파라미터.
@@ -146,6 +168,18 @@ _PROMPT_TEMPLATE = """[대화 기록 시작]
   (전역 컨벤션이 아니라 이 작업에만 해당하는 것만)
 - transcript에 실제로 있는 작업만 서술하라. 추측으로 범위를 넓히지 마라.
 JSON으로만 응답: {{"summary": "...", "requirements": ["..."], "title": "..."}}"""
+
+# Rooting-check question (R3-C2), appended after the summary instruction
+# when a rooting_check task rides the refresh. Question text is verbatim
+# from Plan.md R3-C2.
+#
+# 정착 확인 질문 (R3-C2) — rooting_check 작업이 갱신에 편승할 때 요약
+# 지시 뒤에 덧붙인다. 질문 문구는 Plan.md R3-C2 원문 그대로다.
+_ROOTING_QUESTION_TEMPLATE = (
+    '추가 질문: 이 대화에서 "{rejected_topic}" 관련 작업이 단발 문답을 넘어\n'
+    "이어졌는가? 복수 턴 진행 또는 파일 수정 동반 시에만 yes.\n"
+    '{{"rooted": true|false, "evidence": "근거 인용|null"}}'
+)
 
 
 def _utc_now_iso() -> str:
@@ -509,15 +543,76 @@ def _parse_summary_response(text: str) -> dict[str, Any] | None:
     return data
 
 
+def _parse_json_objects(text: str) -> list[dict[str, Any]]:
+    """Parse every top-level JSON object in *text* (fence-tolerant).
+
+    *text* 안의 최상위 JSON 객체를 전부 파싱한다 (코드펜스 허용).
+
+    The rooting-check question shows its own answer shape, so the model
+    may emit the summary JSON and the rooted JSON as two separate
+    objects instead of one merged object. A whole-text ``json.loads``
+    would then fail and lose the summary too — this scanner recovers
+    both objects whichever way the model chose.
+
+    정착 확인 질문은 자체 응답 형식을 제시하므로, 모델이 summary JSON 과
+    rooted JSON 을 병합하지 않고 별도 객체 둘로 낼 수 있다. 전문
+    ``json.loads`` 는 그 경우 실패해 summary 까지 잃는다 — 이 스캐너는
+    모델이 어느 쪽을 택했든 두 객체를 모두 회수한다.
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[1] if "\n" in stripped else ""
+        stripped = stripped.rsplit("```", 1)[0]
+    decoder = json.JSONDecoder()
+    objects: list[dict[str, Any]] = []
+    idx = 0
+    while True:
+        start = stripped.find("{", idx)
+        if start < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(stripped, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        if isinstance(obj, dict):
+            objects.append(obj)
+        idx = end
+    return objects
+
+
+def _rooting_question(rooting_task: SummaryTask | None) -> str | None:
+    """Render the rooting-check question for a riding task, if usable.
+
+    편승 작업의 정착 확인 질문을 렌더링한다 (사용 가능할 때만).
+    """
+    if rooting_task is None:
+        return None
+    topic = rooting_task.extra.get(EXTRA_REJECTED_TOPIC)
+    if not isinstance(topic, str) or not topic.strip():
+        return None
+    return _ROOTING_QUESTION_TEMPLATE.format(rejected_topic=topic.strip())
+
+
 def _process_task(
     project_path: Path,
     task: SummaryTask,
     run: Callable[[str], str | None],
     transcript_dir: Path | None,
+    rooting_task: SummaryTask | None = None,
 ) -> str | None:
     """Try to summarise one task. Returns None on success, error string on failure.
 
     작업 한 건의 요약을 시도. 성공 시 None, 실패 시 오류 문자열 반환.
+
+    With *rooting_task* attached, the rooting question is appended to
+    the same headless call and the mixing tally is updated from the
+    ``rooted`` answer. A missing/odd ``rooted`` answer never fails the
+    task — the summary still saves, the check outcome is just logged.
+
+    *rooting_task* 가 붙으면 같은 headless 호출에 정착 질문을 덧붙이고
+    ``rooted`` 응답으로 혼합도를 갱신한다. ``rooted`` 응답 누락·이상은
+    작업 실패로 치지 않는다 — summary 는 저장하고 확인 결과는 로그만.
     """
     if task.kind not in _SUPPORTED_KINDS:
         return f"unsupported_kind: {task.kind}"
@@ -528,12 +623,47 @@ def _process_task(
     excerpt = extract_full_text(jsonl_path)
     if not excerpt:
         return "empty_excerpt"
-    response = run(_PROMPT_TEMPLATE.format(excerpt=excerpt))
+    question = _rooting_question(rooting_task)
+    prompt = _PROMPT_TEMPLATE.format(excerpt=excerpt)
+    if question is not None:
+        prompt = f"{prompt}\n\n{question}"
+    response = run(prompt)
     if response is None:
         return "headless_call_failed"
-    parsed = _parse_summary_response(response)
+    rooted_answer: dict[str, Any] | None = None
+    if question is not None:
+        # The model may merge both answers into one object or emit two
+        # separate objects — recover summary and rooted from either shape.
+        # 모델은 두 응답을 한 객체로 병합할 수도, 별도 객체 둘로 낼 수도
+        # 있다 — 어느 형태든 summary 와 rooted 를 회수한다.
+        objects = _parse_json_objects(response)
+        parsed = next(
+            (
+                o
+                for o in objects
+                if isinstance(o.get("summary"), str) and o["summary"].strip()
+            ),
+            None,
+        )
+        rooted_answer = next((o for o in objects if "rooted" in o), None)
+        if parsed is None:
+            debug_log.log(
+                "SUMMARIZER",
+                "WRAPPER",
+                {
+                    "op": "parse_summary_response",
+                    "result": "missing_summary",
+                    "raw": debug_log.mask_text(response),
+                },
+            )
+    else:
+        parsed = _parse_summary_response(response)
     if parsed is None:
         return "unparseable_response"
+    rooted = rooted_answer.get("rooted") if rooted_answer is not None else None
+    rooted_evidence = (
+        rooted_answer.get("evidence") if rooted_answer is not None else None
+    )
     store = SessionStore(project_path)
 
     def apply(session: Any) -> None:
@@ -560,6 +690,16 @@ def _process_task(
         # 범위로 한정한다 (쌍으로 두는 이유는 모델 필드 주석 참조).
         session.summary_dialogue_chars = dialogue_length(jsonl_path)
         session.summary_dialogue_conversation_id = task.conversation_id
+        # Mixing tally (R3-C2): only an explicit boolean true counts.
+        # rooted=false is a judge-calibration signal (logged below), and
+        # anything else is a malformed answer — neither touches the score.
+        # 혼합도 집계 (R3-C2) — 명시적 boolean true 만 집계한다.
+        # rooted=false 는 판정 보정 신호 (아래 로그), 그 외는 형식 이상 —
+        # 어느 쪽도 점수를 건드리지 않는다.
+        if rooted is True:
+            session.mixing_score += 1
+            if isinstance(rooted_evidence, str) and rooted_evidence.strip():
+                session.mixing_evidence.append(rooted_evidence.strip())
 
     # Locked read-modify-write (F15) — a concurrent MCP-side save (e.g.
     # transitions append) must not be lost under this summary update.
@@ -568,6 +708,20 @@ def _process_task(
     session = store.mutate_session_by_name(task.session_name, apply)
     if session is None:
         return f"session_not_found: {task.session_name}"
+    if question is not None:
+        debug_log.log(
+            "SUMMARIZER",
+            "WRAPPER",
+            {
+                "op": "rooting_check",
+                "rooted": rooted,
+                "evidence": rooted_evidence,
+                "answered": rooted_answer is not None,
+                "mixing_score": session.mixing_score,
+            },
+            conv_id=task.conversation_id,
+            session=task.session_name,
+        )
     debug_log.log(
         "SUMMARIZER",
         "WRAPPER",
@@ -643,6 +797,52 @@ def sweep_stale_queue_files(project_path: Path, period_days: int) -> int:
     return removed
 
 
+def _claim_rooting_check(
+    project_path: Path, session_name: str
+) -> tuple[Path, SummaryTask] | None:
+    """Claim the oldest pending rooting check for *session_name*, if any.
+
+    *session_name* 의 가장 오래된 대기 정착 확인을 선점한다 (있을 때).
+
+    One check per refresh: with several pending, the oldest rides now
+    and the rest ride later refreshes — a single question per call keeps
+    the combined response parseable.
+
+    갱신당 확인 1건 — 여럿이 대기 중이면 가장 오래된 것이 지금 편승하고
+    나머지는 이후 갱신에 편승한다. 호출당 질문 하나가 결합 응답을
+    파싱 가능하게 유지한다.
+    """
+    for path, pending in load_pending_tasks(project_path):
+        if pending.kind != KIND_ROOTING_CHECK:
+            continue
+        if pending.session_name != session_name:
+            continue
+        topic = pending.extra.get(EXTRA_REJECTED_TOPIC)
+        if not isinstance(topic, str) or not topic.strip():
+            # Unusable check (no topic) — leave it for the stale sweep.
+            # 사용 불가 확인 (주제 없음) — 오래된 파일 sweep 에 맡긴다.
+            continue
+        claimed = _claim(path)
+        if claimed is not None:
+            return claimed, pending
+    return None
+
+
+def _restore_claimed(claimed: Path) -> None:
+    """Return a claimed queue file to pending state (undo the claim rename).
+
+    선점된 큐 파일을 대기 상태로 되돌린다 (선점 rename 의 역방향).
+    """
+    try:
+        claimed.rename(claimed.with_name(claimed.name.removesuffix(CLAIM_SUFFIX)))
+    except OSError:
+        # Restore failure leaves an orphaned claim file; the stale sweep
+        # collects it eventually. Never raise from cleanup.
+        # 복원 실패는 고아 선점 파일을 남기지만 오래된 파일 sweep 이 결국
+        # 수거한다. 정리 경로에서 예외를 내지 않는다.
+        pass
+
+
 def process_queue(
     project_path: Path,
     run: Callable[[str], str | None] = run_headless_summary,
@@ -657,25 +857,52 @@ def process_queue(
     task is retried once within the same pass, then marked failed. *run*
     and *transcript_dir* are injectable for tests.
 
+    Rooting checks (R3-C2) are never processed standalone: they wait in
+    the queue and ride an active refresh of their session — except the
+    refresh enqueued by the rejection itself (``EXTRA_FROM_REJECT``),
+    which is too early to judge rooting. If the ride fails, the check is
+    restored to pending and rides a later refresh.
+
     작업은 한 번에 하나씩 처리되며, 원자적으로 선점되어 같은 프로젝트의 두
     번째 ccode 인스턴스가 중복 처리하지 못한다. 실패한 작업은 같은 pass 안에서
     1회 재시도 후 실패 마킹. *run* 과 *transcript_dir* 는 테스트용 주입점.
+
+    정착 확인 (R3-C2) 은 단독 처리되지 않는다 — 큐에서 대기하다 같은 세션의
+    active 갱신에 편승하되, 거부 자신이 적재한 갱신 (``EXTRA_FROM_REJECT``)
+    은 정착 판정에 너무 이르므로 제외한다. 편승한 갱신이 실패하면 대기
+    상태로 복원되어 이후 갱신에 편승한다.
     """
     done = 0
     for path, task in load_pending_tasks(project_path):
+        if task.kind == KIND_ROOTING_CHECK:
+            # Waits for an active refresh to ride — see docstring.
+            # active 갱신 편승 대기 — docstring 참조.
+            continue
         claimed = _claim(path)
         if claimed is None:
             # Another worker took it (or it was consumed) — skip.
             # 다른 워커가 가져갔거나 이미 소비됨 — 건너뛴다.
             continue
-        error = _process_task(project_path, task, run, transcript_dir)
+        rooting: tuple[Path, SummaryTask] | None = None
+        if task.kind == KIND_ACTIVE and not task.extra.get(EXTRA_FROM_REJECT):
+            rooting = _claim_rooting_check(project_path, task.session_name)
+        rooting_task = rooting[1] if rooting is not None else None
+        error = _process_task(
+            project_path, task, run, transcript_dir, rooting_task=rooting_task
+        )
         if error is not None:
-            error = _process_task(project_path, task, run, transcript_dir)
+            error = _process_task(
+                project_path, task, run, transcript_dir, rooting_task=rooting_task
+            )
         if error is None:
             claimed.unlink(missing_ok=True)
+            if rooting is not None:
+                rooting[0].unlink(missing_ok=True)
             done += 1
         else:
             _mark_failed(claimed, task, error)
+            if rooting is not None:
+                _restore_claimed(rooting[0])
     return done
 
 

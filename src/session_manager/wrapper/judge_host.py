@@ -277,6 +277,12 @@ class JudgeHost:
                 "title": s.title,
                 "summary": s.summary,
                 "last_accessed": s.last_accessed,
+                # Raw mixing signal (R3-C2) — no threshold applied here;
+                # the judge weighs the raw value and its evidence.
+                # 혼합도 원신호 (R3-C2) — 여기서 임계를 적용하지 않는다.
+                # 원값과 근거 인용의 가중은 판정기가 결정한다.
+                "mixing_score": s.mixing_score,
+                "mixing_evidence": list(s.mixing_evidence),
             }
             for s in self._store.list_sessions()
             if s.status.value == "active"

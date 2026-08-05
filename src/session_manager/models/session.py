@@ -168,6 +168,21 @@ class SessionMetadata:
     # 이 세션에 머물면서 기록된 거부 판례 목록 (R3-C1). 이 세션이 항상
     # kept_in 쪽이다.
     precedents: list[PrecedentRecord] = field(default_factory=list)
+    # Topic-mixing tally (R3-C2): incremented when a rooting check finds
+    # that a rejected topic took root here (multi-turn continuation).
+    # No threshold constant exists on purpose (rule 8) — the raw value
+    # (with its evidence quotes below) goes straight into the judge
+    # input, and the judge weighs it against other signals.
+    # 주제 혼합도 집계 (R3-C2) — 정착 확인이 "거부된 주제가 이 세션에
+    # 뿌리내렸다(복수 턴 진행)"고 판정할 때마다 1 증가. 임계 상수는
+    # 의도적으로 없다 (규칙 8) — 원값이 (아래 근거 인용과 함께) 판정자
+    # 입력에 그대로 들어가고, 가중은 판정기가 다른 신호와 함께 결정한다.
+    mixing_score: int = 0
+    # Evidence quotes from rooted=true rooting checks, accumulated in
+    # order. Shown to the judge next to the raw score.
+    # rooted=true 정착 확인의 근거 인용 누적 목록. 원값 곁에 판정자에게
+    # 표기된다.
+    mixing_evidence: list[str] = field(default_factory=list)
 
     @classmethod
     def new(cls, name: str, title: str, summary: str | None = None) -> SessionMetadata:
@@ -198,6 +213,8 @@ class SessionMetadata:
             "summary_dialogue_chars": self.summary_dialogue_chars,
             "summary_dialogue_conversation_id": self.summary_dialogue_conversation_id,
             "precedents": [p.to_dict() for p in self.precedents],
+            "mixing_score": self.mixing_score,
+            "mixing_evidence": list(self.mixing_evidence),
         }
 
     @classmethod
@@ -233,6 +250,10 @@ class SessionMetadata:
             precedents=[
                 PrecedentRecord.from_dict(p) for p in data.get("precedents", [])
             ],
+            # Backward-compat defaults for the R3-C2 mixing fields.
+            # R3-C2 혼합도 필드의 하위 호환 기본값.
+            mixing_score=data.get("mixing_score", 0),
+            mixing_evidence=list(data.get("mixing_evidence", [])),
         )
 
     def touch(self) -> None:

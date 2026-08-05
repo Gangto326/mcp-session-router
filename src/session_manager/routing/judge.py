@@ -153,10 +153,17 @@ def format_sessions(
         extras = []
         if s.get("last_accessed"):
             extras.append(f"last_accessed: {s['last_accessed']}")
-        # mixing_score enters the model in a later phase; shown when present.
-        # mixing_score 는 후속 Phase 에서 모델에 추가 — 있으면 표기.
+        # Raw mixing signal (R3-C2): the score and its rooted-evidence
+        # quotes are shown as-is; the prompt's rule ("높을수록 confidence
+        # 를 낮춰라") lets the judge do the weighing — no threshold here.
+        # 혼합도 원신호 (R3-C2) — 점수와 rooted 근거 인용을 그대로 표기.
+        # 가중은 프롬프트 규칙("높을수록 confidence 를 낮춰라")에 따라
+        # 판정기가 수행하며, 여기에 임계는 없다.
         if s.get("mixing_score") is not None:
             extras.append(f"mixing_score: {s['mixing_score']}")
+        if s.get("mixing_evidence"):
+            quotes = json.dumps(s["mixing_evidence"], ensure_ascii=False)
+            extras.append(f"mixing_evidence: {quotes}")
         if extras:
             parts.append(f" ({', '.join(extras)})")
         lines.append("".join(parts))
