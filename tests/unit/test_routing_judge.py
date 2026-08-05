@@ -54,6 +54,41 @@ class TestBuildJudgePrompt:
         )
         assert "mixing_score: 2" in text
 
+    def test_mixing_evidence_shown_next_to_score(self) -> None:
+        # R3-C2: the raw score and its rooted-evidence quotes go to the
+        # judge as-is — no threshold applied on the wrapper side.
+        # R3-C2 — 원값 점수와 rooted 근거 인용이 그대로 판정자에게 간다.
+        # 래퍼 측 임계 적용은 없다.
+        text = judge.format_sessions(
+            [
+                {
+                    "name": "s1",
+                    "title": "t",
+                    "summary": "x",
+                    "mixing_score": 1,
+                    "mixing_evidence": ["차트 얘기가 3턴 이어짐"],
+                }
+            ],
+            current_name=None,
+        )
+        assert "mixing_score: 1" in text
+        assert "차트 얘기가 3턴 이어짐" in text
+
+    def test_empty_mixing_evidence_not_shown(self) -> None:
+        text = judge.format_sessions(
+            [
+                {
+                    "name": "s1",
+                    "title": "t",
+                    "summary": "x",
+                    "mixing_score": 0,
+                    "mixing_evidence": [],
+                }
+            ],
+            current_name=None,
+        )
+        assert "mixing_evidence" not in text
+
 
 class TestParseVerdict:
     def test_clean_json(self) -> None:

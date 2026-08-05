@@ -174,6 +174,35 @@ class TestSessionMetadataPrecedents:
         assert [p.rejected for p in session.precedents] == ["backend"]
 
 
+class TestSessionMetadataMixing:
+    """R3-C2 mixing fields: defaults, roundtrip, backward compat.
+
+    R3-C2 혼합도 필드 — 기본값, 라운드트립, 하위 호환.
+    """
+
+    def test_new_defaults(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        assert session.mixing_score == 0
+        assert session.mixing_evidence == []
+
+    def test_roundtrip_preserves_mixing_fields(self) -> None:
+        original = SessionMetadata.new(name="frontend", title="차트")
+        original.mixing_score = 2
+        original.mixing_evidence = ["차트 얘기 3턴", "백엔드 파일 수정 동반"]
+        restored = _roundtrip(original)
+        assert restored == original
+
+    def test_legacy_file_without_mixing_fields_loads_with_defaults(self) -> None:
+        # A session JSON written before R3-C2 has neither mixing key.
+        # R3-C2 이전에 작성된 세션 JSON 에는 혼합도 키가 없다.
+        legacy = SessionMetadata.new(name="old", title="옛 세션").to_dict()
+        for key in ("mixing_score", "mixing_evidence"):
+            del legacy[key]
+        restored = SessionMetadata.from_dict(legacy)
+        assert restored.mixing_score == 0
+        assert restored.mixing_evidence == []
+
+
 class TestSessionMetadataTouch:
     def test_touch_updates_last_accessed(self) -> None:
         session = SessionMetadata.new(name="auth-fix", title="인증 수정")

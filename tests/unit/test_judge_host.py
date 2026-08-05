@@ -51,9 +51,12 @@ def _seed_sessions(project: Path) -> None:
     frontend = SessionMetadata.new(name="frontend", title="차트", summary="차트 리팩토링")
     frontend.claude_conversation_ids = ["conv-1"]
     store.save_session(frontend)
-    store.save_session(
-        SessionMetadata.new(name="backend", title="API", summary="JWT 교체 완료")
-    )
+    backend = SessionMetadata.new(name="backend", title="API", summary="JWT 교체 완료")
+    # Mixing signal (R3-C2) — raw value plus evidence must reach the prompt.
+    # 혼합도 신호 (R3-C2) — 원값과 근거 인용이 프롬프트에 도달해야 한다.
+    backend.mixing_score = 2
+    backend.mixing_evidence = ["프론트 차트 얘기가 3턴 이어짐"]
+    store.save_session(backend)
 
 
 VERDICT_JSON = (
@@ -136,6 +139,10 @@ class TestJudgmentFlow:
         assert "로그인 API가 500을 뱉는다" in judge_prompt
         assert "frontend (현재 세션)" in judge_prompt
         assert "backend" in judge_prompt
+        # Raw mixing signal reaches the judge input untouched (R3-C2).
+        # 혼합도 원신호가 가공 없이 판정 입력에 도달한다 (R3-C2).
+        assert "mixing_score: 2" in judge_prompt
+        assert "프론트 차트 얘기가 3턴 이어짐" in judge_prompt
 
         # 판정 1회 후 재웜업되어 다시 가용 상태가 된다
         assert _wait_until(lambda: host._ready)

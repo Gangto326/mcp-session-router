@@ -324,7 +324,13 @@ class TestProcessQueue:
     def test_unsupported_kind_fails_without_calling_model(
         self, project: Path, transcripts: Path
     ) -> None:
-        summarizer.enqueue(project, _task(kind=summarizer.KIND_ROOTING_CHECK))
+        # An unknown kind (corrupt/foreign queue file) is marked failed.
+        # rooting_check is NOT this case — it stays pending to ride an
+        # active refresh (see TestRootingCheck).
+        # 알 수 없는 kind (손상·외부 큐 파일) 는 실패 마킹된다.
+        # rooting_check 는 이 경우가 아니다 — active 갱신 편승을 위해
+        # 대기한다 (TestRootingCheck 참조).
+        summarizer.enqueue(project, _task(kind="mystery"))
         run = RunRecorder([GOOD_RESPONSE])
         assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 0
         assert run.prompts == []
@@ -338,6 +344,205 @@ class TestProcessQueue:
         run = RunRecorder([GOOD_RESPONSE])
         assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 0
         assert _failed_records(project)[0]["error"].startswith("session_not_found")
+
+
+# ---- rooting check (R3-C2) -----------------------------------------------
+
+
+ROOTED_TRUE_RESPONSE = json.dumps(
+    {
+        "summary": "차트 리팩토링과 백엔드 문의를 진행했다.",
+        "requirements": [],
+        "title": "혼합 작업",
+        "rooted": True,
+        "evidence": "백엔드 얘기가 3턴 이어짐",
+    },
+    ensure_ascii=False,
+)
+
+ROOTED_FALSE_RESPONSE = json.dumps(
+    {
+        "summary": "차트 리팩토링을 진행했다.",
+        "requirements": [],
+        "title": "차트",
+        "rooted": False,
+        "evidence": None,
+    },
+    ensure_ascii=False,
+)
+
+
+def _rooting_task(topic: str = "백엔드 로그인 오류") -> summarizer.SummaryTask:
+    return summarizer.SummaryTask(
+        session_name="work",
+        conversation_id=CONV_ID,
+        kind=summarizer.KIND_ROOTING_CHECK,
+        extra={summarizer.EXTRA_REJECTED_TOPIC: topic},
+    )
+
+
+class TestRootingCheck:
+    """R3-C2: the rooting check rides an active refresh and feeds mixing.
+
+    R3-C2 — 정착 확인이 active 갱신에 편승해 혼합도를 갱신한다.
+    """
+
+    def _mixing(self, project: Path) -> tuple[int, list[str]]:
+        session = SessionStore(project).load_session_by_name("work")
+        assert session is not None
+        return session.mixing_score, session.mixing_evidence
+
+    def test_never_processed_standalone(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        summarizer.enqueue(project, _rooting_task())
+        run = RunRecorder([GOOD_RESPONSE])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 0
+        assert run.prompts == []
+        # Still pending (not failed) — waits for an active refresh.
+        # 실패가 아니라 대기 유지 — active 갱신을 기다린다.
+        pending = summarizer.load_pending_tasks(project)
+        assert [t.kind for _, t in pending] == [summarizer.KIND_ROOTING_CHECK]
+
+    def test_rides_active_refresh_and_scores_on_rooted_true(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        summarizer.enqueue(project, _rooting_task())
+        summarizer.enqueue(project, _task(kind=summarizer.KIND_ACTIVE))
+        run = RunRecorder([ROOTED_TRUE_RESPONSE])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        # The single call carried both the summary instruction and the
+        # verbatim rooting question with the rejected topic.
+        # 호출 한 번에 요약 지시와 원문 정착 질문(거부 주제 포함)이 실렸다.
+        assert len(run.prompts) == 1
+        assert "추가 질문" in run.prompts[0]
+        assert "백엔드 로그인 오류" in run.prompts[0]
+        score, evidence = self._mixing(project)
+        assert score == 1
+        assert evidence == ["백엔드 얘기가 3턴 이어짐"]
+        session = SessionStore(project).load_session_by_name("work")
+        assert session.summary == "차트 리팩토링과 백엔드 문의를 진행했다."
+        assert summarizer.load_pending_tasks(project) == []
+
+    def test_rooted_false_logs_only(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        summarizer.enqueue(project, _rooting_task())
+        summarizer.enqueue(project, _task(kind=summarizer.KIND_ACTIVE))
+        run = RunRecorder([ROOTED_FALSE_RESPONSE])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        score, evidence = self._mixing(project)
+        assert score == 0
+        assert evidence == []
+        # The check is consumed either way — rooted=false is an answer.
+        # 어느 쪽이든 확인은 소비된다 — rooted=false 도 응답이다.
+        assert summarizer.load_pending_tasks(project) == []
+
+    def test_split_json_objects_response_parsed(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        # The model may answer with two separate JSON objects (summary
+        # first, rooted second) instead of one merged object.
+        # 모델이 병합 객체 대신 별도 JSON 객체 둘 (summary, rooted 순) 로
+        # 답할 수 있다.
+        summarizer.enqueue(project, _rooting_task())
+        summarizer.enqueue(project, _task(kind=summarizer.KIND_ACTIVE))
+        split = (
+            GOOD_RESPONSE
+            + "\n"
+            + json.dumps(
+                {"rooted": True, "evidence": "파일 수정 동반"}, ensure_ascii=False
+            )
+        )
+        run = RunRecorder([split])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        score, evidence = self._mixing(project)
+        assert score == 1
+        assert evidence == ["파일 수정 동반"]
+        session = SessionStore(project).load_session_by_name("work")
+        assert session.summary == "라우터 개선 작업을 진행했다."
+
+    def test_missing_rooted_answer_still_saves_summary(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        summarizer.enqueue(project, _rooting_task())
+        summarizer.enqueue(project, _task(kind=summarizer.KIND_ACTIVE))
+        run = RunRecorder([GOOD_RESPONSE])  # rooted 응답 없음
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        score, _evidence = self._mixing(project)
+        assert score == 0
+        session = SessionStore(project).load_session_by_name("work")
+        assert session.summary == "라우터 개선 작업을 진행했다."
+        # Consumed and logged — never retried forever.
+        # 소비 후 로그만 — 무한 재시도하지 않는다.
+        assert summarizer.load_pending_tasks(project) == []
+
+    def test_reject_refresh_does_not_carry_rooting_check(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        # The refresh enqueued by the rejection itself is too early to
+        # judge rooting — the check must wait for the next refresh.
+        # 거부 자신이 적재한 갱신은 정착 판정에 너무 이르다 — 확인은 다음
+        # 갱신을 기다려야 한다.
+        summarizer.enqueue(project, _rooting_task())
+        reject_refresh = summarizer.SummaryTask(
+            session_name="work",
+            conversation_id=CONV_ID,
+            kind=summarizer.KIND_ACTIVE,
+            extra={summarizer.EXTRA_FROM_REJECT: True},
+        )
+        summarizer.enqueue(project, reject_refresh)
+        run = RunRecorder([GOOD_RESPONSE])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        assert "추가 질문" not in run.prompts[0]
+        pending = summarizer.load_pending_tasks(project)
+        assert [t.kind for _, t in pending] == [summarizer.KIND_ROOTING_CHECK]
+
+    def test_departed_refresh_does_not_carry_rooting_check(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        summarizer.enqueue(project, _rooting_task())
+        summarizer.enqueue(project, _task(kind=summarizer.KIND_DEPARTED))
+        run = RunRecorder([GOOD_RESPONSE])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        assert "추가 질문" not in run.prompts[0]
+        pending = summarizer.load_pending_tasks(project)
+        assert [t.kind for _, t in pending] == [summarizer.KIND_ROOTING_CHECK]
+
+    def test_failed_ride_restores_rooting_check(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        summarizer.enqueue(project, _rooting_task())
+        summarizer.enqueue(project, _task(kind=summarizer.KIND_ACTIVE))
+        run = RunRecorder([None])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 0
+        # The active task is marked failed; the check returns to pending
+        # to ride a later refresh.
+        # active 작업은 실패 마킹, 확인은 대기로 복원되어 이후 갱신에 편승.
+        assert [r["error"] for r in _failed_records(project)] == [
+            "headless_call_failed"
+        ]
+        pending = summarizer.load_pending_tasks(project)
+        assert [t.kind for _, t in pending] == [summarizer.KIND_ROOTING_CHECK]
+
+    def test_topicless_check_left_for_sweep(
+        self, project: Path, transcripts: Path
+    ) -> None:
+        broken = summarizer.SummaryTask(
+            session_name="work",
+            conversation_id=CONV_ID,
+            kind=summarizer.KIND_ROOTING_CHECK,
+            extra={},
+        )
+        summarizer.enqueue(project, broken)
+        summarizer.enqueue(project, _task(kind=summarizer.KIND_ACTIVE))
+        run = RunRecorder([GOOD_RESPONSE])
+        assert summarizer.process_queue(project, run=run, transcript_dir=transcripts) == 1
+        assert "추가 질문" not in run.prompts[0]
+        # Unusable check is not claimed — the stale sweep collects it.
+        # 사용 불가 확인은 선점하지 않는다 — 오래된 파일 sweep 이 수거.
+        pending = summarizer.load_pending_tasks(project)
+        assert [t.kind for _, t in pending] == [summarizer.KIND_ROOTING_CHECK]
 
 
 # ---- run_headless_summary (subprocess envelope handling) -----------------

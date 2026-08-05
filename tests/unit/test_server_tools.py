@@ -12,6 +12,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from session_manager import server as server_module
+from session_manager import summarizer
 from session_manager.models.session import (
     PrecedentRecord,
     SessionMetadata,
@@ -455,6 +457,65 @@ class TestRejectSwitch:
             rejected_target="backend", prompt_gist="요지", ctx=_make_ctx(app)
         )
         assert calls == ["frontend"]
+
+    def test_enqueues_refresh_and_rooting_check(
+        self, app: AppContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # R3-C2: a rejection queues (a) an immediate refresh flagged
+        # from_reject and (b) a rooting check carrying the prompt gist.
+        # R3-C2 — 거부는 (a) from_reject 표시가 붙은 즉시 갱신과 (b)
+        # 프롬프트 요지를 담은 정착 확인을 함께 적재한다.
+        app.session_store.save_session(
+            SessionMetadata.new(name="frontend", title="차트")
+        )
+        app.state.set_current_session("frontend")
+        monkeypatch.setattr(
+            server_module, "get_active_conversation_id", lambda _p: "conv-1"
+        )
+
+        result = reject_switch(
+            rejected_target="backend",
+            prompt_gist="로그인 API 500 조사",
+            ctx=_make_ctx(app),
+        )
+
+        assert result["refresh_enqueued"] is True
+        tasks = [t for _, t in summarizer.load_pending_tasks(app.project_path)]
+        by_kind = {t.kind: t for t in tasks}
+        assert set(by_kind) == {
+            summarizer.KIND_ACTIVE,
+            summarizer.KIND_ROOTING_CHECK,
+        }
+        active = by_kind[summarizer.KIND_ACTIVE]
+        assert active.session_name == "frontend"
+        assert active.conversation_id == "conv-1"
+        assert active.extra.get(summarizer.EXTRA_FROM_REJECT) is True
+        rooting = by_kind[summarizer.KIND_ROOTING_CHECK]
+        assert (
+            rooting.extra.get(summarizer.EXTRA_REJECTED_TOPIC)
+            == "로그인 API 500 조사"
+        )
+
+    def test_without_conversation_id_skips_enqueue(
+        self, app: AppContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app.session_store.save_session(
+            SessionMetadata.new(name="frontend", title="차트")
+        )
+        app.state.set_current_session("frontend")
+        monkeypatch.setattr(
+            server_module, "get_active_conversation_id", lambda _p: None
+        )
+
+        result = reject_switch(
+            rejected_target="backend", prompt_gist="요지", ctx=_make_ctx(app)
+        )
+
+        # The precedent still records; only the refresh is skipped.
+        # 판례는 기록되고 갱신 적재만 생략된다.
+        assert result["recorded"] is True
+        assert result["refresh_enqueued"] is False
+        assert summarizer.load_pending_tasks(app.project_path) == []
 
     def test_no_current_session_is_noop(self, app: AppContext) -> None:
         result = reject_switch(
