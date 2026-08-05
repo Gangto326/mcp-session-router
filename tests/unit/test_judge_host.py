@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from session_manager.models.session import SessionMetadata
+from session_manager.models.session import PrecedentRecord, SessionMetadata
 from session_manager.storage.file_store import SessionStore
 from session_manager.wrapper.judge_host import JudgeHost
 
@@ -221,6 +221,104 @@ class TestJudgmentFlow:
         finally:
             first_theirs.close()
             second_theirs.close()
+
+
+class TestPrecedentsInPrompt:
+    """Current session's precedents enter the judge prompt, recent first.
+
+    현재 세션의 판례가 최근 우선으로 판정 프롬프트에 들어간다.
+    """
+
+    @pytest.fixture
+    def host(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> JudgeHost:
+        store = SessionStore(tmp_path)
+        store.init_project()
+        frontend = SessionMetadata.new(
+            name="frontend", title="차트", summary="차트 리팩토링"
+        )
+        frontend.claude_conversation_ids = ["conv-1"]
+        # Two precedents with an out-of-insertion-order timestamp pair —
+        # the prompt must sort by `at`, not by list position.
+        # 삽입 순서와 시각 순서가 어긋난 판례 두 건 — 프롬프트는 리스트
+        # 위치가 아니라 `at` 으로 정렬해야 한다.
+        frontend.precedents = [
+            PrecedentRecord(
+                prompt_gist="오래된 거부",
+                kept_in="frontend",
+                rejected="backend",
+                at="2026-08-01T00:00:00+00:00",
+            ),
+            PrecedentRecord(
+                prompt_gist="최근 거부",
+                kept_in="frontend",
+                rejected="infra",
+                at="2026-08-03T00:00:00+00:00",
+            ),
+        ]
+        store.save_session(frontend)
+        store.save_session(
+            SessionMetadata.new(name="backend", title="API", summary="JWT 교체 완료")
+        )
+        monkeypatch.setattr(JudgeHost, "_spawn_and_warm", lambda self: True)
+        h = JudgeHost(tmp_path)
+        yield h
+        h.stop()
+
+    def test_precedents_included_most_recent_first(
+        self, host: JudgeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prompts: list[str] = []
+
+        def fake_round_trip(self, text: str, timeout: float) -> str:
+            prompts.append(text)
+            return VERDICT_JSON
+
+        monkeypatch.setattr(JudgeHost, "_round_trip", fake_round_trip)
+        host.ensure_started()
+        assert _wait_until(lambda: host._ready)
+
+        ours, theirs = socket.socketpair()
+        try:
+            host.handle_request(
+                {"prompt": "배포 설정을 바꾸자", "session_id": "conv-1"}, ours
+            )
+            assert _recv_reply(theirs)["ok"] is True
+        finally:
+            theirs.close()
+
+        judge_prompt = prompts[-1]
+        assert "오래된 거부" in judge_prompt
+        assert "최근 거부" in judge_prompt
+        assert judge_prompt.index("최근 거부") < judge_prompt.index("오래된 거부")
+
+    def test_unknown_conversation_gets_empty_precedents(
+        self, host: JudgeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prompts: list[str] = []
+
+        def fake_round_trip(self, text: str, timeout: float) -> str:
+            prompts.append(text)
+            return VERDICT_JSON
+
+        monkeypatch.setattr(JudgeHost, "_round_trip", fake_round_trip)
+        host.ensure_started()
+        assert _wait_until(lambda: host._ready)
+
+        ours, theirs = socket.socketpair()
+        try:
+            host.handle_request(
+                {"prompt": "질문", "session_id": "conv-없음"}, ours
+            )
+            assert _recv_reply(theirs)["ok"] is True
+        finally:
+            theirs.close()
+
+        assert "오래된 거부" not in prompts[-1]
+        # The precedents block (right after the rule text) renders empty.
+        # 판례 블록 (규칙 문구 바로 뒤) 이 빈 상태로 렌더링된다.
+        assert "사용하라] (없음)" in prompts[-1]
 
 
 class TestSpawnFailure:

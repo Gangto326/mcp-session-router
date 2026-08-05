@@ -311,6 +311,52 @@ class TestRouteExecution:
         assert "session_switch" in context
         assert "AskUserQuestion" in context
 
+    def test_switch_confirm_instructs_reject_switch_on_keep(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # R3-C1: the "keep" choice must call reject_switch with the
+        # rejected target so the precedent gets recorded.
+        # R3-C1 — "유지" 선택은 판례가 기록되도록 거부 대상을 담아
+        # reject_switch 를 호출해야 한다.
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(
+                action="SWITCH",
+                target="backend",
+                confidence=0.9,
+                evidence="JWT 교체 완료",
+            ),
+        )
+        hook._route(self._routable_payload(project))
+        context = json.loads(capsys.readouterr().out)["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        assert "reject_switch(rejected_target='backend'" in context
+        assert "prompt_gist" in context
+
+    def test_new_confirm_keep_does_not_mention_reject_switch(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # NEW has no rejected target session, so no precedent tool call.
+        # NEW 는 거부 대상 세션이 없으므로 판례 도구 호출도 없다.
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p: self._reply(action="NEW", reason="새 주제"),
+        )
+        hook._route(self._routable_payload(project))
+        context = json.loads(capsys.readouterr().out)["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        assert "reject_switch" not in context
+
     def test_new_confirm_emits_session_create_instruction(
         self,
         project: Path,

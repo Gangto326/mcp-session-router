@@ -12,12 +12,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from session_manager.models.session import SessionMetadata, SessionStatus
+from session_manager.models.session import (
+    PrecedentRecord,
+    SessionMetadata,
+    SessionStatus,
+)
 from session_manager.server import (
     AppContext,
     check_session,
     init_project,
     reinit_project,
+    reject_switch,
     session_create,
     session_end,
     session_register,
@@ -215,6 +220,36 @@ class TestSessionSwitch:
         assert result["switched_to"] == "first"
         assert app.state.get_current_session() == "first"
 
+    def test_accepted_switch_drops_precedents_for_target_only(
+        self, app: AppContext
+    ) -> None:
+        # Invalidation (b): accepting a switch to a previously rejected
+        # target overturns only the precedents against that target.
+        # 무효화 (b): 이전에 거부됐던 대상으로의 전환 수용은 그 대상의
+        # 판례만 뒤집는다.
+        src = SessionMetadata.new(name="src", title="Source")
+        src.precedents = [
+            PrecedentRecord.new(
+                prompt_gist="API 오류", kept_in="src", rejected="dst"
+            ),
+            PrecedentRecord.new(
+                prompt_gist="배포 설정", kept_in="src", rejected="infra"
+            ),
+        ]
+        app.session_store.save_session(src)
+        app.state.set_current_session("src")
+
+        session_switch(
+            target="dst",
+            summary="moving on",
+            user_prompt="dst 작업",
+            ctx=_make_ctx(app),
+        )
+
+        stored = app.session_store.load_session_by_name("src")
+        assert stored is not None
+        assert [p.rejected for p in stored.precedents] == ["infra"]
+
 
 # --------------------------------------------------------------- session_create
 
@@ -347,6 +382,100 @@ class TestSessionEnd:
 
 
 # --------------------------------------------------------------- update_static
+
+
+class TestRejectSwitch:
+    """reject_switch: precedent append under the F15 lock path.
+
+    reject_switch — F15 잠금 경로를 통한 판례 append.
+    """
+
+    def test_appends_precedent_to_current_session(
+        self, app: AppContext
+    ) -> None:
+        app.session_store.save_session(
+            SessionMetadata.new(name="frontend", title="차트")
+        )
+        app.state.set_current_session("frontend")
+
+        result = reject_switch(
+            rejected_target="backend",
+            prompt_gist="로그인 API 500 조사",
+            ctx=_make_ctx(app),
+        )
+
+        assert result["recorded"] is True
+        assert result["kept_in"] == "frontend"
+        stored = app.session_store.load_session_by_name("frontend")
+        assert stored is not None
+        assert len(stored.precedents) == 1
+        record = stored.precedents[0]
+        assert record.prompt_gist == "로그인 API 500 조사"
+        assert record.kept_in == "frontend"
+        assert record.rejected == "backend"
+        assert record.at.endswith("+00:00")
+
+    def test_repeated_rejections_accumulate(self, app: AppContext) -> None:
+        app.session_store.save_session(
+            SessionMetadata.new(name="frontend", title="차트")
+        )
+        app.state.set_current_session("frontend")
+
+        reject_switch(
+            rejected_target="backend", prompt_gist="첫 거부", ctx=_make_ctx(app)
+        )
+        reject_switch(
+            rejected_target="infra", prompt_gist="둘째 거부", ctx=_make_ctx(app)
+        )
+
+        stored = app.session_store.load_session_by_name("frontend")
+        assert stored is not None
+        assert [p.rejected for p in stored.precedents] == ["backend", "infra"]
+
+    def test_uses_locked_mutate_path(self, app: AppContext) -> None:
+        # The append must go through the F15 locked load-modify-save —
+        # a direct load/save would race the wrapper's summarizer.
+        # append 는 F15 잠금 load-modify-save 를 거쳐야 한다 — 직접
+        # load/save 는 래퍼 요약기와 경합한다.
+        app.session_store.save_session(
+            SessionMetadata.new(name="frontend", title="차트")
+        )
+        app.state.set_current_session("frontend")
+
+        calls: list[str] = []
+        original = app.session_store.mutate_session_by_name
+
+        def spying_mutate(name, mutator):
+            calls.append(name)
+            return original(name, mutator)
+
+        app.session_store.mutate_session_by_name = spying_mutate
+
+        reject_switch(
+            rejected_target="backend", prompt_gist="요지", ctx=_make_ctx(app)
+        )
+        assert calls == ["frontend"]
+
+    def test_no_current_session_is_noop(self, app: AppContext) -> None:
+        result = reject_switch(
+            rejected_target="backend",
+            prompt_gist="요지",
+            ctx=_make_ctx(app),
+        )
+        assert result["recorded"] is False
+        assert result["reason"] == "no_current_session"
+
+    def test_unregistered_current_session_reports_not_found(
+        self, app: AppContext
+    ) -> None:
+        app.state.set_current_session("ghost")
+        result = reject_switch(
+            rejected_target="backend",
+            prompt_gist="요지",
+            ctx=_make_ctx(app),
+        )
+        assert result["recorded"] is False
+        assert result["reason"] == "session_not_found"
 
 
 class TestUpdateStatic:

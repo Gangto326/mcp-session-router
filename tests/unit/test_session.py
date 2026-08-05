@@ -7,6 +7,7 @@ import time
 import uuid
 
 from session_manager.models import (
+    PrecedentRecord,
     SessionMetadata,
     SessionStatus,
     TransitionRecord,
@@ -112,6 +113,65 @@ class TestSessionMetadataR1C6Fields:
         assert restored.requirements == []
         assert restored.summary_updated_at is None
         assert restored.profile is None
+
+
+class TestSessionMetadataPrecedents:
+    """R3-C1 precedents: roundtrip, backward compat, event invalidation.
+
+    R3-C1 판례 — 라운드트립, 하위 호환, 이벤트 무효화.
+    """
+
+    def _record(self, rejected: str = "backend") -> PrecedentRecord:
+        return PrecedentRecord.new(
+            prompt_gist="로그인 API 500 조사",
+            kept_in="frontend",
+            rejected=rejected,
+        )
+
+    def test_new_defaults_to_empty(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        assert session.precedents == []
+
+    def test_precedent_record_new_sets_iso_timestamp(self) -> None:
+        record = self._record()
+        assert record.at.endswith("+00:00")
+
+    def test_roundtrip_preserves_precedents(self) -> None:
+        original = SessionMetadata.new(name="frontend", title="차트")
+        original.precedents.append(self._record())
+        restored = _roundtrip(original)
+        assert restored == original
+        assert restored.precedents[0].rejected == "backend"
+
+    def test_legacy_file_without_precedents_loads_with_default(self) -> None:
+        # A session JSON written before R3-C1 has no precedents key.
+        # R3-C1 이전에 작성된 세션 JSON 에는 precedents 키가 없다.
+        legacy = SessionMetadata.new(name="old", title="옛 세션").to_dict()
+        del legacy["precedents"]
+        restored = SessionMetadata.from_dict(legacy)
+        assert restored.precedents == []
+
+    def test_clear_precedents_drops_all(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        session.precedents = [self._record("backend"), self._record("infra")]
+        session.clear_precedents()
+        assert session.precedents == []
+
+    def test_drop_precedents_for_removes_only_matching_target(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        session.precedents = [
+            self._record("backend"),
+            self._record("infra"),
+            self._record("backend"),
+        ]
+        session.drop_precedents_for("backend")
+        assert [p.rejected for p in session.precedents] == ["infra"]
+
+    def test_drop_precedents_for_non_matching_is_noop(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        session.precedents = [self._record("backend")]
+        session.drop_precedents_for("없는-세션")
+        assert [p.rejected for p in session.precedents] == ["backend"]
 
 
 class TestSessionMetadataTouch:
