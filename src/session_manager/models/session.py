@@ -52,6 +52,67 @@ class TransitionRecord:
 
 
 @dataclass
+class PrecedentRecord:
+    """One rejected switch proposal ("precedent", R3-C1).
+
+    Recorded when the user declines a router SWITCH proposal and stays in
+    the current session. Fed back into the judge prompt so the same
+    proposal is not repeated. Invalidation is event-based, not time-based
+    (rule 8 — no TTL): a precedent dies when its kept_in session rolls
+    over (``clear_precedents``) or when a later switch to the same
+    rejected target is accepted (``drop_precedents_for``).
+
+    거부된 전환 제안 한 건 ("판례", R3-C1).
+
+    사용자가 라우터의 SWITCH 제안을 거부하고 현재 세션에 머물 때
+    기록된다. 판정 프롬프트에 다시 입력되어 같은 제안의 반복을 막는다.
+    무효화는 시간이 아니라 이벤트 기반이다 (규칙 8 — TTL 없음): kept_in
+    세션이 롤오버되거나 (``clear_precedents``), 이후 같은 rejected 대상으로의
+    전환이 수용되면 (``drop_precedents_for``) 소멸한다.
+    """
+
+    # One-line gist of the prompt that triggered the rejected proposal.
+    # 거부된 제안을 유발한 프롬프트의 한 줄 요지.
+    prompt_gist: str
+    # Session the user chose to stay in (also where this record is stored).
+    # 사용자가 머물기로 한 세션 (이 기록의 저장 위치이기도 하다).
+    kept_in: str
+    # Proposed switch target the user rejected.
+    # 사용자가 거부한 전환 제안 대상.
+    rejected: str
+    # ISO8601 timestamp of the rejection. Judge input sorts by this,
+    # most recent first.
+    # 거부 시각 (ISO8601). 판정 입력은 이 값으로 최근 우선 정렬한다.
+    at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "prompt_gist": self.prompt_gist,
+            "kept_in": self.kept_in,
+            "rejected": self.rejected,
+            "at": self.at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PrecedentRecord:
+        return cls(
+            prompt_gist=data["prompt_gist"],
+            kept_in=data["kept_in"],
+            rejected=data["rejected"],
+            at=data["at"],
+        )
+
+    @classmethod
+    def new(cls, prompt_gist: str, kept_in: str, rejected: str) -> PrecedentRecord:
+        return cls(
+            prompt_gist=prompt_gist,
+            kept_in=kept_in,
+            rejected=rejected,
+            at=_utc_now_iso(),
+        )
+
+
+@dataclass
 class SessionMetadata:
     session_id: str
     name: str
@@ -102,6 +163,11 @@ class SessionMetadata:
     # 2차 라우팅 판정용 리치 컨텍스트 (핵심 파일, 결정 사항, 상세 상태).
     # R2 부터 채워진다.
     profile: str | None = None
+    # Rejected switch proposals recorded while staying in this session
+    # (R3-C1). This session is always the kept_in side.
+    # 이 세션에 머물면서 기록된 거부 판례 목록 (R3-C1). 이 세션이 항상
+    # kept_in 쪽이다.
+    precedents: list[PrecedentRecord] = field(default_factory=list)
 
     @classmethod
     def new(cls, name: str, title: str, summary: str | None = None) -> SessionMetadata:
@@ -131,6 +197,7 @@ class SessionMetadata:
             "profile": self.profile,
             "summary_dialogue_chars": self.summary_dialogue_chars,
             "summary_dialogue_conversation_id": self.summary_dialogue_conversation_id,
+            "precedents": [p.to_dict() for p in self.precedents],
         }
 
     @classmethod
@@ -159,6 +226,13 @@ class SessionMetadata:
             summary_dialogue_conversation_id=data.get(
                 "summary_dialogue_conversation_id"
             ),
+            # Backward-compat default for session files written before
+            # R3-C1 introduced this field.
+            # R3-C1 이 이 필드를 도입하기 전에 작성된 세션 파일과의 하위
+            # 호환 기본값.
+            precedents=[
+                PrecedentRecord.from_dict(p) for p in data.get("precedents", [])
+            ],
         )
 
     def touch(self) -> None:
@@ -199,5 +273,60 @@ class SessionMetadata:
                 "after": list(self.claude_conversation_ids),
             },
             conv_id=conv_id,
+            session=self.name,
+        )
+
+    def clear_precedents(self) -> None:
+        """Invalidation (a) — drop every precedent of this session.
+
+        Called when this (kept_in) session rolls over: the rollover
+        changes the session's topical make-up, so old rejections no
+        longer describe it. The trigger hookup lands with the rollover
+        phase; the contract lives here with the data.
+
+        이벤트 무효화 (a) — 이 세션의 판례를 전부 소멸시킨다.
+
+        이 (kept_in) 세션이 롤오버될 때 호출된다: 롤오버는 세션의 주제
+        구성을 바꾸므로 과거 거부 기록이 더는 세션을 설명하지 못한다.
+        발동 지점 연결은 롤오버 Phase 에서 하고, 계약은 데이터 곁인
+        여기에 둔다.
+        """
+        if not self.precedents:
+            return
+        dropped = len(self.precedents)
+        self.precedents = []
+        debug_log.log(
+            "PRECEDENT",
+            "MCP_TOOL",
+            {"op": "clear", "session": self.name, "dropped": dropped},
+            session=self.name,
+        )
+
+    def drop_precedents_for(self, rejected_target: str) -> None:
+        """Invalidation (b) — the precedent was overturned.
+
+        Called when a switch to *rejected_target* is later accepted:
+        the user's acceptance contradicts the recorded rejection, so
+        only the precedents against that target die.
+
+        이벤트 무효화 (b) — 선례 뒤집힘.
+
+        이후 *rejected_target* 으로의 전환이 수용될 때 호출된다: 수용은
+        기록된 거부와 모순되므로, 그 대상에 대한 판례만 소멸한다.
+        """
+        kept = [p for p in self.precedents if p.rejected != rejected_target]
+        dropped = len(self.precedents) - len(kept)
+        if dropped == 0:
+            return
+        self.precedents = kept
+        debug_log.log(
+            "PRECEDENT",
+            "MCP_TOOL",
+            {
+                "op": "drop_for",
+                "session": self.name,
+                "rejected_target": rejected_target,
+                "dropped": dropped,
+            },
             session=self.name,
         )

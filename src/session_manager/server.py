@@ -34,6 +34,7 @@ from session_manager import debug_log
 from session_manager.claude_conversation import get_active_conversation_id
 from session_manager.lifecycle import cleanup_expired_sessions, get_cleanup_period_days
 from session_manager.models.session import (
+    PrecedentRecord,
     SessionMetadata,
     SessionStatus,
     TransitionRecord,
@@ -527,6 +528,11 @@ def session_switch(
             current.transitions.append(
                 TransitionRecord.new(from_session=current_name, to_session=target)
             )
+            # Precedent invalidation (b): an accepted switch to *target*
+            # overturns any recorded rejection of that same target.
+            # 판례 무효화 (b): *target* 으로의 전환 수용은 같은 대상에 대한
+            # 기록된 거부(선례)를 뒤집는다.
+            current.drop_precedents_for(target)
             if active_conv_id is not None:
                 current.link_conversation(active_conv_id)
             current.touch()
@@ -695,6 +701,72 @@ def session_end(summary: str, ctx: Context) -> dict:
 
     _set_current_session(app, None)
     return _log_tool_return("session_end", event_id, app, {"ended": current_name})
+
+
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
+def reject_switch(rejected_target: str, prompt_gist: str, ctx: Context) -> dict:
+    """
+    Record that the user rejected a switch proposal and stayed here.
+
+    Called by the LLM when the user picks "keep current session" in the
+    router's confirm flow. Appends a precedent to the current session so
+    the judge stops repeating the same proposal (R3-C1).
+
+    사용자가 전환 제안을 거부하고 현재 세션에 머물렀음을 기록한다.
+
+    라우터 confirm 흐름에서 사용자가 "현재 세션 유지"를 선택하면 LLM 이
+    호출한다. 현재 세션에 판례를 추가해 판정기가 같은 제안을 반복하지
+    않게 한다 (R3-C1).
+    """
+    app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "reject_switch",
+        app,
+        {
+            "rejected_target": rejected_target,
+            "prompt_gist": debug_log.mask_text(prompt_gist),
+        },
+    )
+    current_name = app.state.get_current_session()
+    if current_name is None:
+        # Harmless no-op: without a current session there is no kept_in
+        # side to attach the precedent to.
+        # 무해한 no-op — 현재 세션이 없으면 판례를 붙일 kept_in 쪽이 없다.
+        return _log_tool_return(
+            "reject_switch",
+            event_id,
+            app,
+            {"recorded": False, "reason": "no_current_session"},
+        )
+
+    record = PrecedentRecord.new(
+        prompt_gist=prompt_gist,
+        kept_in=current_name,
+        rejected=rejected_target,
+    )
+
+    def apply_reject(current: SessionMetadata) -> None:
+        current.precedents.append(record)
+        current.touch()
+
+    # F15 lock — the wrapper's summarizer may be saving this same
+    # session concurrently (see session_switch).
+    # F15 잠금 — 래퍼의 요약기가 같은 세션을 동시에 저장하고 있을 수
+    # 있다 (session_switch 참조).
+    saved = app.session_store.mutate_session_by_name(current_name, apply_reject)
+    if saved is None:
+        return _log_tool_return(
+            "reject_switch",
+            event_id,
+            app,
+            {"recorded": False, "reason": "session_not_found"},
+        )
+    return _log_tool_return(
+        "reject_switch",
+        event_id,
+        app,
+        {"recorded": True, "kept_in": current_name, "rejected": rejected_target},
+    )
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)

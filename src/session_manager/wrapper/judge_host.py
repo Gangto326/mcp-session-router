@@ -50,6 +50,7 @@ from typing import Any
 
 from session_manager import debug_log
 from session_manager.claude_conversation import encode_cwd
+from session_manager.models.session import SessionMetadata
 from session_manager.routing import judge
 from session_manager.storage.file_store import SessionStore
 from session_manager.transcript_excerpt import extract_dialogue, read_tail_events
@@ -280,14 +281,30 @@ class JudgeHost:
             for s in self._store.list_sessions()
             if s.status.value == "active"
         ]
-        current_name = self._resolve_current_name(request)
+        current = self._resolve_current_session(request)
+        current_name = current.name if current is not None else None
+        # Precedents of the current (kept_in) session, most recent first
+        # — no fixed cap; recency ordering is the natural size limit for
+        # the prompt (rule 8).
+        # 현재 (kept_in) 세션의 판례, 최근 우선 정렬 — 고정 개수 상한
+        # 없음. 최근 우선 정렬이 프롬프트 크기의 자연 제한이다 (규칙 8).
+        precedents = (
+            [
+                p.to_dict()
+                for p in sorted(
+                    current.precedents, key=lambda p: p.at, reverse=True
+                )
+            ]
+            if current is not None
+            else []
+        )
 
         judge_prompt = judge.build_judge_prompt(
             prompt=prompt,
             excerpt=excerpt,
             sessions=sessions,
             current_name=current_name,
-            precedents=[],
+            precedents=precedents,
         )
         t0 = time.monotonic()
         raw = self._round_trip(judge_prompt, judge.JUDGE_TIMEOUT_SECS)
@@ -312,17 +329,19 @@ class JudgeHost:
         )
         return {"ok": True, "verdict": verdict.to_dict()}
 
-    def _resolve_current_name(self, request: dict[str, Any]) -> str | None:
-        """Map the hook's conversation id to a session name, if known.
+    def _resolve_current_session(
+        self, request: dict[str, Any]
+    ) -> SessionMetadata | None:
+        """Map the hook's conversation id to a session, if known.
 
-        hook 의 conversation id 를 세션 이름으로 대응시킨다 (가능할 때).
+        hook 의 conversation id 를 세션으로 대응시킨다 (가능할 때).
         """
         conv_id = request.get("session_id")
         if not isinstance(conv_id, str) or not conv_id:
             return None
         for s in self._store.list_sessions():
             if conv_id in s.claude_conversation_ids:
-                return s.name
+                return s
         return None
 
     # ------------------------------------------------- judge process plumbing

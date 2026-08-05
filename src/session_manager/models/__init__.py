@@ -3,6 +3,7 @@
 from session_manager.models.config import Config
 from session_manager.models.fields import StaticField
 from session_manager.models.session import (
+    PrecedentRecord,
     SessionMetadata,
     SessionStatus,
     TransitionRecord,
@@ -10,6 +11,7 @@ from session_manager.models.session import (
 
 __all__ = [
     "Config",
+    "PrecedentRecord",
     "SessionMetadata",
     "SessionStatus",
     "StaticField",

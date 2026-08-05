@@ -229,15 +229,18 @@ def _calibrated_auto_threshold() -> float | None:
 
 
 # Confirm-path instruction templates. Wording follows Plan.md R2-C4
-# verbatim, except the reject_switch clause (that tool arrives in a
-# later phase) — until then "keep" asks for no tool call.
-# confirm 경로 지시 템플릿. 문구는 Plan.md R2-C4 원문을 따르되,
-# reject_switch 절만 예외 (해당 도구는 후속 Phase 에서 추가) — 그 전까지
-# "유지" 선택은 도구 호출 없음으로 지시한다.
+# verbatim, with the reject_switch clause activated in R3-C1. The NEW
+# template keeps "no tool call" for the keep choice — there is no
+# rejected target session to record a precedent against.
+# confirm 경로 지시 템플릿. 문구는 Plan.md R2-C4 원문을 따르며,
+# reject_switch 절은 R3-C1 에서 활성화되었다. NEW 템플릿의 "유지" 선택은
+# 도구 호출 없음 유지 — 판례를 기록할 거부 대상 세션이 없다.
 _CONFIRM_SWITCH_TEMPLATE = (
     "[session-manager 라우터] 판정: {target}으로의 전환이 적합 (근거: {evidence}). "
     "AskUserQuestion으로 사용자에게 [전환 / 현재 세션 유지]를 물은 뒤, "
-    "전환 선택 시 session_switch를 호출하라. 유지 선택 시 아무 도구도 호출하지 마라."
+    "전환 선택 시 session_switch를 호출하라. 유지 선택 시 "
+    "reject_switch(rejected_target='{target}', "
+    "prompt_gist=<사용자 프롬프트 요지 한 줄>)를 호출하라."
 )
 _CONFIRM_NEW_TEMPLATE = (
     "[session-manager 라우터] 판정: 이 프롬프트는 기존 세션들의 소관이 아니다 "
