@@ -4,6 +4,7 @@ command_matcher 단위 테스트.
 
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
+    match_back_command,
     match_intercept_command,
 )
 
@@ -185,3 +186,33 @@ class TestEdgeCases:
         """
         result = match_intercept_command("/rename foo [bar]")
         assert result == InterceptedCommand("rename", "foo")
+
+
+class TestMatchBackCommand:
+    """/back matching (R3-C3) — wrapper-native, argument-free.
+    /back 매칭 (R3-C3) — 래퍼 자체 명령, 인자 없음.
+    """
+
+    def test_bare_back(self):
+        assert match_back_command("/back") is True
+
+    def test_trailing_whitespace(self):
+        assert match_back_command("/back   ") is True
+
+    def test_back_with_argument_not_matched(self):
+        # "/back x" is not an undo request — falls through to the TUI.
+        # "/back x" 는 undo 요청이 아니다 — TUI 로 흘러간다.
+        assert match_back_command("/back x") is False
+
+    def test_backup_not_matched(self):
+        assert match_back_command("/backup") is False
+
+    def test_not_intercept_whitelisted(self):
+        # /back must not enter the observe-and-forward path.
+        # /back 은 관찰 후 통과 경로에 들어가면 안 된다.
+        assert match_intercept_command("/back") is None
+
+    def test_none_and_empty(self):
+        assert match_back_command(None) is False
+        assert match_back_command("") is False
+        assert match_back_command("   ") is False

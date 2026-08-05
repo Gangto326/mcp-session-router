@@ -19,6 +19,7 @@ from session_manager import summarizer
 from session_manager.models import SessionMetadata
 from session_manager.storage.file_store import SessionStore
 from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS
+from session_manager.wrapper import wrapper_state
 from session_manager.wrapper.pty_wrapper import (
     AUTO_CONFIRM_PATTERNS,
     CLEAR_COMMAND_RE,
@@ -386,6 +387,183 @@ class TestNewFlow:
         wrapper._advance_new(pending)
         assert wrapper.mode == "passthrough"
         assert wrapper._pending_action is None
+
+
+class TestBackCommand:
+    """/back undo (R3-C3): transition recording and reverse execution.
+
+    /back 되돌리기 (R3-C3) — 전환 기록과 역방향 실행.
+    """
+
+    RECORD = {
+        "from": "frontend",
+        "to": "backend",
+        "user_prompt": "미스라우팅된 프롬프트\n둘째 줄",
+        "at": "2026-08-05T00:00:00+00:00",
+    }
+
+    def _complete_switch(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        handoff: dict,
+        target: str = "bar",
+        user_prompt: str = "p",
+    ) -> None:
+        _capture_injects(wrapper, monkeypatch)
+        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
+        pending = _PendingAction(
+            action_type="switch",
+            target=target,
+            handoff=handoff,
+            user_prompt=user_prompt,
+            stage="await_handoff_submit",
+        )
+        wrapper._pending_action = pending
+        wrapper._advance_switch(pending)
+
+    def test_switch_completion_records_last_transition(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        self._complete_switch(wrapper, monkeypatch, handoff={"from": "foo"})
+        record = wrapper._last_transition
+        assert record is not None
+        assert record["from"] == "foo"
+        assert record["to"] == "bar"
+        assert record["user_prompt"] == "p"
+        # Persisted too, so /back survives a wrapper restart.
+        # 영속화도 됨 — /back 이 래퍼 재시작을 견딘다.
+        assert wrapper_state.load_last_transition(tmp_path) == record
+
+    def test_back_marked_switch_not_recorded(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # A /back reverse switch must not re-arm the undo (ping-pong).
+        # /back 역방향 전환이 undo 를 재장전하면 핑퐁이 된다.
+        self._complete_switch(
+            wrapper, monkeypatch, handoff={"from": "wrong", "back": True}
+        )
+        assert wrapper._last_transition is None
+        assert wrapper_state.load_last_transition(tmp_path) is None
+
+    def test_switch_without_from_not_recorded(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Unregistered start: no origin to return to.
+        # 미등록 시작 — 되돌아갈 곳이 없다.
+        self._complete_switch(wrapper, monkeypatch, handoff={})
+        assert wrapper._last_transition is None
+
+    def test_new_completion_records_last_transition(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _capture_injects(wrapper, monkeypatch)
+        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
+        pending = _PendingAction(
+            action_type="new",
+            target="",
+            handoff={"from": "foo"},
+            user_prompt="새 주제",
+            stage="await_new_handoff_submit",
+            new_session_name="fresh",
+        )
+        wrapper._pending_action = pending
+        wrapper._advance_new(pending)
+        record = wrapper._last_transition
+        assert record is not None
+        assert record["from"] == "foo"
+        assert record["to"] == "fresh"
+
+    def test_back_executes_reverse_switch(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        store = SessionStore(tmp_path)
+        store.save_session(SessionMetadata.new(name="frontend", title="차트"))
+        wrapper._last_transition = dict(self.RECORD)
+        wrapper_state.save_last_transition(tmp_path, dict(self.RECORD))
+        send = MagicMock()
+        monkeypatch.setattr(wrapper.socket_server, "send", send)
+
+        wrapper._handle_back_command()
+
+        # Reverse switch registered through the ordinary machinery.
+        # 일반 SWITCH 머신을 통해 역방향 전환이 등록된다.
+        pending = wrapper._pending_action
+        assert pending is not None
+        assert pending.action_type == "switch"
+        assert pending.target == "frontend"
+        assert pending.user_prompt == self.RECORD["user_prompt"]
+        assert pending.handoff.get("back") is True
+        assert pending.handoff.get("from") == "backend"
+
+        # One-shot: the record is consumed in memory and on disk.
+        # 1회용 — 기록이 메모리·디스크 양쪽에서 소비된다.
+        assert wrapper._last_transition is None
+        assert wrapper_state.load_last_transition(tmp_path) is None
+
+        # Rejection precedent on the origin session, gist = first line.
+        # 복귀 세션에 거부 판례 기록 — gist 는 첫 줄.
+        origin = store.load_session_by_name("frontend")
+        assert origin is not None
+        assert len(origin.precedents) == 1
+        precedent = origin.precedents[0]
+        assert precedent.kept_in == "frontend"
+        assert precedent.rejected == "backend"
+        assert precedent.prompt_gist == "미스라우팅된 프롬프트"
+
+        # MCP pointer invalidation goes out over the socket.
+        # MCP 포인터 무효화가 소켓으로 나간다.
+        signals = [c.args[0] for c in send.call_args_list]
+        assert {"action": "session_command", "command": "back", "args": ""} in signals
+
+    def test_back_without_record_is_noop(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        send = MagicMock()
+        monkeypatch.setattr(wrapper.socket_server, "send", send)
+        wrapper._handle_back_command()
+        assert wrapper._pending_action is None
+        send.assert_not_called()
+
+    def test_back_during_pending_action_ignored(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        send = MagicMock()
+        monkeypatch.setattr(wrapper.socket_server, "send", send)
+        inflight = _PendingAction(
+            action_type="switch",
+            target="bar",
+            handoff={},
+            user_prompt="",
+            stage="await_resume_prompt",
+        )
+        wrapper._pending_action = inflight
+        wrapper._last_transition = dict(self.RECORD)
+
+        wrapper._handle_back_command()
+
+        # The in-flight action and the undo record are both untouched.
+        # 진행 중 액션과 undo 기록 둘 다 그대로다.
+        assert wrapper._pending_action is inflight
+        assert wrapper._last_transition == self.RECORD
+        send.assert_not_called()
 
 
 class TestHandshake:
