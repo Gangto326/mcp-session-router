@@ -46,6 +46,17 @@ _COMMAND_RE = re.compile(
     r"^/(" + "|".join(KNOWN_COMMANDS) + r")(?:\s+(\S.*?))?\s*$"
 )
 
+# /back (R3-C3) is matched separately from KNOWN_COMMANDS on purpose:
+# those are observe-and-forward (real Claude Code commands), while /back
+# does not exist in Claude Code — the wrapper intercepts it and handles
+# it itself, never forwarding. No arguments allowed: "/back x" is not an
+# undo request and falls through to the TUI.
+# /back (R3-C3) 은 의도적으로 KNOWN_COMMANDS 와 분리 매칭한다: 그쪽은
+# "관찰 후 통과" (실제 Claude Code 명령) 경로이고, /back 은 Claude Code 에
+# 없는 명령 — 래퍼가 가로채 자체 처리하며 절대 forward 하지 않는다.
+# 인자는 허용하지 않는다: "/back x" 는 undo 요청이 아니므로 TUI 로 흘려보낸다.
+_BACK_COMMAND_RE = re.compile(r"^/back\s*$")
+
 # Heuristic: strip Ink-style placeholder hints like
 # ``[conversation id or search term]`` that may follow the user's input.
 # False-positive risk if a user genuinely types ``[...]`` as the argument —
@@ -123,3 +134,21 @@ def match_intercept_command(prompt_text: str | None) -> InterceptedCommand | Non
         },
     )
     return InterceptedCommand(command=command, args=args)
+
+
+def match_back_command(prompt_text: str | None) -> bool:
+    """Return True if ``prompt_text`` is the wrapper-native ``/back`` command.
+
+    ``prompt_text`` 가 래퍼 자체 명령 ``/back`` 이면 True.
+    """
+    if not prompt_text or not prompt_text.strip():
+        return False
+    cleaned = _PLACEHOLDER_RE.sub("", prompt_text)
+    matched = _BACK_COMMAND_RE.match(cleaned) is not None
+    if matched:
+        debug_log.log(
+            "CMD_MATCH",
+            "USER",
+            {"matched": True, "command": "back", "prompt": prompt_text},
+        )
+    return matched

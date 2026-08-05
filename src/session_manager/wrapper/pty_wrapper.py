@@ -50,11 +50,14 @@ from session_manager.hooks.user_prompt_submit import (
     _load_routing_mode,
 )
 from session_manager.lifecycle import get_cleanup_period_days
+from session_manager.models.session import PrecedentRecord
 from session_manager.storage.file_store import _SESSION_MANAGER_DIRNAME, SessionStore
 from session_manager.summarizer import SummarizerWorker, SummaryTask
 from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS, scan_dialogue_growth
+from session_manager.wrapper import wrapper_state
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
+    match_back_command,
     match_intercept_command,
 )
 from session_manager.wrapper.handoff_formatter import format_handoff_injection
@@ -110,6 +113,14 @@ AGENT_GUIDE_PATH = (Path(__file__).parent.parent / "AGENT_GUIDE.md").resolve()
 # /clear 관찰 — 대화 내용이 곧 지워지므로 활성 세션을 요약할 마지막
 # 기회다. 명령 자체는 손대지 않고 그대로 통과시킨다.
 CLEAR_COMMAND_RE = re.compile(r"^/clear(\s|$)")
+
+# Ctrl+U — clears Claude Code's input line, slash-command popup included
+# (measured 3/3, docs/poc/R3-back.md). Used to erase the typed /back
+# before the wrapper handles it, since the \r is never forwarded.
+# Ctrl+U — Claude Code 입력란을 지운다. 슬래시 명령 팝업이 열려 있어도
+# 동작 (실측 3/3, docs/poc/R3-back.md). /back 은 \r 을 forward 하지
+# 않으므로, 래퍼가 처리하기 전에 타이핑된 텍스트를 이것으로 지운다.
+ERASE_INPUT_LINE = b"\x15"
 
 Mode = Literal["passthrough", "filtering"]
 
@@ -299,6 +310,15 @@ class SessionManagerWrapper:
         self._dialogue_scan_conv_id: str | None = None
         self._dialogue_scan_offset: int = 0
         self._dialogue_scan_chars: int = 0
+
+        # Most recent wrapper-executed transition, the target of /back
+        # (R3-C3). Memory-first with state.json persistence so the undo
+        # survives a wrapper restart. Consumed on use (one-shot).
+        # 가장 최근의 래퍼 실행 전환 — /back (R3-C3) 의 대상. 메모리 우선
+        # + state.json 영속화로 래퍼 재시작을 견딘다. 사용 시 소비 (1회용).
+        self._last_transition: dict[str, Any] | None = (
+            wrapper_state.load_last_transition(Path(self.project_path))
+        )
 
     def start(self) -> None:
         """
@@ -665,6 +685,13 @@ class SessionManagerWrapper:
             matched = match_intercept_command(prompt_text)
             if matched is not None:
                 self._observe_session_command(matched)
+            elif match_back_command(prompt_text):
+                # Wrapper-native command: never forward — Claude Code has
+                # no /back and the \r would only submit an unknown command.
+                # 래퍼 자체 명령 — forward 금지. Claude Code 에 /back 은
+                # 없으므로 \r 은 unknown command 제출만 만든다.
+                self._handle_back_command()
+                return
             elif prompt_text and CLEAR_COMMAND_RE.match(prompt_text.strip()):
                 # /clear wipes the conversation — summarise it while it's
                 # still there.
@@ -731,6 +758,160 @@ class SessionManagerWrapper:
                 "args": matched.args,
             }
         )
+
+    # ------------------------------------------------------------- /back undo
+    # /back 되돌리기 (R3-C3) -----------------------------------------------------
+
+    def _notify_user(self, text: str) -> None:
+        """Print one wrapper status line to the user's terminal.
+
+        래퍼 상태 한 줄을 사용자 터미널에 출력한다. Ink 의 다음 redraw 가
+        덮을 수 있는 일시적 표시로 충분하다.
+        """
+        if self._stdout_fd < 0:
+            return
+        try:
+            os.write(self._stdout_fd, f"\r\n[session-manager] {text}\r\n".encode())
+        except OSError:
+            pass
+
+    def _handle_back_command(self) -> None:
+        """Undo the most recent wrapper-executed transition.
+
+        가장 최근의 래퍼 실행 전환을 되돌린다.
+
+        The typed ``/back`` is erased with Ctrl+U (measured,
+        docs/poc/R3-back.md) since its \\r is never forwarded. Then the
+        recorded transition is executed in reverse through the ordinary
+        SWITCH machinery: resume the original session, re-inject the
+        prompt that was misrouted, and record the rejection as a
+        precedent (R3-C1) so the judge stops proposing it.
+
+        타이핑된 ``/back`` 은 \\r 을 forward 하지 않으므로 Ctrl+U 로
+        지운다 (실측, docs/poc/R3-back.md). 이후 기록된 전환을 일반 SWITCH
+        머신으로 역방향 실행한다 — 원래 세션 resume, 잘못 이동했던
+        프롬프트 재주입, 그리고 이 거부를 판례 (R3-C1) 로 기록해 판정기가
+        같은 제안을 멈추게 한다.
+        """
+        try:
+            os.write(self.pty_fd, ERASE_INPUT_LINE)
+        except OSError:
+            pass
+        if self._pending_action is not None:
+            self._notify_user("세션 전환이 진행 중입니다 — /back 은 무시됩니다")
+            return
+        record = self._last_transition or wrapper_state.load_last_transition(
+            Path(self.project_path)
+        )
+        if record is None:
+            self._notify_user("되돌릴 전환이 없습니다")
+            debug_log.log(
+                "BACK", "USER", {"result": "no_last_transition"},
+                session=self._current_session_name,
+            )
+            return
+        # One-shot undo: consume the record first so a repeated /back
+        # cannot ping-pong between the two sessions.
+        # 1회용 undo — 기록을 먼저 소비해 /back 연타가 두 세션 사이를
+        # 오가지 못하게 한다.
+        self._last_transition = None
+        wrapper_state.clear_last_transition(Path(self.project_path))
+
+        self._record_back_precedent(record)
+        user_prompt = record.get("user_prompt")
+        if not isinstance(user_prompt, str):
+            user_prompt = ""
+        origin, wrong = record["from"], record["to"]
+        debug_log.log(
+            "BACK",
+            "USER",
+            {"result": "undo", "origin": origin, "wrong": wrong},
+            session=self._current_session_name,
+        )
+        self._notify_user(f"⇄ {origin} 세션으로 되돌립니다 (직전: {wrong})")
+        # Reverse switch. handoff["back"] marks it so completion does NOT
+        # record a new last_transition (no /back-of-/back ping-pong).
+        # 역방향 SWITCH. handoff["back"] 표시로 완료 시 새 last_transition
+        # 을 기록하지 않는다 (/back 의 /back 핑퐁 방지).
+        self._handle_switch(
+            origin,
+            {
+                "from": wrong,
+                "back": True,
+                "message": f"/back — {wrong} 로의 직전 전환을 되돌려 복귀",
+            },
+            user_prompt,
+        )
+        # Same pointer-invalidation path as manual /resume observation:
+        # the MCP re-resolves the session from the active conversation.
+        # 수동 /resume 관찰과 동일한 포인터 무효화 경로 — MCP 는 활성
+        # conversation 으로부터 세션을 재해석한다.
+        self.socket_server.send(
+            {"action": "session_command", "command": "back", "args": ""}
+        )
+
+    def _record_back_precedent(self, record: dict[str, Any]) -> None:
+        """Record the /back as a rejection precedent on the origin session.
+
+        /back 을 복귀(원래) 세션의 거부 판례로 기록한다. kept_in = 복귀
+        세션, rejected = 잘못 갔던 세션. 기록 경로는 MCP reject_switch 와
+        동일한 F15 잠금 mutate 다.
+        """
+        user_prompt = record.get("user_prompt")
+        gist = ""
+        if isinstance(user_prompt, str) and user_prompt.strip():
+            gist = user_prompt.strip().splitlines()[0]
+        if not gist:
+            gist = "(재주입 프롬프트 없음)"
+        precedent = PrecedentRecord.new(
+            prompt_gist=gist, kept_in=record["from"], rejected=record["to"]
+        )
+
+        def apply(session: Any) -> None:
+            session.precedents.append(precedent)
+
+        try:
+            saved = SessionStore(Path(self.project_path)).mutate_session_by_name(
+                record["from"], apply
+            )
+        except Exception as exc:
+            saved = None
+            debug_log.log(
+                "BACK",
+                "WRAPPER",
+                {"op": "precedent", "result": "error", "error": str(exc)},
+            )
+        if saved is None:
+            debug_log.log(
+                "BACK",
+                "WRAPPER",
+                {
+                    "op": "precedent",
+                    "result": "session_not_found",
+                    "kept_in": record["from"],
+                },
+            )
+
+    def _record_last_transition(
+        self, from_name: object, to_name: object, user_prompt: str
+    ) -> None:
+        """Remember a completed wrapper-executed transition for /back.
+
+        완료된 래퍼 실행 전환을 /back 용으로 기억한다. 떠난 세션 이름을
+        모르면 (미등록 시작) 되돌아갈 곳이 없으므로 기록하지 않는다.
+        """
+        if not isinstance(from_name, str) or not from_name:
+            return
+        if not isinstance(to_name, str) or not to_name:
+            return
+        record = {
+            "from": from_name,
+            "to": to_name,
+            "user_prompt": user_prompt,
+            "at": wrapper_state.utc_now_iso(),
+        }
+        self._last_transition = record
+        wrapper_state.save_last_transition(Path(self.project_path), record)
 
     # ------------------------------------------------------- Summary triggers
     # 요약 트리거 ---------------------------------------------------------------
@@ -1410,6 +1591,16 @@ class SessionManagerWrapper:
             self._submit()
             self.mode = "passthrough"
             self._drain_input_queue()
+            # Completed transition becomes the /back target — unless this
+            # switch IS a /back (marked in the handoff), which must not
+            # re-arm the undo toward the rejected session.
+            # 완료된 전환이 /back 대상이 된다 — 단 이 전환 자체가 /back
+            # (handoff 에 표시) 이면 거부한 세션 쪽으로 undo 를 재장전하지
+            # 않는다.
+            if not pending.handoff.get("back"):
+                self._record_last_transition(
+                    pending.handoff.get("from"), pending.target, pending.user_prompt
+                )
             self._set_stage(pending, "done")
             self._pending_action = None
 
@@ -1568,6 +1759,15 @@ class SessionManagerWrapper:
             self._submit()
             self.mode = "passthrough"
             self._drain_input_queue()
+            # NEW is also a /back-able transition: the previous
+            # conversation still exists, so /resume can return to it.
+            # NEW 도 /back 가능한 전환이다 — 이전 conversation 은 그대로
+            # 남아 있어 /resume 으로 복귀할 수 있다.
+            self._record_last_transition(
+                pending.handoff.get("from"),
+                pending.new_session_name,
+                pending.user_prompt,
+            )
             self._set_stage(pending, "done")
             self._pending_action = None
         # `await_child_exit`와 `await_handshake` 단계에서는 프롬프트 감지로
