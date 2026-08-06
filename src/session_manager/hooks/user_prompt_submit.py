@@ -34,8 +34,16 @@ from pathlib import Path
 from typing import Any
 
 from session_manager import debug_log
-from session_manager.models.config import DEFAULT_ROUTING_MODE
-from session_manager.routing.judge import HOOK_REPLY_TIMEOUT_SECS
+from session_manager.models.config import (
+    DEFAULT_AUTO_ERROR_TOLERANCE,
+    DEFAULT_ROUTING_MODE,
+)
+from session_manager.routing import decision_log
+from session_manager.routing.judge import (
+    AUTO_HOOK_REPLY_TIMEOUT_SECS,
+    HOOK_REPLY_TIMEOUT_SECS,
+    calibrated_threshold,
+)
 from session_manager.storage.file_store import (
     _CONFIG_FILENAME,
     _SESSION_MANAGER_DIRNAME,
@@ -86,6 +94,24 @@ def _load_routing_mode(root: Path) -> str:
         return DEFAULT_ROUTING_MODE
     mode = data.get("routing_mode")
     return mode if isinstance(mode, str) else DEFAULT_ROUTING_MODE
+
+
+def _load_auto_error_tolerance(root: Path) -> float:
+    """Read the ``auto_error_tolerance`` policy parameter defensively.
+
+    정책 파라미터 ``auto_error_tolerance`` 를 방어적으로 읽는다. 파일·키
+    부재나 이상값 (0~1 범위 밖) 은 기본값으로 폴백.
+    """
+    try:
+        data = json.loads((root / _CONFIG_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return DEFAULT_AUTO_ERROR_TOLERANCE
+    if not isinstance(data, dict):
+        return DEFAULT_AUTO_ERROR_TOLERANCE
+    value = data.get("auto_error_tolerance")
+    if isinstance(value, int | float) and 0.0 < value < 1.0:
+        return float(value)
+    return DEFAULT_AUTO_ERROR_TOLERANCE
 
 
 def _count_active_sessions(root: Path) -> int:
@@ -147,7 +173,9 @@ def _prefilter(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _socket_round_trip(request: dict[str, Any]) -> dict[str, Any] | None:
+def _socket_round_trip(
+    request: dict[str, Any], timeout: float = HOOK_REPLY_TIMEOUT_SECS
+) -> dict[str, Any] | None:
     """
     One short-lived socket exchange with the wrapper: send one message,
     read one reply line. Returns the reply dict, or None on any failure
@@ -161,7 +189,7 @@ def _socket_round_trip(request: dict[str, Any]) -> dict[str, Any] | None:
         return None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(HOOK_REPLY_TIMEOUT_SECS)
+            sock.settimeout(timeout)
             sock.connect(socket_path)
             sock.sendall(
                 (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
@@ -182,50 +210,59 @@ def _socket_round_trip(request: dict[str, Any]) -> dict[str, Any] | None:
     return reply if isinstance(reply, dict) else None
 
 
-def _request_judgment(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _request_judgment(
+    payload: dict[str, Any], auto_gate: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
     """
     Ask the wrapper's judge host for a routing verdict.
 
-    The request is thin — prompt assembly happens wrapper-side.
+    The request is thin — prompt assembly happens wrapper-side. With an
+    *auto_gate* attached, the host may run one extra refute round in the
+    same warm process, so the reply timeout is extended accordingly
+    (deterministic — the hook knows beforehand whether a gate is sent).
 
     래퍼 판정 호스트에 라우팅 판정을 요청한다. 요청은 얇다 — 프롬프트
-    조립은 래퍼 측 담당.
+    조립은 래퍼 측 담당. *auto_gate* 동봉 시 호스트가 같은 웜 프로세스에
+    반박 라운드 1회를 추가로 돌릴 수 있으므로 회신 타임아웃을 그만큼
+    연장한다 (결정적 — 게이트 동봉 여부는 hook 이 사전에 안다).
     """
-    return _socket_round_trip(
-        {
-            "client": "hook",
-            "action": "judge_request",
-            "prompt": payload.get(FIELD_PROMPT),
-            "session_id": payload.get(FIELD_SESSION_ID),
-            "transcript_path": payload.get(FIELD_TRANSCRIPT_PATH),
-            "cwd": payload.get(FIELD_CWD),
-        }
-    )
+    request = {
+        "client": "hook",
+        "action": "judge_request",
+        "prompt": payload.get(FIELD_PROMPT),
+        "session_id": payload.get(FIELD_SESSION_ID),
+        "transcript_path": payload.get(FIELD_TRANSCRIPT_PATH),
+        "cwd": payload.get(FIELD_CWD),
+    }
+    timeout = HOOK_REPLY_TIMEOUT_SECS
+    if auto_gate is not None:
+        request["auto_gate"] = auto_gate
+        timeout = AUTO_HOOK_REPLY_TIMEOUT_SECS
+    return _socket_round_trip(request, timeout=timeout)
 
 
-def _calibrated_auto_threshold() -> float | None:
+def _calibrated_auto_threshold(root: Path) -> float | None:
     """
-    Confidence threshold for auto-switching, derived from the judgment
-    log's (confidence, accept/reject) history.
+    Confidence threshold for auto-switching, computed from the routing
+    decision log's (confidence, accept/reject) history (R3-C4).
 
-    LLM confidence is uncalibrated, so no fixed threshold is used (rule
-    8). A later phase computes this from accumulated logs (smallest
-    confidence whose historical acceptance rate clears the target with
-    Wilson-bound sample sufficiency). Until that exists there is no
-    defensible threshold — returning None makes auto mode degrade to the
-    confirm path, i.e. auto only truly activates once data has
-    accumulated.
+    LLM confidence is uncalibrated, so no fixed threshold exists (rule
+    8): the threshold is the smallest confidence whose historical
+    acceptance rate clears 1 - auto_error_tolerance with Wilson-bound
+    sample sufficiency. None (insufficient data) degrades auto mode to
+    the confirm path — auto only truly activates once data accumulates.
 
-    자동 전환용 confidence 임계 — 판정 로그의 (confidence, 수용/거부)
-    이력에서 산출한다.
+    자동 전환용 confidence 임계 — 라우팅 결정 로그의 (confidence,
+    수용/거부) 이력에서 산출한다 (R3-C4).
 
-    LLM confidence 는 보정되지 않은 값이므로 고정 임계를 쓰지 않는다
-    (규칙 8). 후속 Phase 가 누적 로그에서 임계를 산출한다 (과거 수용률이
-    목표치를 넘는 최소 confidence, Wilson 하한으로 표본 충분성 판정).
-    그 전까지는 옹호 가능한 임계가 없다 — None 반환으로 auto 모드는
-    confirm 경로로 완화된다. 즉 auto 는 데이터가 쌓여야 실제로 켜진다.
+    LLM confidence 는 보정되지 않은 값이므로 고정 임계는 없다 (규칙 8):
+    임계는 과거 수용률의 Wilson 하한이 1 - auto_error_tolerance 를 넘는
+    최소 confidence 다. None (데이터 부족) 이면 auto 모드는 confirm
+    경로로 완화된다 — auto 는 데이터가 쌓여야 실제로 켜진다.
     """
-    return None
+    project = root.parent
+    pairs = decision_log.labeled_pairs(decision_log.load_events(project))
+    return calibrated_threshold(pairs, _load_auto_error_tolerance(root))
 
 
 # Confirm-path instruction templates. Wording follows Plan.md R2-C4
@@ -334,11 +371,32 @@ def _route(payload: dict[str, Any]) -> None:
     (block + 래퍼 전환 + 재주입)는 auto 모드에서 보정 임계가 존재할
     때만 발동한다. 모든 결과가 호출자에서 exit 0 으로 끝난다.
     """
-    reply = _request_judgment(payload)
+    cwd = payload.get(FIELD_CWD)
+    root = (
+        Path(cwd) / _SESSION_MANAGER_DIRNAME
+        if isinstance(cwd, str) and cwd
+        else None
+    )
+    mode = _load_routing_mode(root) if root is not None else DEFAULT_ROUTING_MODE
+
+    # The auto gate is decided BEFORE the judgment request: the judge
+    # host runs the refute round inside the same warm process, so it
+    # must learn the threshold with the request (R3-C4).
+    # auto 게이트는 판정 요청 **전에** 결정한다 — 반박 라운드를 같은 웜
+    # 프로세스에서 돌리려면 판정 호스트가 요청과 함께 임계를 알아야
+    # 한다 (R3-C4).
+    auto_gate: dict[str, Any] | None = None
+    threshold: float | None = None
+    if mode == "auto" and root is not None:
+        threshold = _calibrated_auto_threshold(root)
+        if threshold is not None:
+            auto_gate = {"threshold": threshold}
+
+    reply = _request_judgment(payload, auto_gate)
     debug_log.log(
         "HOOK_ROUTE",
         "SYSTEM",
-        {"reply": reply},
+        {"reply": reply, "auto_gate": auto_gate},
         conv_id=payload.get(FIELD_SESSION_ID),
     )
     if reply is None or not reply.get("ok"):
@@ -355,27 +413,38 @@ def _route(payload: dict[str, Any]) -> None:
         # 재판정은 세션 profile 위에 정의되는데 아직 아무도 채우지 않는다.
         return
 
-    cwd = payload.get(FIELD_CWD)
-    root = (
-        Path(cwd) / _SESSION_MANAGER_DIRNAME
-        if isinstance(cwd, str) and cwd
-        else None
-    )
-    mode = _load_routing_mode(root) if root is not None else DEFAULT_ROUTING_MODE
+    target = verdict.get("target")
+    confidence = verdict.get("confidence")
 
-    if mode == "auto" and action == "SWITCH":
-        threshold = _calibrated_auto_threshold()
-        confidence = verdict.get("confidence")
+    if auto_gate is not None and action == "SWITCH":
+        # Auto requires all three: confidence clears the calibrated
+        # threshold, the second-pass refutation explicitly failed to
+        # refute, and the wrapper ack'd the switch. Anything less —
+        # including a missing/unparseable refute — demotes to confirm.
+        # auto 는 셋 모두를 요구한다: confidence 가 보정 임계 이상,
+        # 2차 반박이 명시적으로 반박 실패 (refuted=false), 래퍼의 전환
+        # ack. 하나라도 아니면 — 반박 누락·파싱 불가 포함 — confirm 강등.
+        refute = reply.get("refute")
+        refute_passed = isinstance(refute, dict) and refute.get("refuted") is False
         if (
-            threshold is not None
-            and isinstance(confidence, int | float)
+            isinstance(confidence, int | float)
+            and threshold is not None
             and confidence >= threshold
+            and refute_passed
             and _execute_auto_switch(payload, verdict)
         ):
+            if root is not None and isinstance(target, str) and target:
+                # Auto proposals get no accept label (the user was not
+                # asked); only a later /back can label them rejected.
+                # auto 제안은 수용 라벨을 만들지 않는다 (사용자에게 묻지
+                # 않음) — 이후 /back 만이 거부 라벨을 남긴다.
+                decision_log.append_proposal(
+                    root.parent, target, float(confidence), mode="auto"
+                )
             debug_log.log(
                 "HOOK_ROUTE",
                 "SYSTEM",
-                {"path": "auto_block", "verdict": verdict},
+                {"path": "auto_block", "verdict": verdict, "refute": refute},
                 conv_id=payload.get(FIELD_SESSION_ID),
             )
             return
@@ -384,6 +453,20 @@ def _route(payload: dict[str, Any]) -> None:
     # NEW 는 자동 전환하지 않는다 — 세션 생성은 이름 결정이 필요하고,
     # 그것은 confirm 흐름의 사용자·LLM 몫이다.
     _emit_confirm_context(verdict)
+    if (
+        root is not None
+        and action == "SWITCH"
+        and isinstance(target, str)
+        and target
+        and isinstance(confidence, int | float)
+    ):
+        # Confirm proposals are the calibration source: session_switch
+        # labels them accepted, reject_switch / /back rejected (R3-C4).
+        # confirm 제안이 보정의 원천이다 — session_switch 가 수용 라벨,
+        # reject_switch·/back 이 거부 라벨을 남긴다 (R3-C4).
+        decision_log.append_proposal(
+            root.parent, target, float(confidence), mode=mode
+        )
     debug_log.log(
         "HOOK_ROUTE",
         "SYSTEM",

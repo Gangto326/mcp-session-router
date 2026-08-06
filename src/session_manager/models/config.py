@@ -29,18 +29,31 @@ DEFAULT_CLEANUP_PERIOD_DAYS = 30
 ROUTING_MODES = ("auto", "confirm", "off")
 DEFAULT_ROUTING_MODE = "confirm"
 
+# Policy parameter (rule 8, 3-way classification): the mis-switch rate
+# the user is willing to tolerate in auto mode. The auto gate targets an
+# acceptance rate of 1 - tolerance. The default (0.05 = 1 mis-switch
+# allowed per 20) is a CHOICE about risk preference, not a measured
+# fact — users adjust it in config.json.
+# 정책 파라미터 (규칙 8, 3분류): auto 모드에서 사용자가 감수할 오전환율.
+# auto 게이트의 목표 수용률 = 1 - tolerance. 기본값 (0.05 = 20회 중 1회
+# 오전환 허용) 은 측정된 사실이 아니라 위험 선호의 **선택**이다 —
+# 사용자가 config.json 에서 조정한다.
+DEFAULT_AUTO_ERROR_TOLERANCE = 0.05
+
 
 @dataclass
 class Config:
     socket_path: str
     cleanup_period_days: int = DEFAULT_CLEANUP_PERIOD_DAYS
     routing_mode: str = DEFAULT_ROUTING_MODE
+    auto_error_tolerance: float = DEFAULT_AUTO_ERROR_TOLERANCE
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "socket_path": self.socket_path,
             "cleanup_period_days": self.cleanup_period_days,
             "routing_mode": self.routing_mode,
+            "auto_error_tolerance": self.auto_error_tolerance,
         }
 
     @classmethod
@@ -51,4 +64,7 @@ class Config:
                 "cleanup_period_days", DEFAULT_CLEANUP_PERIOD_DAYS
             ),
             routing_mode=data.get("routing_mode", DEFAULT_ROUTING_MODE),
+            auto_error_tolerance=data.get(
+                "auto_error_tolerance", DEFAULT_AUTO_ERROR_TOLERANCE
+            ),
         )

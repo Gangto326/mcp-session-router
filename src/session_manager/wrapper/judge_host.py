@@ -333,7 +333,57 @@ class JudgeHost:
             },
             conv_id=request.get("session_id"),
         )
-        return {"ok": True, "verdict": verdict.to_dict()}
+        reply: dict[str, Any] = {"ok": True, "verdict": verdict.to_dict()}
+        refute = self._maybe_refute(request, verdict)
+        if refute is not None:
+            reply["refute"] = refute
+        return reply
+
+    def _maybe_refute(
+        self, request: dict[str, Any], verdict: judge.Verdict
+    ) -> dict[str, Any] | None:
+        """Run the second-pass refutation when the verdict qualifies for auto.
+
+        판정이 auto 자격일 때 2차 반박 검증을 수행한다 (R3-C4).
+
+        Runs one extra turn in the SAME warm process right before its
+        retirement (rationale measured — judge.REFUTE_PROMPT_TEMPLATE
+        comment). Only fires when the hook attached an ``auto_gate`` and
+        the verdict is a SWITCH at or above the calibrated threshold —
+        so the extra round-trip cost is bounded to imminent auto
+        switches. A timeout or unparseable answer reports refuted=true:
+        an unverified switch must not run automatically.
+
+        은퇴 직전의 **같은 웜 프로세스**에 1턴을 추가로 돌린다 (근거
+        실측 — judge.REFUTE_PROMPT_TEMPLATE 주석). hook 이 ``auto_gate``
+        를 동봉했고 판정이 보정 임계 이상의 SWITCH 일 때만 발동 — 추가
+        왕복 비용이 임박한 자동 전환에만 한정된다. 타임아웃·파싱 불가는
+        refuted=true 로 보고한다: 검증되지 않은 전환을 자동 실행하면
+        안 된다.
+        """
+        auto_gate = request.get("auto_gate")
+        if not isinstance(auto_gate, dict):
+            return None
+        threshold = auto_gate.get("threshold")
+        if not isinstance(threshold, int | float):
+            return None
+        if verdict.action != judge.ACTION_SWITCH or verdict.confidence < threshold:
+            return None
+        raw = self._round_trip(
+            judge.build_refute_prompt(verdict.to_dict()), judge.JUDGE_TIMEOUT_SECS
+        )
+        parsed = judge.parse_refute(raw) if raw is not None else None
+        if parsed is None:
+            result = {"refuted": True, "reason": "refute_unavailable"}
+        else:
+            result = parsed
+        debug_log.log(
+            "JUDGE",
+            "WRAPPER",
+            {"op": "refute", "result": result, "raw": raw},
+            conv_id=request.get("session_id"),
+        )
+        return result
 
     def _resolve_current_session(
         self, request: dict[str, Any]

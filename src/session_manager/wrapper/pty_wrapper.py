@@ -51,6 +51,7 @@ from session_manager.hooks.user_prompt_submit import (
 )
 from session_manager.lifecycle import get_cleanup_period_days
 from session_manager.models.session import PrecedentRecord
+from session_manager.routing import decision_log
 from session_manager.storage.file_store import _SESSION_MANAGER_DIRNAME, SessionStore
 from session_manager.summarizer import SummarizerWorker, SummaryTask
 from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS, scan_dialogue_growth
@@ -822,6 +823,13 @@ class SessionManagerWrapper:
         if not isinstance(user_prompt, str):
             user_prompt = ""
         origin, wrong = record["from"], record["to"]
+        # Calibration label (R3-C4): /back is a rejection — this is also
+        # how auto switches feed calibration data after auto activates.
+        # 보정 라벨 (R3-C4) — /back 은 거부다. auto 활성 후에도 auto
+        # 전환의 보정 데이터가 갱신되는 경로가 바로 이것이다.
+        decision_log.append_label(
+            Path(self.project_path), wrong, decision_log.LABEL_REJECT, source="back"
+        )
         debug_log.log(
             "BACK",
             "USER",
@@ -1440,12 +1448,20 @@ class SessionManagerWrapper:
             user_prompt_val = message.get("user_prompt", "")
             user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
             verdict = message.get("verdict")
-            handoff = {"from": self._current_session_name}
+            origin = self._current_session_name
+            handoff = {"from": origin}
             if isinstance(verdict, dict):
                 reason = verdict.get("reason")
                 if isinstance(reason, str) and reason:
                     handoff["router_reason"] = reason
             self._handle_switch(target, handoff, user_prompt)
+            # Status line for the unattended switch (Plan R3-C4 wording)
+            # — the user must learn about it and how to undo it.
+            # 무인 전환의 상태 줄 (Plan R3-C4 원문) — 사용자는 전환 사실과
+            # 되돌리는 방법을 알아야 한다.
+            self._notify_user(
+                f"⇄ {target} 세션으로 전환됨 (이전: {origin}) — 되돌리려면 /back"
+            )
         elif action == "current_session":
             # MCP resolved or changed the current session. The wrapper has
             # no other way to learn it — the handshake only flows

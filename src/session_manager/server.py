@@ -39,6 +39,7 @@ from session_manager.models.session import (
     SessionStatus,
     TransitionRecord,
 )
+from session_manager.routing import decision_log
 from session_manager.state import SessionManagerState
 from session_manager.storage import FieldStore, ProjectContextStore, SessionStore
 from session_manager.wrapper.socket_client import WrapperSocketClient
@@ -539,6 +540,16 @@ def session_switch(
 
         app.session_store.mutate_session_by_name(current_name, apply_outgoing)
 
+    # Calibration label (R3-C4): an executed switch is the "accept" side
+    # of the confirm flow. Pairing with the originating proposal happens
+    # at read time — a voluntary switch with no proposal stays orphan.
+    # 보정 라벨 (R3-C4) — 실행된 전환은 confirm 흐름의 "수용" 쪽이다.
+    # 제안과의 짝짓기는 읽기 시점에 일어난다 — 제안 없는 자발 전환은
+    # 무연고로 남는다.
+    decision_log.append_label(
+        app.project_path, target, decision_log.LABEL_ACCEPT, source="session_switch"
+    )
+
     # Send SWITCH signal to the wrapper.
     # 래퍼에 SWITCH 신호를 전송한다.
     handoff = {
@@ -738,6 +749,16 @@ def reject_switch(rejected_target: str, prompt_gist: str, ctx: Context) -> dict:
             app,
             {"recorded": False, "reason": "no_current_session"},
         )
+
+    # Calibration label (R3-C4): the explicit "keep" choice is the
+    # reject side of the confirm flow.
+    # 보정 라벨 (R3-C4) — 명시적 "유지" 선택은 confirm 흐름의 거부 쪽이다.
+    decision_log.append_label(
+        app.project_path,
+        rejected_target,
+        decision_log.LABEL_REJECT,
+        source="reject_switch",
+    )
 
     record = PrecedentRecord.new(
         prompt_gist=prompt_gist,
