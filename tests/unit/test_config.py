@@ -6,6 +6,7 @@ import pytest
 
 from session_manager.models import Config
 from session_manager.models.config import (
+    DEFAULT_AUTO_ERROR_TOLERANCE,
     DEFAULT_CLEANUP_PERIOD_DAYS,
     DEFAULT_ROUTING_MODE,
     ROUTING_MODES,
@@ -58,3 +59,22 @@ class TestConfigRoundtrip:
     def test_from_dict_missing_socket_path_raises(self) -> None:
         with pytest.raises(KeyError):
             Config.from_dict({"cleanup_period_days": 10})
+
+
+class TestAutoErrorTolerance:
+    """R3-C4 policy parameter: auto_error_tolerance.
+
+    R3-C4 정책 파라미터 — auto_error_tolerance.
+    """
+
+    def test_default_is_five_percent(self) -> None:
+        assert DEFAULT_AUTO_ERROR_TOLERANCE == 0.05
+        assert Config(socket_path="/s").auto_error_tolerance == 0.05
+
+    def test_roundtrip_preserves_override(self) -> None:
+        config = Config(socket_path="/s", auto_error_tolerance=0.1)
+        assert Config.from_dict(config.to_dict()).auto_error_tolerance == 0.1
+
+    def test_from_dict_missing_key_uses_default(self) -> None:
+        config = Config.from_dict({"socket_path": "/s"})
+        assert config.auto_error_tolerance == DEFAULT_AUTO_ERROR_TOLERANCE

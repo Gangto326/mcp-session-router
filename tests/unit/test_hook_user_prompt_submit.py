@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from session_manager.hooks import user_prompt_submit as hook
+from session_manager.routing import decision_log
 
 
 def _write_session(sessions_dir: Path, name: str, **extra: object) -> None:
@@ -251,7 +252,7 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(action="STAY", reason="연속 작업"),
+            lambda _p, _g=None: self._reply(action="STAY", reason="연속 작업"),
         )
         hook._route(self._routable_payload(project))
         assert capsys.readouterr().out == ""
@@ -265,7 +266,7 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(action="ASK", reason="후보 다수"),
+            lambda _p, _g=None: self._reply(action="ASK", reason="후보 다수"),
         )
         hook._route(self._routable_payload(project))
         assert capsys.readouterr().out == ""
@@ -276,12 +277,12 @@ class TestRouteExecution:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture,
     ) -> None:
-        monkeypatch.setattr(hook, "_request_judgment", lambda _p: None)
+        monkeypatch.setattr(hook, "_request_judgment", lambda _p, _g=None: None)
         hook._route(self._routable_payload(project))
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: {"ok": False, "reason": "judge_unavailable"},
+            lambda _p, _g=None: {"ok": False, "reason": "judge_unavailable"},
         )
         hook._route(self._routable_payload(project))
         assert capsys.readouterr().out == ""
@@ -295,7 +296,7 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(
+            lambda _p, _g=None: self._reply(
                 action="SWITCH",
                 target="backend",
                 confidence=0.9,
@@ -324,7 +325,7 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(
+            lambda _p, _g=None: self._reply(
                 action="SWITCH",
                 target="backend",
                 confidence=0.9,
@@ -349,7 +350,7 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(action="NEW", reason="새 주제"),
+            lambda _p, _g=None: self._reply(action="NEW", reason="새 주제"),
         )
         hook._route(self._routable_payload(project))
         context = json.loads(capsys.readouterr().out)["hookSpecificOutput"][
@@ -366,7 +367,7 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(action="NEW", reason="새 주제"),
+            lambda _p, _g=None: self._reply(action="NEW", reason="새 주제"),
         )
         hook._route(self._routable_payload(project))
         context = json.loads(capsys.readouterr().out)["hookSpecificOutput"][
@@ -374,6 +375,12 @@ class TestRouteExecution:
         ]
         assert "session_create" in context
         assert "새 주제" in context
+
+    def _auto_reply(self, refute: dict | None = None, **verdict: object) -> dict:
+        reply = self._reply(**verdict)
+        if refute is not None:
+            reply["refute"] = refute
+        return reply
 
     def test_auto_without_calibration_falls_back_to_confirm(
         self,
@@ -385,7 +392,7 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(
+            lambda _p, _g=None: self._reply(
                 action="SWITCH", target="backend", confidence=0.99, evidence="e"
             ),
         )
@@ -401,19 +408,24 @@ class TestRouteExecution:
         capsys: pytest.CaptureFixture,
     ) -> None:
         sent: list[dict] = []
+        gates: list[dict | None] = []
 
-        def fake_round_trip(request: dict) -> dict:
+        def fake_round_trip(request: dict, timeout: float = 0.0) -> dict:
             sent.append(request)
             return {"type": "ack", "ok": True}
 
-        monkeypatch.setattr(
-            hook,
-            "_request_judgment",
-            lambda _p: self._reply(
-                action="SWITCH", target="backend", confidence=0.95, evidence="e"
-            ),
-        )
-        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda: 0.9)
+        def fake_judgment(_payload: dict, auto_gate: dict | None = None) -> dict:
+            gates.append(auto_gate)
+            return self._auto_reply(
+                refute={"refuted": False, "reason": "타당"},
+                action="SWITCH",
+                target="backend",
+                confidence=0.95,
+                evidence="e",
+            )
+
+        monkeypatch.setattr(hook, "_request_judgment", fake_judgment)
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda _root: 0.9)
         monkeypatch.setattr(hook, "_socket_round_trip", fake_round_trip)
 
         hook._route(self._routable_payload(project, mode="auto"))
@@ -421,11 +433,60 @@ class TestRouteExecution:
         out = json.loads(capsys.readouterr().out)
         assert out["decision"] == "block"
         assert "backend" in out["reason"]
+        # The gate travelled with the judgment request (refute runs
+        # wrapper-side in the same warm process).
+        # 게이트가 판정 요청과 함께 전달됐다 (반박은 래퍼 측 동일 웜
+        # 프로세스에서 돈다).
+        assert gates == [{"threshold": 0.9}]
         assert len(sent) == 1
         assert sent[0]["action"] == "route_switch"
         assert sent[0]["client"] == "hook"
         assert sent[0]["target"] == "backend"
         assert sent[0]["user_prompt"] == "다음 작업을 진행해"
+
+    def test_auto_refuted_falls_back_to_confirm(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # 2차 반박이 성공하면 (refuted=true) confirm 으로 강등된다
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p, _g=None: self._auto_reply(
+                refute={"refuted": True, "reason": "근거 빈약"},
+                action="SWITCH",
+                target="backend",
+                confidence=0.95,
+                evidence="e",
+            ),
+        )
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda _root: 0.9)
+        hook._route(self._routable_payload(project, mode="auto"))
+        out = capsys.readouterr().out
+        assert "decision" not in out
+        assert "session_switch" in out
+
+    def test_auto_missing_refute_falls_back_to_confirm(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # 반박 결과가 회신에 없으면 (미검증 전환) 자동 실행하지 않는다
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p, _g=None: self._reply(
+                action="SWITCH", target="backend", confidence=0.95, evidence="e"
+            ),
+        )
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda _root: 0.9)
+        hook._route(self._routable_payload(project, mode="auto"))
+        out = capsys.readouterr().out
+        assert "decision" not in out
+        assert "session_switch" in out
 
     def test_auto_below_threshold_falls_back_to_confirm(
         self,
@@ -436,11 +497,11 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(
+            lambda _p, _g=None: self._reply(
                 action="SWITCH", target="backend", confidence=0.5, evidence="e"
             ),
         )
-        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda: 0.9)
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda _root: 0.9)
         hook._route(self._routable_payload(project, mode="auto"))
         out = capsys.readouterr().out
         assert "decision" not in out
@@ -457,12 +518,18 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(
-                action="SWITCH", target="backend", confidence=0.95, evidence="e"
+            lambda _p, _g=None: self._auto_reply(
+                refute={"refuted": False, "reason": "타당"},
+                action="SWITCH",
+                target="backend",
+                confidence=0.95,
+                evidence="e",
             ),
         )
-        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda: 0.9)
-        monkeypatch.setattr(hook, "_socket_round_trip", lambda _r: None)
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda _root: 0.9)
+        monkeypatch.setattr(
+            hook, "_socket_round_trip", lambda _r, timeout=0.0: None
+        )
         hook._route(self._routable_payload(project, mode="auto"))
         out = capsys.readouterr().out
         assert "decision" not in out
@@ -477,13 +544,119 @@ class TestRouteExecution:
         monkeypatch.setattr(
             hook,
             "_request_judgment",
-            lambda _p: self._reply(action="NEW", confidence=0.99, reason="새 주제"),
+            lambda _p, _g=None: self._reply(
+                action="NEW", confidence=0.99, reason="새 주제"
+            ),
         )
-        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda: 0.9)
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda _root: 0.9)
         hook._route(self._routable_payload(project, mode="auto"))
         out = capsys.readouterr().out
         assert "decision" not in out
         assert "session_create" in out
+
+    def test_confirm_switch_records_proposal(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # confirm SWITCH 제안이 보정 로그에 기록된다 (R3-C4)
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p, _g=None: self._reply(
+                action="SWITCH", target="backend", confidence=0.9, evidence="e"
+            ),
+        )
+        hook._route(self._routable_payload(project))
+        capsys.readouterr()
+        events = decision_log.load_events(project)
+        assert len(events) == 1
+        assert events[0]["type"] == "proposal"
+        assert events[0]["target"] == "backend"
+        assert events[0]["confidence"] == 0.9
+        assert events[0]["mode"] == "confirm"
+
+    def test_auto_switch_records_auto_proposal(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p, _g=None: self._auto_reply(
+                refute={"refuted": False, "reason": "타당"},
+                action="SWITCH",
+                target="backend",
+                confidence=0.95,
+                evidence="e",
+            ),
+        )
+        monkeypatch.setattr(hook, "_calibrated_auto_threshold", lambda _root: 0.9)
+        monkeypatch.setattr(
+            hook,
+            "_socket_round_trip",
+            lambda _r, timeout=0.0: {"type": "ack", "ok": True},
+        )
+        hook._route(self._routable_payload(project, mode="auto"))
+        capsys.readouterr()
+        events = decision_log.load_events(project)
+        assert [e["mode"] for e in events] == ["auto"]
+
+    def test_new_verdict_records_no_proposal(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p, _g=None: self._reply(action="NEW", reason="새 주제"),
+        )
+        hook._route(self._routable_payload(project))
+        capsys.readouterr()
+        assert decision_log.load_events(project) == []
+
+
+class TestCalibratedAutoThreshold:
+    """_calibrated_auto_threshold over a real decision log.
+
+    실제 결정 로그 위에서의 _calibrated_auto_threshold.
+    """
+
+    def test_empty_log_returns_none(self, project: Path) -> None:
+        root = project / ".session-manager"
+        root.mkdir(exist_ok=True)
+        assert hook._calibrated_auto_threshold(root) is None
+
+    def test_sufficient_accepts_yield_threshold(self, project: Path) -> None:
+        root = project / ".session-manager"
+        root.mkdir(exist_ok=True)
+        # 60 accepted proposals at confidence 0.9 — the one-sided 95%
+        # Wilson lower bound of 60/60 is 0.957 ≥ 0.95 target.
+        # confidence 0.9 수용 60건 — 60/60 의 단측 95% Wilson 하한은
+        # 0.957 로 목표 0.95 이상.
+        for _ in range(60):
+            decision_log.append_proposal(project, "backend", 0.9, mode="confirm")
+            decision_log.append_label(
+                project, "backend", decision_log.LABEL_ACCEPT, source="session_switch"
+            )
+        assert hook._calibrated_auto_threshold(root) == 0.9
+
+    def test_insufficient_samples_return_none(self, project: Path) -> None:
+        root = project / ".session-manager"
+        root.mkdir(exist_ok=True)
+        # 10/10 accepts: Wilson lower bound 1/(1+z²/10) ≈ 0.787 < 0.95.
+        # 10/10 수용 — Wilson 하한 약 0.787 로 목표 미달.
+        for _ in range(10):
+            decision_log.append_proposal(project, "backend", 0.9, mode="confirm")
+            decision_log.append_label(
+                project, "backend", decision_log.LABEL_ACCEPT, source="session_switch"
+            )
+        assert hook._calibrated_auto_threshold(root) is None
 
 
 class TestRun:

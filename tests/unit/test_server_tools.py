@@ -19,6 +19,7 @@ from session_manager.models.session import (
     SessionMetadata,
     SessionStatus,
 )
+from session_manager.routing import decision_log
 from session_manager.server import (
     AppContext,
     check_session,
@@ -221,6 +222,23 @@ class TestSessionSwitch:
         )
         assert result["switched_to"] == "first"
         assert app.state.get_current_session() == "first"
+
+    def test_switch_appends_accept_label(self, app: AppContext) -> None:
+        # Calibration label (R3-C4): an executed switch = accept.
+        # 보정 라벨 (R3-C4) — 실행된 전환은 수용이다.
+        app.session_store.save_session(
+            SessionMetadata.new(name="src", title="Source")
+        )
+        app.state.set_current_session("src")
+        session_switch(
+            target="dst", summary="s", user_prompt="p", ctx=_make_ctx(app)
+        )
+        events = decision_log.load_events(app.project_path)
+        assert len(events) == 1
+        assert events[0]["type"] == "label"
+        assert events[0]["label"] == "accept"
+        assert events[0]["target"] == "dst"
+        assert events[0]["source"] == "session_switch"
 
     def test_accepted_switch_drops_precedents_for_target_only(
         self, app: AppContext
@@ -517,6 +535,23 @@ class TestRejectSwitch:
         assert result["refresh_enqueued"] is False
         assert summarizer.load_pending_tasks(app.project_path) == []
 
+    def test_reject_appends_reject_label(self, app: AppContext) -> None:
+        # Calibration label (R3-C4): the explicit keep choice = reject.
+        # 보정 라벨 (R3-C4) — 명시적 유지 선택은 거부다.
+        app.session_store.save_session(
+            SessionMetadata.new(name="frontend", title="차트")
+        )
+        app.state.set_current_session("frontend")
+        reject_switch(
+            rejected_target="backend", prompt_gist="요지", ctx=_make_ctx(app)
+        )
+        events = decision_log.load_events(app.project_path)
+        labels = [e for e in events if e.get("type") == "label"]
+        assert len(labels) == 1
+        assert labels[0]["label"] == "reject"
+        assert labels[0]["target"] == "backend"
+        assert labels[0]["source"] == "reject_switch"
+
     def test_no_current_session_is_noop(self, app: AppContext) -> None:
         result = reject_switch(
             rejected_target="backend",
@@ -525,6 +560,7 @@ class TestRejectSwitch:
         )
         assert result["recorded"] is False
         assert result["reason"] == "no_current_session"
+        assert decision_log.load_events(app.project_path) == []
 
     def test_unregistered_current_session_reports_not_found(
         self, app: AppContext

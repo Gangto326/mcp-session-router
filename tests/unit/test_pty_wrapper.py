@@ -17,6 +17,7 @@ import pytest
 
 from session_manager import summarizer
 from session_manager.models import SessionMetadata
+from session_manager.routing import decision_log
 from session_manager.storage.file_store import SessionStore
 from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS
 from session_manager.wrapper import wrapper_state
@@ -529,6 +530,18 @@ class TestBackCommand:
         signals = [c.args[0] for c in send.call_args_list]
         assert {"action": "session_command", "command": "back", "args": ""} in signals
 
+        # Calibration label (R3-C4): /back = rejection of the wrong target.
+        # 보정 라벨 (R3-C4) — /back 은 잘못 간 대상에 대한 거부다.
+        labels = [
+            e
+            for e in decision_log.load_events(tmp_path)
+            if e.get("type") == "label"
+        ]
+        assert len(labels) == 1
+        assert labels[0]["label"] == "reject"
+        assert labels[0]["target"] == "backend"
+        assert labels[0]["source"] == "back"
+
     def test_back_without_record_is_noop(
         self,
         wrapper: SessionManagerWrapper,
@@ -615,6 +628,30 @@ class TestMcpSignalRouting:
         )
         assert wrapper._pending_action is not None
         assert wrapper._pending_action.action_type == "switch"
+
+    def test_route_switch_notifies_with_back_hint(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An unattended (auto) switch must announce itself and the undo
+        # (Plan R3-C4 status-line wording).
+        # 무인 (auto) 전환은 전환 사실과 undo 방법을 알려야 한다
+        # (Plan R3-C4 상태 줄 원문).
+        notices: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notices.append)
+        wrapper._current_session_name = "frontend"
+        wrapper._handle_mcp_signal(
+            {
+                "action": "route_switch",
+                "target": "backend",
+                "user_prompt": "로그인 API 500",
+                "verdict": {"reason": "인증 소관"},
+            }
+        )
+        assert wrapper._pending_action is not None
+        assert wrapper._pending_action.target == "backend"
+        assert notices == [
+            "⇄ backend 세션으로 전환됨 (이전: frontend) — 되돌리려면 /back"
+        ]
 
     def test_new_routes_to_handle_new(self, wrapper: SessionManagerWrapper) -> None:
         wrapper._handle_mcp_signal(
