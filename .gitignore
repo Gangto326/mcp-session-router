@@ -34,3 +34,6 @@ htmlcov/
 .vscode/
 
 *.md
+# Local-only docs policy: all .md ignored, EXCEPT distributed skill files.
+# 로컬 전용 문서 정책 — 모든 .md 무시, 단 배포 대상 스킬 파일은 예외.
+!.claude/skills/**/*.md
