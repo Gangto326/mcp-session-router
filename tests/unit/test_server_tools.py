@@ -7,6 +7,7 @@ server.py의 MCP 도구 핸들러 단위 테스트.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -23,6 +24,7 @@ from session_manager.routing import decision_log
 from session_manager.server import (
     AppContext,
     check_session,
+    get_routing_status,
     init_project,
     reinit_project,
     reject_switch,
@@ -30,6 +32,7 @@ from session_manager.server import (
     session_end,
     session_register,
     session_switch,
+    set_routing_mode,
     update_project_context,
     update_static,
 )
@@ -700,3 +703,114 @@ class TestCurrentSessionNotification:
         result = session_register(name="alpha", title="첫 세션", ctx=_make_ctx(app))
         assert result["registered"] == "alpha"
         assert app.state.get_current_session() == "alpha"
+
+
+# ------------------------------------------------------- routing mode tools
+
+
+class TestSetRoutingMode:
+    """set_routing_mode: config.json update preserving foreign keys.
+
+    set_routing_mode — 타 키를 보존하는 config.json 갱신.
+    """
+
+    def _config_path(self, app: AppContext) -> Path:
+        return app.project_path / ".session-manager" / "config.json"
+
+    def test_updates_mode_preserving_other_keys(self, app: AppContext) -> None:
+        path = self._config_path(app)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"socket_path": "/tmp/x.sock", "routing_mode": "confirm"}),
+            encoding="utf-8",
+        )
+        result = set_routing_mode(mode="auto", ctx=_make_ctx(app))
+        assert result == {"ok": True, "mode": "auto"}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["routing_mode"] == "auto"
+        assert data["socket_path"] == "/tmp/x.sock"
+
+    def test_creates_config_when_missing(self, app: AppContext) -> None:
+        result = set_routing_mode(mode="off", ctx=_make_ctx(app))
+        assert result["ok"] is True
+        data = json.loads(self._config_path(app).read_text(encoding="utf-8"))
+        assert data == {"routing_mode": "off"}
+
+    def test_corrupt_config_replaced(self, app: AppContext) -> None:
+        path = self._config_path(app)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{깨진", encoding="utf-8")
+        assert set_routing_mode(mode="confirm", ctx=_make_ctx(app))["ok"] is True
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["routing_mode"] == "confirm"
+
+    def test_invalid_mode_rejected(self, app: AppContext) -> None:
+        result = set_routing_mode(mode="turbo", ctx=_make_ctx(app))
+        assert result["ok"] is False
+        assert result["error"] == "invalid_mode"
+        assert "auto" in result["valid"]
+        assert not self._config_path(app).exists()
+
+
+class TestGetRoutingStatus:
+    """get_routing_status: mode + acceptance stats + auto availability.
+
+    get_routing_status — 모드 + 수용률 통계 + auto 가능 여부.
+    """
+
+    def _seed(self, app: AppContext, count: int, accept: bool = True) -> None:
+        for _ in range(count):
+            decision_log.append_proposal(
+                app.project_path, "backend", 0.9, mode="confirm"
+            )
+            decision_log.append_label(
+                app.project_path,
+                "backend",
+                decision_log.LABEL_ACCEPT if accept else decision_log.LABEL_REJECT,
+                source="test",
+            )
+
+    def test_empty_project_defaults(self, app: AppContext) -> None:
+        status = get_routing_status(ctx=_make_ctx(app))
+        assert status["mode"] == "confirm"
+        assert status["acceptance"] == {
+            "accepted": 0,
+            "rejected": 0,
+            "unlabeled": 0,
+        }
+        assert status["overall_acceptance_rate"] is None
+        assert status["recent_acceptance_rate"] is None
+        assert status["auto_available"] is False
+        assert status["auto_threshold"] is None
+        assert status["auto_error_tolerance"] == 0.05
+
+    def test_stats_and_auto_available_with_sufficient_data(
+        self, app: AppContext
+    ) -> None:
+        # 60/60 accepts — beyond the one-sided 95% Wilson bar (52).
+        # 60/60 수용 — 단측 95% Wilson 기준선 (52건) 초과.
+        self._seed(app, 60)
+        status = get_routing_status(ctx=_make_ctx(app))
+        assert status["acceptance"]["accepted"] == 60
+        assert status["overall_acceptance_rate"] == 1.0
+        assert status["recent_acceptance_rate"] == 1.0
+        assert status["auto_available"] is True
+        assert status["auto_threshold"] == 0.9
+
+    def test_recent_trend_reflects_latest_half(self, app: AppContext) -> None:
+        # Old accepts then recent rejects: overall 0.5, recent 0.0 —
+        # the trend must expose the deterioration.
+        # 과거 수용 후 최근 거부 — 전체 0.5, 최근 0.0. 추세가 악화를
+        # 드러내야 한다.
+        self._seed(app, 10, accept=True)
+        self._seed(app, 10, accept=False)
+        status = get_routing_status(ctx=_make_ctx(app))
+        assert status["overall_acceptance_rate"] == 0.5
+        assert status["recent_acceptance_rate"] == 0.0
+        assert status["auto_available"] is False
+
+    def test_mode_read_from_config(self, app: AppContext) -> None:
+        path = app.project_path / ".session-manager" / "config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"routing_mode": "off"}), encoding="utf-8")
+        assert get_routing_status(ctx=_make_ctx(app))["mode"] == "off"
