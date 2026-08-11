@@ -793,6 +793,15 @@ class SessionManagerWrapper:
             session=self._current_session_name,
         )
         self._enqueue_active_summary()
+        # Precedent invalidation on a manual move (R3-FIX2): the user
+        # resuming a session BY HAND overturns any recorded rejection of
+        # it — the deterministic suppression gate would otherwise have
+        # no acceptance path and could suppress that target forever.
+        # 수동 이동 시 판례 무효화 (R3-FIX2) — 사용자가 그 세션으로 손수
+        # 이동하면 기록된 거부가 뒤집힌다. 이 소멸 경로가 없으면 결정적
+        # 억제 게이트에는 수락 경로가 없어 그 대상이 영원히 억제될 수 있다.
+        if matched.command == "resume" and matched.args:
+            self._drop_precedents_on_manual_move(matched.args)
         # Tell the MCP server its current-session pointer is now stale: the
         # user is moving to another conversation by hand.
         # MCP 서버에 현재 세션 포인터가 낡았음을 알린다 — 사용자가 손수 다른
@@ -804,6 +813,50 @@ class SessionManagerWrapper:
                 "args": matched.args,
             }
         )
+
+    def _drop_precedents_on_manual_move(self, resume_arg: str) -> None:
+        """Drop the current session's precedents against a manually
+        resumed session.
+
+        수동 resume 대상 세션에 대한 현재 세션의 판례를 소멸시킨다.
+
+        The /resume argument may be a conversation id or a session name/
+        title — match either against the metadata. A bare /resume opens
+        the picker (destination unknown) and never reaches here.
+
+        /resume 인자는 conversation id 또는 세션 이름·제목일 수 있다 —
+        메타데이터에서 양쪽 다 매칭한다. 인자 없는 /resume 은 picker 라
+        목적지를 알 수 없고 이 지점에 오지 않는다.
+        """
+        kept_in = self._current_session_name
+        if kept_in is None:
+            return
+        arg = resume_arg.strip()
+        try:
+            sessions = SessionStore(Path(self.project_path)).list_sessions()
+        except Exception:
+            return
+        target_name: str | None = None
+        for session in sessions:
+            if arg == session.name or arg in session.claude_conversation_ids:
+                target_name = session.name
+                break
+        if target_name is None or target_name == kept_in:
+            return
+
+        def apply(session: Any) -> None:
+            session.drop_precedents_for(target_name)
+
+        try:
+            SessionStore(Path(self.project_path)).mutate_session_by_name(
+                kept_in, apply
+            )
+        except Exception as exc:
+            debug_log.log(
+                "PRECEDENT",
+                "WRAPPER",
+                {"op": "manual_move_drop", "result": "error", "error": str(exc)},
+            )
 
     # ------------------------------------------------------------- /back undo
     # /back 되돌리기 (R3-C3) -----------------------------------------------------

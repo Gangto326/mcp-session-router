@@ -289,28 +289,12 @@ class JudgeHost:
         ]
         current = self._resolve_current_session(request)
         current_name = current.name if current is not None else None
-        # Precedents of the current (kept_in) session, most recent first
-        # — no fixed cap; recency ordering is the natural size limit for
-        # the prompt (rule 8).
-        # 현재 (kept_in) 세션의 판례, 최근 우선 정렬 — 고정 개수 상한
-        # 없음. 최근 우선 정렬이 프롬프트 크기의 자연 제한이다 (규칙 8).
-        precedents = (
-            [
-                p.to_dict()
-                for p in sorted(
-                    current.precedents, key=lambda p: p.at, reverse=True
-                )
-            ]
-            if current is not None
-            else []
-        )
 
         judge_prompt = judge.build_judge_prompt(
             prompt=prompt,
             excerpt=excerpt,
             sessions=sessions,
             current_name=current_name,
-            precedents=precedents,
         )
         t0 = time.monotonic()
         raw = self._round_trip(judge_prompt, judge.JUDGE_TIMEOUT_SECS)
@@ -321,6 +305,40 @@ class JudgeHost:
             parsed = judge.parse_verdict(raw)
             verdict = (
                 parsed if parsed is not None else judge.Verdict.stay("judge_unparsable")
+            )
+
+        # Deterministic precedent gate (R3-FIX2): a SWITCH whose target
+        # the user has rejected before (live precedent on the current
+        # session) is demoted to STAY here, in code — not entrusted to
+        # the model (measured 3/3: the model inverted the precedent's
+        # meaning when asked to weigh it). Invalidation stays
+        # event-based: acceptance, manual move into the target, rollover.
+        # The suppression is logged for R5 metrics.
+        # 결정적 판례 게이트 (R3-FIX2) — 사용자가 이미 거부한 대상 (현재
+        # 세션의 유효 판례) 으로의 SWITCH 는 모델에게 맡기지 않고 여기
+        # 코드에서 STAY 로 강등한다 (실측 3/3: 모델은 판례의 의미를 반전
+        # 해석했다). 무효화는 이벤트 기반 유지 — 수락·대상으로의 수동
+        # 이동·롤오버. 억제는 R5 계측용으로 로그에 남긴다.
+        if (
+            verdict.action == judge.ACTION_SWITCH
+            and current is not None
+            and verdict.target is not None
+            and any(p.rejected == verdict.target for p in current.precedents)
+        ):
+            debug_log.log(
+                "JUDGE",
+                "WRAPPER",
+                {
+                    "op": "precedent_suppress",
+                    "target": verdict.target,
+                    "kept_in": current.name,
+                    "original_confidence": verdict.confidence,
+                },
+                conv_id=request.get("session_id"),
+                session=current.name,
+            )
+            verdict = judge.Verdict.stay(
+                f"suppressed_by_precedent: {verdict.target}"
             )
         debug_log.log(
             "JUDGE",

@@ -91,8 +91,6 @@ VALID_ACTIONS = (ACTION_STAY, ACTION_SWITCH, ACTION_NEW, ACTION_ASK)
 PROMPT_TEMPLATE = """너는 코딩 세션 라우터다. 사용자의 새 프롬프트가 어느 세션 소관인지 판정하라.
 [현재 세션 최근 대화] {excerpt}
 [세션 목록] {sessions}
-[판례 — 과거 사용자가 전환을 거부하고 머문 기록. 현재 세션과 kept_in이
- 일치하는 항목만 STAY 우대 근거로 사용하라] {precedents}
 [새 프롬프트] {prompt}
 규칙:
 - action: STAY | SWITCH | NEW | ASK
@@ -200,19 +198,25 @@ def build_judge_prompt(
     excerpt: str,
     sessions: list[dict[str, Any]],
     current_name: str | None = None,
-    precedents: list[dict[str, Any]] | None = None,
 ) -> str:
     """Assemble the full judge input.
 
-    판정기 입력 전문을 조립한다. 판례는 R3 전까지 빈 목록이다.
+    판정기 입력 전문을 조립한다.
+
+    Precedents are deliberately NOT part of the judge input (R3-FIX2):
+    measured 3/3, the model inverted their meaning and cited a rejection
+    as evidence FOR switching. Suppressing repeat proposals is a MUST,
+    so it moved to the deterministic layer — the judge host demotes a
+    SWITCH whose target has a live precedent (판단이 아니라 보장).
+
+    판례는 의도적으로 판정 입력에서 제외한다 (R3-FIX2): 실측 3/3 으로
+    모델이 의미를 반전 해석해 거부 기록을 전환 **찬성** 근거로 인용했다.
+    거부된 제안의 반복 억제는 "반드시 일어나야 하는 일"이므로 결정적
+    계층으로 이전 — 판정 호스트가 판례 대상으로의 SWITCH 를 강등한다.
     """
-    precedent_block = (
-        json.dumps(precedents, ensure_ascii=False) if precedents else "(없음)"
-    )
     return PROMPT_TEMPLATE.format(
         excerpt=excerpt.strip() or "(없음)",
         sessions=format_sessions(sessions, current_name),
-        precedents=precedent_block,
         prompt=prompt,
     )
 
