@@ -24,6 +24,7 @@ MCP 소켓 통합, stdin 슬래시 커맨드 관찰 같은 상위 로직은 별�
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import select
@@ -418,6 +419,47 @@ class SessionManagerWrapper:
             return []
         return [f"--append-system-prompt={guide}"]
 
+    @staticmethod
+    def _mcp_config_flag() -> list[str]:
+        """MCP server delivery: CLI injection instead of user-scope registration.
+
+        MCP 서버 전달 — user 스코프 등록 대신 CLI 인자 직접 주입.
+
+        ``--mcp-config=`` with inline JSON loads session-manager only in
+        the children ccode spawns, so a bare ``claude`` never starts the
+        server and cannot pollute unrelated folders (F4). Measured
+        (docs/poc/R3-mcp-config.md): works in headless, TUI and the
+        respawn combination (``--resume=`` + trigger prompt); no trust
+        prompt fires; on a name collision with a leftover user-scope
+        entry the injected config wins. ``--strict-mcp-config`` is
+        deliberately absent — the user's other MCP servers keep loading.
+        The server command is ``sys.executable`` so it runs from the same
+        venv as ccode itself (no hard-coded project path).
+
+        인라인 JSON 의 ``--mcp-config=`` 는 ccode 가 spawn 한 자식에만
+        session-manager 를 로드시키므로, 맨몸 ``claude`` 는 서버를 띄우지
+        않아 무관 폴더를 오염시킬 수 없다 (F4). 실측
+        (docs/poc/R3-mcp-config.md): headless·TUI·respawn 조합
+        (``--resume=`` + 트리거 프롬프트) 전부 동작, 신뢰 프롬프트
+        미발생, 잔존 user 스코프 동명 등록과 충돌 시 주입 측 승리.
+        ``--strict-mcp-config`` 는 의도적으로 제외 — 사용자의 타 MCP
+        서버 로드를 유지한다. 서버 커맨드는 ``sys.executable`` 로 ccode
+        와 같은 venv 에서 실행된다 (프로젝트 경로 하드코딩 없음).
+        """
+        config = json.dumps(
+            {
+                "mcpServers": {
+                    "session-manager": {
+                        "type": "stdio",
+                        "command": sys.executable,
+                        "args": ["-m", "session_manager.server"],
+                        "env": {},
+                    }
+                }
+            }
+        )
+        return [f"--mcp-config={config}"]
+
     def _build_child_args(self) -> list[str]:
         """Assemble argv for the next child from the pending transition.
 
@@ -436,9 +478,14 @@ class SessionManagerWrapper:
         """
         pending = self._pending_respawn
         if pending is None:
-            return list(self.claude_args) + self._agent_guide_flag()
+            return (
+                list(self.claude_args)
+                + self._agent_guide_flag()
+                + self._mcp_config_flag()
+            )
         args = self._strip_resume_args(self.claude_args)
         args += self._agent_guide_flag()
+        args += self._mcp_config_flag()
         if pending.resume_conv is not None:
             args.append(f"--resume={pending.resume_conv}")
         args.append(handoff_store.TRIGGER_PROMPT)
