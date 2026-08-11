@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from session_manager import handoff_store
 from session_manager.hooks import user_prompt_submit as hook
 from session_manager.routing import decision_log
 
@@ -688,3 +689,68 @@ class TestRun:
 
         monkeypatch.setattr(hook, "_route", boom)
         assert hook.run(_payload(project)) == 0
+
+
+class TestPendingHandoffDelivery:
+    """Transition trigger: consume the pending file, inject, skip routing.
+
+    전환 트리거 — pending 파일 소비·주입·라우팅 skip.
+    """
+
+    def _trigger_payload(self, project: Path) -> str:
+        return _payload(project, prompt=handoff_store.TRIGGER_PROMPT)
+
+    def test_trigger_delivers_handoff_as_context(
+        self, project: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        handoff_store.write_pending(
+            project,
+            target="backend",
+            handoff={"from": "frontend", "message": "이전 세션 요약"},
+            user_prompt="원래 사용자 프롬프트",
+        )
+        assert hook.run(self._trigger_payload(project)) == 0
+        out = json.loads(capsys.readouterr().out)
+        context = out["hookSpecificOutput"]["additionalContext"]
+        assert context.startswith("[handoff]")
+        assert "이전 세션 요약" in context
+        assert context.endswith("원래 사용자 프롬프트")
+        # Consumed — a second trigger passes silently.
+        # 소비됨 — 두 번째 트리거는 조용히 통과.
+        assert handoff_store.take_pending(project) is None
+
+    def test_trigger_skips_routing_even_with_sessions(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # A transition trigger must never be re-routed by the judge.
+        # 전환 트리거가 판정기로 재라우팅되면 안 된다.
+        sessions = project / ".session-manager" / "sessions"
+        _write_session(sessions, "frontend")
+        _write_session(sessions, "backend")
+        handoff_store.write_pending(project, "backend", {}, "p")
+        called: list = []
+        monkeypatch.setattr(hook, "_route", called.append)
+        assert hook.run(self._trigger_payload(project)) == 0
+        assert called == []
+        capsys.readouterr()
+
+    def test_trigger_without_file_passes_silently(
+        self, project: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        assert hook.run(self._trigger_payload(project)) == 0
+        assert capsys.readouterr().out == ""
+
+    def test_normal_prompt_leaves_pending_file_alone(
+        self, project: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        # Only the exact trigger consumes the file — a stale file must
+        # not be slurped by an unrelated prompt.
+        # 정확한 트리거만 파일을 소비한다 — 무관한 프롬프트가 낡은 파일을
+        # 삼키면 안 된다.
+        handoff_store.write_pending(project, "backend", {}, "p")
+        assert hook.run(_payload(project)) == 0
+        capsys.readouterr()
+        assert handoff_store.take_pending(project) is not None

@@ -182,3 +182,35 @@ def test_get_prompt_line_survives_orphan_stub():
     s.feed(b"\x1b[3;1H")  # CUP → row 3, col 1 (1-indexed)
     s.feed(PROMPT_MARKER.encode() + b" /help")
     assert s.get_prompt_line() == "/help"
+
+
+class TestContainsNearPrompt:
+    """R3-FIX1: busy-marker search scoped to the input-box neighbourhood.
+    R3-FIX1 — 입력란 주변으로 한정한 바쁨 마커 검색.
+    """
+
+    def _screen_with_rows(self, rows: list[str]) -> VirtualScreen:
+        screen = VirtualScreen(cols=80, rows=24)
+        screen.feed(("\r\n".join(rows)).encode("utf-8"))
+        return screen
+
+    def test_marker_near_prompt_found(self) -> None:
+        screen = self._screen_with_rows(
+            ["대화 내용", "❯ 입력 중", "· Thinking… (esc to interrupt)"]
+        )
+        assert screen.contains_near_prompt("esc to interrupt", 4) is True
+
+    def test_quoted_marker_far_from_prompt_ignored(self) -> None:
+        # Conversation text QUOTING the marker must not read as busy.
+        # 마커 문구를 인용한 대화 본문은 바쁨으로 읽히면 안 된다.
+        rows = ['답변에 "esc to interrupt" 라는 문구가 나왔다'] + [""] * 10 + ["❯ "]
+        screen = self._screen_with_rows(rows)
+        assert screen.contains_near_prompt("esc to interrupt", 4) is False
+
+    def test_no_prompt_falls_back_to_whole_screen(self) -> None:
+        screen = self._screen_with_rows(["esc to interrupt"])
+        assert screen.contains_near_prompt("esc to interrupt", 4) is True
+
+    def test_absent_marker_false(self) -> None:
+        screen = self._screen_with_rows(["❯ hello"])
+        assert screen.contains_near_prompt("esc to interrupt", 4) is False

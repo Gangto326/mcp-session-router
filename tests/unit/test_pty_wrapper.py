@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from session_manager import summarizer
+from session_manager import handoff_store, summarizer
 from session_manager.models import SessionMetadata
 from session_manager.routing import decision_log
 from session_manager.storage.file_store import SessionStore
@@ -23,13 +23,10 @@ from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS
 from session_manager.wrapper import wrapper_state
 from session_manager.wrapper.pty_wrapper import (
     AUTO_CONFIRM_PATTERNS,
+    BUSY_MARKER,
     CLEAR_COMMAND_RE,
-    INVERSE_VIDEO_START,
-    OUTPUT_BUFFER_CAP,
-    OUTPUT_BUFFER_TAIL_KEEP,
-    PROMPT_POINTER,
     SessionManagerWrapper,
-    _PendingAction,
+    _PendingRespawn,
 )
 
 
@@ -40,97 +37,6 @@ def wrapper(tmp_path: Path) -> SessionManagerWrapper:
         claude_args=[],
         project_path=str(tmp_path),
     )
-
-
-def _capture_injects(
-    wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-) -> list[bytes]:
-    """Capture all _inject_text calls as bytes."""
-    captured: list[bytes] = []
-
-    def fake_inject(text: str) -> None:
-        captured.append(text.encode("utf-8"))
-
-    monkeypatch.setattr(wrapper, "_inject_text", fake_inject)
-    return captured
-
-
-class TestDetectPrompt:
-    def test_detects_pointer_with_inverse(self, wrapper: SessionManagerWrapper) -> None:
-        buffer = (
-            b"some output\n"
-            + PROMPT_POINTER
-            + b" "
-            + INVERSE_VIDEO_START
-            + b" \x1b[27m"
-        )
-        assert wrapper._detect_prompt(buffer) is True
-
-    def test_not_detected_pointer_only(self, wrapper: SessionManagerWrapper) -> None:
-        buffer = b"output\n" + PROMPT_POINTER + b" no inverse here"
-        assert wrapper._detect_prompt(buffer) is False
-
-    def test_not_detected_inverse_only(self, wrapper: SessionManagerWrapper) -> None:
-        buffer = INVERSE_VIDEO_START + b"text"
-        assert wrapper._detect_prompt(buffer) is False
-
-    def test_detected_inverse_far_from_pointer(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        """Inverse anywhere after the latest ❯ counts as detected.
-
-        The wrapper widened the detect window from a 64-byte slice after
-        ❯ to *everything past the latest ❯* to handle multi-line wrapped
-        input fields, where ❯ sits on the first line and the cursor
-        inverse on the last. A distance-based window misses that case.
-
-        ❯ 이후 거리에 무관하게 inverse 가 있으면 detect 된다.
-
-        Multi-line wrap 입력란에서는 ❯ 마커가 첫 라인에, cursor inverse 가
-        마지막 라인에 있을 수 있다. 거리 기반 좁은 윈도우는 이 케이스를
-        놓치므로 detect 범위를 마지막 ❯ 이후 buffer 전체로 확대했다.
-        """
-        buffer = PROMPT_POINTER + b"x" * 100 + INVERSE_VIDEO_START
-        assert wrapper._detect_prompt(buffer) is True
-
-    def test_chunk_boundary_detection(self, wrapper: SessionManagerWrapper) -> None:
-        # ❯의 첫 2바이트만 도착한 시점에는 매칭 안 됨
-        wrapper.output_buffer += PROMPT_POINTER[:2]
-        assert wrapper._detect_prompt(wrapper.output_buffer) is False
-
-        # 나머지 1바이트 + inverse 가 따라오면 매칭 성공
-        wrapper.output_buffer += PROMPT_POINTER[2:] + b" " + INVERSE_VIDEO_START
-        assert wrapper._detect_prompt(wrapper.output_buffer) is True
-
-    def test_uses_rfind_picks_latest_pointer(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        # 오래된 ❯ 는 inverse 와 멀리, 최신 ❯ 는 inverse 와 가까이 — rfind 라
-        # 최신 위치만 검사하므로 매칭 성공
-        buffer = (
-            PROMPT_POINTER
-            + b"x" * 200
-            + b" newer turn "
-            + PROMPT_POINTER
-            + b" "
-            + INVERSE_VIDEO_START
-        )
-        assert wrapper._detect_prompt(buffer) is True
-
-
-class TestTruncateOutputBuffer:
-    def test_no_truncation_below_cap(self, wrapper: SessionManagerWrapper) -> None:
-        wrapper.output_buffer = b"x" * (OUTPUT_BUFFER_CAP - 1)
-        wrapper._truncate_output_buffer()
-        assert len(wrapper.output_buffer) == OUTPUT_BUFFER_CAP - 1
-
-    def test_truncates_keeps_tail(self, wrapper: SessionManagerWrapper) -> None:
-        head = b"a" * (OUTPUT_BUFFER_CAP // 2)
-        tail = b"b" * (OUTPUT_BUFFER_CAP // 2 + 100)
-        wrapper.output_buffer = head + tail
-        wrapper._truncate_output_buffer()
-        assert len(wrapper.output_buffer) == OUTPUT_BUFFER_TAIL_KEEP
-        assert wrapper.output_buffer == b"b" * OUTPUT_BUFFER_TAIL_KEEP
 
 
 class TestParseInitialSessionName:
@@ -166,529 +72,6 @@ class TestParseInitialSessionName:
             )
             == "x"
         )
-
-
-class TestDrainInputQueue:
-    def test_replaces_newlines_with_spaces(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        captured: list[bytes] = []
-        monkeypatch.setattr(
-            "session_manager.wrapper.pty_wrapper.os.write",
-            lambda fd, data: captured.append(data) or len(data),
-        )
-        wrapper.pty_fd = 99
-        wrapper.input_queue = b"hello\nworld\n"
-        wrapper._drain_input_queue()
-        assert captured == [b"hello world "]
-        assert wrapper.input_queue == b""
-
-    def test_empty_queue_no_write(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        captured: list[bytes] = []
-        monkeypatch.setattr(
-            "session_manager.wrapper.pty_wrapper.os.write",
-            lambda fd, data: captured.append(data) or len(data),
-        )
-        wrapper.pty_fd = 99
-        wrapper.input_queue = b""
-        wrapper._drain_input_queue()
-        assert captured == []
-
-
-class TestSwitchFlow:
-    def test_handle_switch_registers_pending(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        wrapper._handle_switch(
-            target="bar",
-            handoff={"from": "foo", "user_prompt": "do thing"},
-            user_prompt="do thing",
-        )
-        pending = wrapper._pending_action
-        assert pending is not None
-        assert pending.action_type == "switch"
-        assert pending.target == "bar"
-        assert pending.user_prompt == "do thing"
-        assert pending.stage == "await_resume_prompt"
-        # JSON 본문에서 user_prompt 제거 — 본문 평문과 중복 노출 방지
-        assert "user_prompt" not in pending.handoff
-        assert pending.handoff == {"from": "foo"}
-
-    def test_advance_switch_stage_one_injects_resume_text_only(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        injected = _capture_injects(wrapper, monkeypatch)
-        pending = _PendingAction(
-            action_type="switch",
-            target="bar",
-            handoff={},
-            user_prompt="hi",
-            stage="await_resume_prompt",
-        )
-        wrapper._pending_action = pending
-        wrapper._advance_switch(pending)
-        assert wrapper.mode == "filtering"
-        assert injected == [b"/resume bar"]
-        assert pending.stage == "await_resume_submit"
-
-    def test_advance_switch_stage_two_submits_resume(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        submitted = _capture_injects(wrapper, monkeypatch)
-        pending = _PendingAction(
-            action_type="switch",
-            target="bar",
-            handoff={},
-            user_prompt="hi",
-            stage="await_resume_submit",
-        )
-        wrapper._pending_action = pending
-        wrapper._advance_switch(pending)
-        assert submitted == [b"\r"]
-        assert pending.stage == "await_handoff_prompt"
-
-    def test_advance_switch_stage_three_injects_handoff_text_only(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        injected = _capture_injects(wrapper, monkeypatch)
-        pending = _PendingAction(
-            action_type="switch",
-            target="bar",
-            handoff={"from": "old"},
-            user_prompt="user req",
-            stage="await_handoff_prompt",
-        )
-        wrapper._pending_action = pending
-        wrapper.mode = "filtering"
-        wrapper._advance_switch(pending)
-        assert len(injected) == 1
-        text = injected[0].decode("utf-8")
-        assert text.startswith("[handoff]\n")
-        assert text.endswith("user req")
-        assert pending.stage == "await_handoff_submit"
-
-    def test_advance_switch_stage_four_submits_and_unfilters(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _capture_injects(wrapper, monkeypatch)
-        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
-        pending = _PendingAction(
-            action_type="switch",
-            target="bar",
-            handoff={},
-            user_prompt="hi",
-            stage="await_handoff_submit",
-        )
-        wrapper._pending_action = pending
-        wrapper.mode = "filtering"
-        wrapper._advance_switch(pending)
-        assert wrapper.mode == "passthrough"
-        assert wrapper._pending_action is None
-
-
-class TestNewFlow:
-    def test_handle_new_registers_pending(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        wrapper._handle_new(
-            rename_current="old",
-            new_session_name="new",
-            handoff={"from": "old"},
-            user_prompt="hi",
-        )
-        pending = wrapper._pending_action
-        assert pending is not None
-        assert pending.action_type == "new"
-        assert pending.rename_current == "old"
-        assert pending.new_session_name == "new"
-        assert pending.stage == "await_rename_or_exit_prompt"
-
-    def test_handle_new_with_null_rename_injects_exit_text_only(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        injected = _capture_injects(wrapper, monkeypatch)
-        wrapper._handle_new(
-            rename_current=None,
-            new_session_name="new",
-            handoff={},
-            user_prompt="x",
-        )
-        wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
-        assert injected == [b"/exit"]
-        assert wrapper._pending_action is not None
-        assert wrapper._pending_action.stage == "await_exit_submit"
-
-    def test_advance_new_with_rename_then_submit_then_exit(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        injected = _capture_injects(wrapper, monkeypatch)
-        wrapper._handle_new(
-            rename_current="cur",
-            new_session_name="new",
-            handoff={},
-            user_prompt="x",
-        )
-        # Stage 1: inject /rename text
-        wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
-        assert injected == [b"/rename cur"]
-        assert wrapper._pending_action.stage == "await_rename_submit"  # type: ignore[union-attr]
-
-        # Stage 2: submit /rename
-        wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
-        assert injected == [b"/rename cur", b"\r"]
-        assert wrapper._pending_action.stage == "await_exit_prompt"  # type: ignore[union-attr]
-
-        # Stage 3: inject /exit text
-        wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
-        assert injected == [b"/rename cur", b"\r", b"/exit"]
-        assert wrapper._pending_action.stage == "await_exit_submit"  # type: ignore[union-attr]
-
-        # Stage 4: submit /exit
-        wrapper._advance_new(wrapper._pending_action)  # type: ignore[arg-type]
-        assert injected == [b"/rename cur", b"\r", b"/exit", b"\r"]
-        assert wrapper._pending_action.stage == "await_child_exit"  # type: ignore[union-attr]
-
-    def test_advance_new_handoff_injects_text_only(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        injected = _capture_injects(wrapper, monkeypatch)
-        pending = _PendingAction(
-            action_type="new",
-            target="",
-            handoff={"from": "old"},
-            user_prompt="user req",
-            stage="await_new_session_prompt",
-            new_session_name="new",
-        )
-        wrapper._pending_action = pending
-        wrapper.mode = "filtering"
-        wrapper._advance_new(pending)
-        assert wrapper.mode == "filtering"
-        assert pending.stage == "await_new_handoff_submit"
-        assert len(injected) == 1
-        assert injected[0].decode("utf-8").startswith("[handoff]\n")
-
-    def test_advance_new_handoff_submit_unfilters(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _capture_injects(wrapper, monkeypatch)
-        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
-        pending = _PendingAction(
-            action_type="new",
-            target="",
-            handoff={},
-            user_prompt="x",
-            stage="await_new_handoff_submit",
-            new_session_name="new",
-        )
-        wrapper._pending_action = pending
-        wrapper.mode = "filtering"
-        wrapper._advance_new(pending)
-        assert wrapper.mode == "passthrough"
-        assert wrapper._pending_action is None
-
-
-class TestBackCommand:
-    """/back undo (R3-C3): transition recording and reverse execution.
-
-    /back 되돌리기 (R3-C3) — 전환 기록과 역방향 실행.
-    """
-
-    RECORD = {
-        "from": "frontend",
-        "to": "backend",
-        "user_prompt": "미스라우팅된 프롬프트\n둘째 줄",
-        "at": "2026-08-05T00:00:00+00:00",
-    }
-
-    def _complete_switch(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-        handoff: dict,
-        target: str = "bar",
-        user_prompt: str = "p",
-    ) -> None:
-        _capture_injects(wrapper, monkeypatch)
-        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
-        pending = _PendingAction(
-            action_type="switch",
-            target=target,
-            handoff=handoff,
-            user_prompt=user_prompt,
-            stage="await_handoff_submit",
-        )
-        wrapper._pending_action = pending
-        wrapper._advance_switch(pending)
-
-    def test_switch_completion_records_last_transition(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ) -> None:
-        self._complete_switch(wrapper, monkeypatch, handoff={"from": "foo"})
-        record = wrapper._last_transition
-        assert record is not None
-        assert record["from"] == "foo"
-        assert record["to"] == "bar"
-        assert record["user_prompt"] == "p"
-        # Persisted too, so /back survives a wrapper restart.
-        # 영속화도 됨 — /back 이 래퍼 재시작을 견딘다.
-        assert wrapper_state.load_last_transition(tmp_path) == record
-
-    def test_back_marked_switch_not_recorded(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ) -> None:
-        # A /back reverse switch must not re-arm the undo (ping-pong).
-        # /back 역방향 전환이 undo 를 재장전하면 핑퐁이 된다.
-        self._complete_switch(
-            wrapper, monkeypatch, handoff={"from": "wrong", "back": True}
-        )
-        assert wrapper._last_transition is None
-        assert wrapper_state.load_last_transition(tmp_path) is None
-
-    def test_switch_without_from_not_recorded(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # Unregistered start: no origin to return to.
-        # 미등록 시작 — 되돌아갈 곳이 없다.
-        self._complete_switch(wrapper, monkeypatch, handoff={})
-        assert wrapper._last_transition is None
-
-    def test_new_completion_records_last_transition(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        _capture_injects(wrapper, monkeypatch)
-        monkeypatch.setattr(wrapper, "_drain_input_queue", lambda: None)
-        pending = _PendingAction(
-            action_type="new",
-            target="",
-            handoff={"from": "foo"},
-            user_prompt="새 주제",
-            stage="await_new_handoff_submit",
-            new_session_name="fresh",
-        )
-        wrapper._pending_action = pending
-        wrapper._advance_new(pending)
-        record = wrapper._last_transition
-        assert record is not None
-        assert record["from"] == "foo"
-        assert record["to"] == "fresh"
-
-    def test_back_executes_reverse_switch(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ) -> None:
-        store = SessionStore(tmp_path)
-        store.save_session(SessionMetadata.new(name="frontend", title="차트"))
-        wrapper._last_transition = dict(self.RECORD)
-        wrapper_state.save_last_transition(tmp_path, dict(self.RECORD))
-        send = MagicMock()
-        monkeypatch.setattr(wrapper.socket_server, "send", send)
-
-        wrapper._handle_back_command()
-
-        # Reverse switch registered through the ordinary machinery.
-        # 일반 SWITCH 머신을 통해 역방향 전환이 등록된다.
-        pending = wrapper._pending_action
-        assert pending is not None
-        assert pending.action_type == "switch"
-        assert pending.target == "frontend"
-        assert pending.user_prompt == self.RECORD["user_prompt"]
-        assert pending.handoff.get("back") is True
-        assert pending.handoff.get("from") == "backend"
-
-        # One-shot: the record is consumed in memory and on disk.
-        # 1회용 — 기록이 메모리·디스크 양쪽에서 소비된다.
-        assert wrapper._last_transition is None
-        assert wrapper_state.load_last_transition(tmp_path) is None
-
-        # Rejection precedent on the origin session, gist = first line.
-        # 복귀 세션에 거부 판례 기록 — gist 는 첫 줄.
-        origin = store.load_session_by_name("frontend")
-        assert origin is not None
-        assert len(origin.precedents) == 1
-        precedent = origin.precedents[0]
-        assert precedent.kept_in == "frontend"
-        assert precedent.rejected == "backend"
-        assert precedent.prompt_gist == "미스라우팅된 프롬프트"
-
-        # MCP pointer invalidation goes out over the socket.
-        # MCP 포인터 무효화가 소켓으로 나간다.
-        signals = [c.args[0] for c in send.call_args_list]
-        assert {"action": "session_command", "command": "back", "args": ""} in signals
-
-        # Calibration label (R3-C4): /back = rejection of the wrong target.
-        # 보정 라벨 (R3-C4) — /back 은 잘못 간 대상에 대한 거부다.
-        labels = [
-            e
-            for e in decision_log.load_events(tmp_path)
-            if e.get("type") == "label"
-        ]
-        assert len(labels) == 1
-        assert labels[0]["label"] == "reject"
-        assert labels[0]["target"] == "backend"
-        assert labels[0]["source"] == "back"
-
-    def test_back_without_record_is_noop(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        send = MagicMock()
-        monkeypatch.setattr(wrapper.socket_server, "send", send)
-        wrapper._handle_back_command()
-        assert wrapper._pending_action is None
-        send.assert_not_called()
-
-    def test_back_during_pending_action_ignored(
-        self,
-        wrapper: SessionManagerWrapper,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        send = MagicMock()
-        monkeypatch.setattr(wrapper.socket_server, "send", send)
-        inflight = _PendingAction(
-            action_type="switch",
-            target="bar",
-            handoff={},
-            user_prompt="",
-            stage="await_resume_prompt",
-        )
-        wrapper._pending_action = inflight
-        wrapper._last_transition = dict(self.RECORD)
-
-        wrapper._handle_back_command()
-
-        # The in-flight action and the undo record are both untouched.
-        # 진행 중 액션과 undo 기록 둘 다 그대로다.
-        assert wrapper._pending_action is inflight
-        assert wrapper._last_transition == self.RECORD
-        send.assert_not_called()
-
-
-class TestHandshake:
-    def test_replies_with_initial_session_name_on_normal_start(
-        self, tmp_path: Path
-    ) -> None:
-        wrapper = SessionManagerWrapper(
-            socket_path=str(tmp_path / "x.sock"),
-            claude_args=["--resume", "foo"],
-            project_path=str(tmp_path),
-        )
-        sent: list[dict] = []
-        wrapper.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
-        wrapper._handle_handshake_request()
-        assert sent == [{"current_session_name": "foo"}]
-
-    def test_replies_with_new_session_name_during_new_flow(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        sent: list[dict] = []
-        wrapper.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
-        wrapper._pending_action = _PendingAction(
-            action_type="new",
-            target="",
-            handoff={},
-            user_prompt="",
-            stage="await_handshake",
-            new_session_name="new-one",
-        )
-        wrapper._handle_handshake_request()
-        assert sent == [{"current_session_name": "new-one"}]
-        assert wrapper._pending_action.stage == "await_new_session_prompt"
-
-    def test_replies_with_none_when_no_initial_and_not_new(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        sent: list[dict] = []
-        wrapper.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
-        wrapper._handle_handshake_request()
-        assert sent == [{"current_session_name": None}]
-
-
-class TestMcpSignalRouting:
-    def test_switch_routes_to_handle_switch(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        wrapper._handle_mcp_signal(
-            {"action": "switch", "target": "bar", "handoff": {"user_prompt": "x"}}
-        )
-        assert wrapper._pending_action is not None
-        assert wrapper._pending_action.action_type == "switch"
-
-    def test_route_switch_notifies_with_back_hint(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # An unattended (auto) switch must announce itself and the undo
-        # (Plan R3-C4 status-line wording).
-        # 무인 (auto) 전환은 전환 사실과 undo 방법을 알려야 한다
-        # (Plan R3-C4 상태 줄 원문).
-        notices: list[str] = []
-        monkeypatch.setattr(wrapper, "_notify_user", notices.append)
-        wrapper._current_session_name = "frontend"
-        wrapper._handle_mcp_signal(
-            {
-                "action": "route_switch",
-                "target": "backend",
-                "user_prompt": "로그인 API 500",
-                "verdict": {"reason": "인증 소관"},
-            }
-        )
-        assert wrapper._pending_action is not None
-        assert wrapper._pending_action.target == "backend"
-        assert notices == [
-            "⇄ backend 세션으로 전환됨 (이전: frontend) — 되돌리려면 /back"
-        ]
-
-    def test_new_routes_to_handle_new(self, wrapper: SessionManagerWrapper) -> None:
-        wrapper._handle_mcp_signal(
-            {
-                "action": "new",
-                "rename_current": "cur",
-                "new_session_name": "new",
-                "handoff": {},
-            }
-        )
-        assert wrapper._pending_action is not None
-        assert wrapper._pending_action.action_type == "new"
-
-    def test_handshake_request_routes_to_handler(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        sent: list[dict] = []
-        wrapper.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
-        wrapper._handle_mcp_signal({"type": "handshake_request"})
-        assert sent == [{"current_session_name": None}]
-
-    def test_invalid_message_ignored(self, wrapper: SessionManagerWrapper) -> None:
-        wrapper._handle_mcp_signal("not a dict")  # type: ignore[arg-type]
-        wrapper._handle_mcp_signal({})
-        assert wrapper._pending_action is None
-
-    def test_switch_missing_target_ignored(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        wrapper._handle_mcp_signal({"action": "switch", "handoff": {}})
-        assert wrapper._pending_action is None
-
-    def test_new_missing_session_name_ignored(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        wrapper._handle_mcp_signal({"action": "new", "handoff": {}})
-        assert wrapper._pending_action is None
 
 
 class TestVirtualScreenIntegration:
@@ -813,8 +196,6 @@ class TestSessionCommandObservation:
         # The keystroke goes through in the same call — no holding, no delay.
         # 키 입력이 같은 호출 안에서 통과한다 — 보관도 지연도 없다.
         assert writes == [b"\r"]
-        assert wrapper.mode == "passthrough"
-        assert wrapper.input_queue == b""
         # The departing conversation is queued for a background summary.
         # 떠나는 conversation 이 백그라운드 요약 큐에 들어간다.
         tasks = self._pending(wrapper)
@@ -919,21 +300,6 @@ class TestSessionCommandObservation:
         assert writes == [b"o"]
         assert sent == []
         assert self._pending(wrapper) == []
-
-    def test_filtering_mode_still_queues_input(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """SWITCH/NEW injection still buffers user keystrokes.
-
-        SWITCH/NEW 주입 중에는 여전히 사용자 키 입력을 큐잉한다.
-        """
-        wrapper.mode = "filtering"
-        monkeypatch.setattr("os.read", lambda fd, n: b"typed")
-        wrapper._stdin_fd = 0
-
-        wrapper._handle_stdin_readable()
-
-        assert wrapper.input_queue == b"typed"
 
 
 class TestAutoAcceptConfirmations:
@@ -1117,8 +483,6 @@ class TestAutoAcceptConfirmations:
         wrapper._spawn_child()
 
         assert wrapper._handled_confirmations == set()
-
-
 
 
 class TestSummaryTriggers:
@@ -1644,96 +1008,552 @@ class TestJudgeWiring:
         assert started == [True]
 
 
-class TestRouteSwitchExecution:
-    """route_switch (hook auto path) execution on the wrapper side.
 
-    hook 자동 경로 (route_switch) 의 래퍼 측 실행 테스트.
+
+# ---- Respawn-based transitions (redesign, docs/poc/R3-respawn.md) --------
+
+
+def _seed_resumable_session(
+    wrapper: SessionManagerWrapper,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_home: Path,
+    name: str = "frontend",
+    conv: str = "conv-1",
+) -> None:
+    """Register *name* with a conversation whose transcript exists.
+
+    transcript 가 실존하는 conversation 을 가진 세션 *name* 을 등록.
     """
+    from session_manager.claude_conversation import encode_cwd
 
-    def test_route_switch_registers_pending_with_mirror_from(
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    session = SessionMetadata.new(name=name, title="t", summary="s")
+    session.claude_conversation_ids = [conv]
+    SessionStore(Path(wrapper.project_path)).save_session(session)
+    transcript_dir = (
+        fake_home / ".claude" / "projects" / encode_cwd(Path(wrapper.project_path))
+    )
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    (transcript_dir / f"{conv}.jsonl").write_text("{}\n", encoding="utf-8")
+
+
+class TestResolveResumeConv:
+    def test_unknown_session_returns_none(
         self, wrapper: SessionManagerWrapper
     ) -> None:
+        assert wrapper._resolve_resume_conv("ghost") is None
+
+    def test_session_without_conversations_returns_none(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        SessionStore(Path(wrapper.project_path)).save_session(
+            SessionMetadata.new(name="empty", title="t")
+        )
+        assert wrapper._resolve_resume_conv("empty") is None
+
+    def test_stale_transcript_returns_none(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # Conversation id recorded but Claude Code's own cleanup removed
+        # the transcript — resuming it would kill the child at boot.
+        # id 는 기록됐지만 Claude Code 자체 정리로 transcript 소멸 —
+        # resume 하면 자식이 부팅에서 죽는다.
+        fake_home = tmp_path / "home"
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        session = SessionMetadata.new(name="stale", title="t")
+        session.claude_conversation_ids = ["gone-conv"]
+        SessionStore(Path(wrapper.project_path)).save_session(session)
+        assert wrapper._resolve_resume_conv("stale") is None
+
+    def test_live_transcript_returns_latest_id(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        _seed_resumable_session(wrapper, monkeypatch, tmp_path / "home")
+        assert wrapper._resolve_resume_conv("frontend") == "conv-1"
+
+
+class TestExecuteTransition:
+    def test_registers_pending_and_writes_handoff_file(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._execute_transition(
+            target="backend",
+            resume_conv="conv-9",
+            handoff={"from": "frontend", "message": "m", "user_prompt": "dup"},
+            user_prompt="원래 프롬프트",
+        )
+        pending = wrapper._pending_respawn
+        assert pending is not None
+        assert pending.target == "backend"
+        assert pending.resume_conv == "conv-9"
+        assert pending.from_name == "frontend"
+        assert pending.user_prompt == "원래 프롬프트"
+        assert pending.terminated is False
+        # Mirror moves immediately; the handoff content (minus the
+        # duplicated user_prompt key) lands in the pending file.
+        # 미러는 즉시 이동, handoff 내용 (중복 user_prompt 키 제외) 은
+        # pending 파일로.
+        assert wrapper._current_session_name == "backend"
+        stored = handoff_store.take_pending(Path(wrapper.project_path))
+        assert stored is not None
+        assert stored["target"] == "backend"
+        assert stored["user_prompt"] == "원래 프롬프트"
+        assert stored["handoff"] == {"from": "frontend", "message": "m"}
+
+    def test_second_transition_dropped_while_pending(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._execute_transition(
+            target="a", resume_conv=None, handoff={}, user_prompt=""
+        )
+        wrapper._execute_transition(
+            target="b", resume_conv=None, handoff={}, user_prompt=""
+        )
+        assert wrapper._pending_respawn is not None
+        assert wrapper._pending_respawn.target == "a"
+
+
+class TestMaybeTerminateForRespawn:
+    def _arm(self, wrapper: SessionManagerWrapper) -> list:
+        kills: list[tuple[int, int]] = []
+        wrapper.child = MagicMock(pid=4242)
+        wrapper._pending_respawn = _PendingRespawn(
+            target="backend", resume_conv="conv-1"
+        )
+        return kills
+
+    def test_no_pending_is_noop(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        kills: list = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: kills.append(pid))
+        wrapper._maybe_terminate_for_respawn()
+        assert kills == []
+
+    def test_busy_holds_the_swap(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # /back mid-response or an MCP switch signalled mid-turn: the
+        # in-flight reply must land in the transcript first.
+        # 응답 중 /back·턴 중 MCP 전환 — 진행 중 응답이 먼저 기록돼야 한다.
+        kills = self._arm(wrapper)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: kills.append(pid))
+        monkeypatch.setattr(
+            wrapper.virtual_screen,
+            "contains_near_prompt",
+            lambda needle, radius: needle == BUSY_MARKER,
+        )
+        wrapper._maybe_terminate_for_respawn()
+        assert kills == []
+        assert wrapper._pending_respawn.terminated is False
+
+    def test_idle_terminates_child_once(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        kills = self._arm(wrapper)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: kills.append((pid, sig)))
+        monkeypatch.setattr(
+            wrapper.virtual_screen,
+            "contains_near_prompt",
+            lambda needle, radius: False,
+        )
+        wrapper._maybe_terminate_for_respawn()
+        wrapper._maybe_terminate_for_respawn()  # 멱등 — 재전송 없음
+        import signal as _signal
+
+        assert kills == [(4242, _signal.SIGTERM)]
+        assert wrapper._pending_respawn.terminated is True
+
+
+class TestShouldRespawn:
+    def test_false_without_pending(self, wrapper: SessionManagerWrapper) -> None:
+        wrapper.child = MagicMock(exitstatus=0, signalstatus=None)
+        assert wrapper._should_respawn() is False
+
+    def test_true_with_pending(self, wrapper: SessionManagerWrapper) -> None:
+        wrapper.child = MagicMock(exitstatus=None, signalstatus=15)
+        wrapper._pending_respawn = _PendingRespawn(target="t", resume_conv=None)
+        assert wrapper._should_respawn() is True
+
+
+class TestBuildChildArgs:
+    def test_plain_boot_keeps_user_args_and_guide(
+        self, tmp_path: Path
+    ) -> None:
+        w = SessionManagerWrapper(
+            socket_path=str(tmp_path / "s.sock"),
+            claude_args=["--model", "opus"],
+            project_path=str(tmp_path),
+        )
+        args = w._build_child_args()
+        assert args[:2] == ["--model", "opus"]
+        assert any(a.startswith("--append-system-prompt=") for a in args)
+        # No trigger prompt without a pending transition.
+        # pending 전환이 없으면 트리거 프롬프트도 없다.
+        assert handoff_store.TRIGGER_PROMPT not in args
+
+    def test_respawn_appends_resume_and_trigger(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._pending_respawn = _PendingRespawn(
+            target="backend", resume_conv="conv-9"
+        )
+        args = wrapper._build_child_args()
+        # `=` form is mandatory: the space form greedily swallows the
+        # trailing positional trigger (measured, docs/poc/R3-respawn.md).
+        # `=` 형식 필수 — 공백 형식은 뒤의 트리거를 삼킨다 (실측).
+        assert "--resume=conv-9" in args
+        assert args[-1] == handoff_store.TRIGGER_PROMPT
+        assert "--resume" not in args
+
+    def test_new_respawn_has_trigger_but_no_resume(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._pending_respawn = _PendingRespawn(target="fresh", resume_conv=None)
+        args = wrapper._build_child_args()
+        assert not any(a.startswith("--resume") for a in args)
+        assert args[-1] == handoff_store.TRIGGER_PROMPT
+
+    def test_respawn_strips_user_resume_args(self, tmp_path: Path) -> None:
+        w = SessionManagerWrapper(
+            socket_path=str(tmp_path / "s.sock"),
+            claude_args=["--resume", "old-conv", "--model", "opus"],
+            project_path=str(tmp_path),
+        )
+        w._pending_respawn = _PendingRespawn(target="t", resume_conv="new-conv")
+        args = w._build_child_args()
+        assert "old-conv" not in args
+        assert "--resume=new-conv" in args
+        assert "--model" in args
+
+
+class TestStripResumeArgs:
+    def test_strips_all_resume_variants(self) -> None:
+        args = [
+            "--resume", "aaa", "-r", "bbb", "--resume=ccc", "--continue",
+            "-c", "--model", "opus",
+        ]
+        assert SessionManagerWrapper._strip_resume_args(args) == [
+            "--model", "opus",
+        ]
+
+    def test_keeps_everything_else(self) -> None:
+        args = ["--model", "opus", "--verbose"]
+        assert SessionManagerWrapper._strip_resume_args(args) == args
+
+
+class TestSpawnCompletion:
+    """Transition bookkeeping happens at (re)spawn — the swap's success.
+
+    전환 부기는 교체가 성공한 (re)spawn 시점에 일어난다.
+    """
+
+    def _spawn(self, wrapper: SessionManagerWrapper, monkeypatch) -> list:
+        spawned: list[list[str]] = []
+
+        class FakeChild:
+            pid = 7
+            def fileno(self) -> int:
+                return 0
+
+        def fake_spawn(cmd, args, **kwargs):
+            spawned.append(args)
+            return FakeChild()
+
+        import pexpect
+
+        monkeypatch.setattr(pexpect, "spawn", fake_spawn)
+        wrapper._spawn_child()
+        return spawned
+
+    def test_normal_transition_records_last_transition(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapper._pending_respawn = _PendingRespawn(
+            target="backend",
+            resume_conv="conv-9",
+            from_name="frontend",
+            user_prompt="옮겨간 프롬프트",
+        )
+        self._spawn(wrapper, monkeypatch)
+        assert wrapper._pending_respawn is None
+        record = wrapper._last_transition
+        assert record is not None
+        assert record["from"] == "frontend"
+        assert record["to"] == "backend"
+        assert record["user_prompt"] == "옮겨간 프롬프트"
+
+    def test_back_respawn_consumes_undo_record(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        record = {
+            "from": "frontend", "to": "backend",
+            "user_prompt": "p", "at": "2026-08-10T00:00:00+00:00",
+        }
+        wrapper._last_transition = dict(record)
+        wrapper_state.save_last_transition(Path(wrapper.project_path), record)
+        wrapper._pending_respawn = _PendingRespawn(
+            target="frontend", resume_conv="conv-1", is_back=True
+        )
+        self._spawn(wrapper, monkeypatch)
+        assert wrapper._last_transition is None
+        assert (
+            wrapper_state.load_last_transition(Path(wrapper.project_path)) is None
+        )
+
+    def test_spawn_uses_built_args(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapper._pending_respawn = _PendingRespawn(
+            target="backend", resume_conv="conv-9"
+        )
+        spawned = self._spawn(wrapper, monkeypatch)
+        assert len(spawned) == 1
+        assert "--resume=conv-9" in spawned[0]
+        assert spawned[0][-1] == handoff_store.TRIGGER_PROMPT
+
+
+class TestBackCommand:
+    """/back over the respawn transition path.
+
+    respawn 전환 경로 위의 /back.
+    """
+
+    RECORD = {
+        "from": "frontend",
+        "to": "backend",
+        "user_prompt": "미스라우팅된 프롬프트\n둘째 줄",
+        "at": "2026-08-10T00:00:00+00:00",
+    }
+
+    def _prepare(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> MagicMock:
+        _seed_resumable_session(
+            wrapper, monkeypatch, tmp_path / "home", name="frontend", conv="conv-1"
+        )
+        wrapper._last_transition = dict(self.RECORD)
+        send = MagicMock()
+        monkeypatch.setattr(wrapper.socket_server, "send", send)
+        return send
+
+    def test_back_registers_reverse_respawn(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        send = self._prepare(wrapper, monkeypatch, tmp_path)
+        wrapper._handle_back_command()
+
+        pending = wrapper._pending_respawn
+        assert pending is not None
+        assert pending.target == "frontend"
+        assert pending.resume_conv == "conv-1"
+        assert pending.is_back is True
+        # The misrouted prompt travels via the pending-handoff file.
+        # 잘못 이동했던 프롬프트는 pending handoff 파일로 이동한다.
+        stored = handoff_store.take_pending(Path(wrapper.project_path))
+        assert stored is not None
+        assert stored["user_prompt"] == self.RECORD["user_prompt"]
+        assert stored["handoff"]["back"] is True
+        assert stored["handoff"]["from"] == "backend"
+
+        # NOT consumed until the respawn completes.
+        # respawn 완료 전에는 소비되지 않는다.
+        assert wrapper._last_transition == self.RECORD
+
+        # Precedent on the origin session, gist = first line.
+        # 복귀 세션에 판례 — gist 는 첫 줄.
+        origin = SessionStore(Path(wrapper.project_path)).load_session_by_name(
+            "frontend"
+        )
+        assert len(origin.precedents) == 1
+        assert origin.precedents[0].rejected == "backend"
+        assert origin.precedents[0].prompt_gist == "미스라우팅된 프롬프트"
+
+        # Calibration label + MCP pointer invalidation.
+        # 보정 라벨 + MCP 포인터 무효화.
+        labels = [
+            e
+            for e in decision_log.load_events(Path(wrapper.project_path))
+            if e.get("type") == "label"
+        ]
+        assert [(la["label"], la["target"], la["source"]) for la in labels] == [
+            ("reject", "backend", "back")
+        ]
+        signals = [c.args[0] for c in send.call_args_list]
+        assert {"action": "session_command", "command": "back", "args": ""} in signals
+
+    def test_back_unresolvable_origin_keeps_record(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # Origin session's transcript is gone — abort BEFORE any side
+        # effect so the user can retry after fixing things.
+        # 원 세션 transcript 소멸 — 부수효과 전에 중단해 재시도 가능하게.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+        wrapper._last_transition = dict(self.RECORD)
+        send = MagicMock()
+        monkeypatch.setattr(wrapper.socket_server, "send", send)
+
+        wrapper._handle_back_command()
+
+        assert wrapper._pending_respawn is None
+        assert wrapper._last_transition == self.RECORD
+        assert decision_log.load_events(Path(wrapper.project_path)) == []
+        send.assert_not_called()
+
+    def test_back_without_record_is_noop(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        send = MagicMock()
+        monkeypatch.setattr(wrapper.socket_server, "send", send)
+        wrapper._handle_back_command()
+        assert wrapper._pending_respawn is None
+        send.assert_not_called()
+
+    def test_back_during_pending_transition_ignored(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        self._prepare(wrapper, monkeypatch, tmp_path)
+        wrapper._pending_respawn = _PendingRespawn(target="x", resume_conv=None)
+        wrapper._handle_back_command()
+        assert wrapper._pending_respawn.target == "x"
+        assert wrapper._last_transition == self.RECORD
+
+
+class TestHandshake:
+    def test_replies_with_initial_session_name(self, tmp_path: Path) -> None:
+        w = SessionManagerWrapper(
+            socket_path=str(tmp_path / "s.sock"),
+            claude_args=["--resume", "foo"],
+            project_path=str(tmp_path),
+        )
+        sent: list[dict] = []
+        w.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
+        w._handle_handshake_request()
+        assert sent == [{"current_session_name": "foo"}]
+
+    def test_replies_with_none_on_plain_start(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        sent: list[dict] = []
+        wrapper.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
+        wrapper._handle_handshake_request()
+        assert sent == [{"current_session_name": None}]
+
+    def test_replies_with_mirror_after_transition(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        # After a transition the respawned child's MCP must learn the
+        # target session from the handshake.
+        # 전환 후 재시작된 자식의 MCP 는 핸드셰이크로 대상 세션을 알아야
+        # 한다.
+        wrapper._execute_transition(
+            target="backend", resume_conv=None, handoff={}, user_prompt=""
+        )
+        sent: list[dict] = []
+        wrapper.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
+        wrapper._handle_handshake_request()
+        assert sent == [{"current_session_name": "backend"}]
+
+
+class TestMcpSignalRouting:
+    def test_switch_signal_registers_respawn(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        _seed_resumable_session(
+            wrapper, monkeypatch, tmp_path / "home", name="bar", conv="conv-bar"
+        )
+        wrapper._handle_mcp_signal(
+            {"action": "switch", "target": "bar", "handoff": {"user_prompt": "x"}}
+        )
+        pending = wrapper._pending_respawn
+        assert pending is not None
+        assert pending.target == "bar"
+        assert pending.resume_conv == "conv-bar"
+
+    def test_switch_without_conversation_boots_fresh(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._handle_mcp_signal(
+            {"action": "switch", "target": "ghost", "handoff": {}}
+        )
+        pending = wrapper._pending_respawn
+        assert pending is not None
+        assert pending.resume_conv is None
+
+    def test_new_signal_registers_fresh_respawn(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._handle_mcp_signal(
+            {
+                "action": "new",
+                "rename_current": "cur",
+                "new_session_name": "fresh",
+                "handoff": {"from": "cur"},
+            }
+        )
+        pending = wrapper._pending_respawn
+        assert pending is not None
+        assert pending.target == "fresh"
+        assert pending.resume_conv is None
+
+    def test_route_switch_notifies_with_back_hint(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        notices: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notices.append)
         wrapper._current_session_name = "frontend"
         wrapper._handle_mcp_signal(
             {
-                "client": "hook",
                 "action": "route_switch",
                 "target": "backend",
-                "user_prompt": "로그인 API가 500을 뱉는다",
-                "verdict": {"action": "SWITCH", "reason": "인증 소관"},
+                "user_prompt": "로그인 API 500",
+                "verdict": {"reason": "인증 소관"},
             }
         )
-        pending = wrapper._pending_action
+        pending = wrapper._pending_respawn
         assert pending is not None
-        assert pending.action_type == "switch"
         assert pending.target == "backend"
-        assert pending.user_prompt == "로그인 API가 500을 뱉는다"
-        assert pending.handoff == {"from": "frontend", "router_reason": "인증 소관"}
-        assert wrapper._current_session_name == "backend"
+        stored = handoff_store.take_pending(Path(wrapper.project_path))
+        assert stored["handoff"]["from"] == "frontend"
+        assert stored["handoff"]["router_reason"] == "인증 소관"
+        assert notices == [
+            "⇄ backend 세션으로 전환됨 (이전: frontend) — 되돌리려면 /back"
+        ]
 
-    def test_route_switch_without_target_ignored(
+    def test_invalid_message_ignored(self, wrapper: SessionManagerWrapper) -> None:
+        wrapper._handle_mcp_signal("not a dict")  # type: ignore[arg-type]
+        wrapper._handle_mcp_signal({})
+        assert wrapper._pending_respawn is None
+
+    def test_switch_missing_target_ignored(
         self, wrapper: SessionManagerWrapper
     ) -> None:
-        wrapper._handle_mcp_signal(
-            {"client": "hook", "action": "route_switch", "user_prompt": "x"}
-        )
-        assert wrapper._pending_action is None
+        wrapper._handle_mcp_signal({"action": "switch", "handoff": {}})
+        assert wrapper._pending_respawn is None
 
-    def test_route_switch_without_verdict_reason(
+    def test_new_missing_session_name_ignored(
         self, wrapper: SessionManagerWrapper
     ) -> None:
-        wrapper._current_session_name = None
-        wrapper._handle_mcp_signal(
-            {"client": "hook", "action": "route_switch", "target": "backend"}
-        )
-        pending = wrapper._pending_action
-        assert pending is not None
-        assert pending.handoff == {"from": None}
-        assert pending.user_prompt == ""
-
-
-class TestResolveResumeArg:
-    """Conversation-id resolution for the /resume injection (P2-h).
-
-    /resume 주입 인자의 conversation id 해석 (P2-h 실측 근거) 테스트.
-    """
-
-    def _seed(self, wrapper: SessionManagerWrapper, conv_ids: list[str]) -> None:
-        store = SessionStore(Path(wrapper.project_path))
-        store.init_project()
-        session = SessionMetadata.new(name="backend", title="API")
-        session.claude_conversation_ids = conv_ids
-        store.save_session(session)
-
-    def test_latest_conversation_id_preferred(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        self._seed(wrapper, ["conv-old", "conv-new"])
-        assert wrapper._resolve_resume_arg("backend") == "conv-new"
-
-    def test_no_ids_falls_back_to_name(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        self._seed(wrapper, [])
-        assert wrapper._resolve_resume_arg("backend") == "backend"
-
-    def test_unknown_session_falls_back_to_name(
-        self, wrapper: SessionManagerWrapper
-    ) -> None:
-        assert wrapper._resolve_resume_arg("ghost") == "ghost"
-
-    def test_advance_switch_injects_conversation_id(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._seed(wrapper, ["conv-a", "conv-b"])
-        injected = _capture_injects(wrapper, monkeypatch)
-        pending = _PendingAction(
-            action_type="switch",
-            target="backend",
-            handoff={},
-            user_prompt="hi",
-            stage="await_resume_prompt",
-        )
-        wrapper._pending_action = pending
-        wrapper._advance_switch(pending)
-        assert injected == [b"/resume conv-b"]
+        wrapper._handle_mcp_signal({"action": "new", "handoff": {}})
+        assert wrapper._pending_respawn is None

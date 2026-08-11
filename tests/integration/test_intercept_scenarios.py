@@ -25,10 +25,10 @@ from pathlib import Path
 import pexpect
 import pytest
 
-from session_manager.wrapper.pty_wrapper import (
-    PROMPT_POINTER,
-    SessionManagerWrapper,
-)
+from session_manager.wrapper.pty_wrapper import SessionManagerWrapper
+
+# Ink 입력란 포인터 (관찰용 가상 화면 렌더링에 사용)
+PROMPT_POINTER = "❯".encode()
 
 _MOCK_CLAUDE = str(Path(__file__).parent / "mock_claude.py")
 _TIMEOUT = 5
