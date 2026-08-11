@@ -1233,6 +1233,55 @@ class TestBuildChildArgs:
         assert "--model" in args
 
 
+class TestMcpConfigFlag:
+    """--mcp-config= injection (F4 fix — docs/poc/R3-mcp-config.md).
+
+    --mcp-config= 주입 (F4 수정 — docs/poc/R3-mcp-config.md).
+    """
+
+    def test_flag_is_single_equals_form_token(self) -> None:
+        # `=` form is mandatory: the space form greedily swallows the
+        # trailing positional trigger (measured, docs/poc/R3-respawn.md).
+        # `=` 형식 필수 — 공백 형식은 뒤의 트리거를 삼킨다 (실측).
+        flag = SessionManagerWrapper._mcp_config_flag()
+        assert len(flag) == 1
+        assert flag[0].startswith("--mcp-config=")
+
+    def test_config_targets_server_module_in_same_venv(self) -> None:
+        import json as _json
+        import sys as _sys
+
+        flag = SessionManagerWrapper._mcp_config_flag()
+        config = _json.loads(flag[0].removeprefix("--mcp-config="))
+        server = config["mcpServers"]["session-manager"]
+        assert server["type"] == "stdio"
+        assert server["command"] == _sys.executable
+        assert server["args"] == ["-m", "session_manager.server"]
+
+    def test_plain_boot_includes_mcp_config(self, tmp_path: Path) -> None:
+        w = SessionManagerWrapper(
+            socket_path=str(tmp_path / "s.sock"),
+            claude_args=["--model", "opus"],
+            project_path=str(tmp_path),
+        )
+        args = w._build_child_args()
+        assert any(a.startswith("--mcp-config=") for a in args)
+        # Additive injection only — never strict, so the user's other
+        # MCP servers keep loading.
+        # 추가 주입만 — strict 금지, 사용자의 타 MCP 서버 로드 유지.
+        assert "--strict-mcp-config" not in args
+
+    def test_respawn_includes_mcp_config_before_trigger(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._pending_respawn = _PendingRespawn(
+            target="backend", resume_conv="conv-9"
+        )
+        args = wrapper._build_child_args()
+        assert any(a.startswith("--mcp-config=") for a in args)
+        assert args[-1] == handoff_store.TRIGGER_PROMPT
+
+
 class TestStripResumeArgs:
     def test_strips_all_resume_variants(self) -> None:
         args = [
