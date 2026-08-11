@@ -21,17 +21,11 @@ uv sync
 
 ## 설정
 
-### MCP 서버 등록
+### MCP 서버 등록 — 필요 없음
 
-Claude Code에 MCP 서버를 등록한다. `--scope user`로 전역 등록하면 모든 프로젝트에서 사용할 수 있다.
+별도의 MCP 서버 등록이 필요 없다. `ccode`가 Claude Code를 실행할 때 `--mcp-config` 인자로 session-manager 서버를 직접 주입하므로, `ccode`로 띄운 Claude Code에만 서버가 로드된다. 래퍼 없이 `claude`를 직접 실행하면 서버는 로드되지 않는다 (무관한 폴더에 `.session-manager/`가 생기지 않는다).
 
-```bash
-claude mcp add session-manager --scope user -- \
-  uv run --project /path/to/mcp-session-router \
-  python -m session_manager.server
-```
-
-`/path/to/mcp-session-router`를 실제 클론한 경로로 교체한다.
+> 이전 버전 안내에 따라 `claude mcp add session-manager --scope user ...`로 전역 등록했다면 제거를 권장한다: `claude mcp remove session-manager --scope user`. 남아 있어도 `ccode` 동작에는 지장이 없지만, 래퍼 없는 `claude`가 서버를 띄워 실행 폴더마다 `.session-manager/`를 만든다.
 
 ## 사용법
 
