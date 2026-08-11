@@ -113,3 +113,31 @@ class VirtualScreen:
         confirmation prompt 감지에 사용 — 발견되면 wrapper가 자동 승인.
         """
         return any(needle in line for line in self._safe_display())
+
+    def contains_near_prompt(self, needle: str, radius: int) -> bool:
+        """True if *needle* appears within *radius* rows of the prompt row.
+
+        입력란(마지막 ❯ 행) 위아래 *radius* 행 안에 *needle* 이 있으면 True.
+
+        Used for status markers Ink draws next to the input box (e.g.
+        "esc to interrupt" while a turn is running). Scoping the search
+        to the input-box neighbourhood keeps conversation text that
+        merely QUOTES the marker from false-positiving. Without a prompt
+        row the whole screen is searched (conservative fallback).
+
+        Ink 가 입력란 곁에 그리는 상태 마커 (턴 실행 중의 "esc to
+        interrupt" 등) 감지용. 검색을 입력란 주변으로 한정해, 마커 문구를
+        단지 **인용**한 대화 본문이 오탐을 내지 않게 한다. ❯ 행이 없으면
+        보수적으로 화면 전체를 검색한다.
+        """
+        display = self._safe_display()
+        prompt_idx: int | None = None
+        for idx in range(len(display) - 1, -1, -1):
+            if PROMPT_MARKER in display[idx]:
+                prompt_idx = idx
+                break
+        if prompt_idx is None:
+            return any(needle in line for line in display)
+        lo = max(0, prompt_idx - radius)
+        hi = min(len(display), prompt_idx + radius + 1)
+        return any(needle in line for line in display[lo:hi])

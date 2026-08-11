@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from session_manager import debug_log
+from session_manager import debug_log, handoff_store
 from session_manager.models.config import (
     DEFAULT_AUTO_ERROR_TOLERANCE,
     DEFAULT_ROUTING_MODE,
@@ -49,6 +49,7 @@ from session_manager.storage.file_store import (
     _SESSION_MANAGER_DIRNAME,
     _SESSIONS_DIRNAME,
 )
+from session_manager.wrapper.handoff_formatter import format_handoff_injection
 
 # The wrapper exports its socket path to Claude Code's env; hook
 # processes are Claude Code's children and inherit it.
@@ -141,6 +142,62 @@ def _count_active_sessions(root: Path) -> int:
         if isinstance(data, dict) and data.get("status", "active") == "active":
             count += 1
     return count
+
+
+def _deliver_pending_handoff(payload: dict[str, Any]) -> bool:
+    """
+    Transition-trigger stage: when this submission is the respawn's
+    fixed trigger prompt, consume the pending handoff file and hand its
+    content to the LLM as additionalContext. Returns True when handled
+    (the caller then skips prefilter/judgment — a transition trigger
+    must never be re-routed).
+
+    전환 트리거 단계 — 이 제출이 respawn 의 고정 트리거 프롬프트면
+    pending handoff 파일을 소비해 additionalContext 로 LLM 에 전달한다.
+    처리했으면 True — 호출자는 프리필터·판정을 건너뛴다 (전환 트리거가
+    다시 라우팅되면 안 된다).
+    """
+    if payload.get(FIELD_PROMPT) != handoff_store.TRIGGER_PROMPT:
+        return False
+    cwd = payload.get(FIELD_CWD)
+    if not isinstance(cwd, str) or not cwd:
+        return True  # 트리거인데 cwd 불명 — 라우팅만 막고 통과
+    pending = handoff_store.take_pending(Path(cwd))
+    if pending is None:
+        # Trigger without a file (stale trigger, double fire) — pass
+        # through silently; the LLM sees only the bare trigger text.
+        # 파일 없는 트리거 (낡은 트리거·이중 발동) — 조용히 통과.
+        debug_log.log(
+            "HOOK_HANDOFF",
+            "SYSTEM",
+            {"result": "no_pending_file"},
+            conv_id=payload.get(FIELD_SESSION_ID),
+        )
+        return True
+    handoff = pending.get("handoff")
+    user_prompt = pending.get("user_prompt")
+    context = format_handoff_injection(
+        handoff if isinstance(handoff, dict) else {},
+        user_prompt if isinstance(user_prompt, str) else "",
+    )
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+    debug_log.log(
+        "HOOK_HANDOFF",
+        "SYSTEM",
+        {"result": "delivered", "target": pending.get("target")},
+        conv_id=payload.get(FIELD_SESSION_ID),
+    )
+    return True
 
 
 def _prefilter(payload: dict[str, Any]) -> str | None:
@@ -499,6 +556,8 @@ def run(stdin_text: str) -> int:
         return 0
 
     try:
+        if _deliver_pending_handoff(payload):
+            return 0
         rule = _prefilter(payload)
         if rule is not None:
             debug_log.log(

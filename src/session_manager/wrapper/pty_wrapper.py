@@ -30,16 +30,15 @@ import select
 import signal
 import sys
 import termios
-import time
 import tty
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import pexpect
 
-from session_manager import debug_log, summarizer
+from session_manager import debug_log, handoff_store, summarizer
 from session_manager.claude_conversation import (
     encode_cwd,
     get_active_conversation_id,
@@ -61,29 +60,29 @@ from session_manager.wrapper.command_matcher import (
     match_back_command,
     match_intercept_command,
 )
-from session_manager.wrapper.handoff_formatter import format_handoff_injection
 from session_manager.wrapper.judge_host import JudgeHost
 from session_manager.wrapper.socket_server import WrapperSocketServer
 from session_manager.wrapper.virtual_screen import VirtualScreen
 
-# figures.pointer "❯" (UTF-8 E2 9D AF) followed by chalk.inverse "\x1b[7m"
-# is what ink-text-input renders for the prompt cursor. Verified against
-# the Claude Code binary (strings shows both \u276F and inverse: [7, 27]).
+# NOTE (R3-FIX1 redesign, docs/poc/R3-respawn.md): the wrapper no longer
+# scans PTY output for renderer-internal patterns (pointer+inverse
+# cursor) and never types into the TUI to execute transitions. Measured
+# 2026-08-09: the current Claude Code renderer emits no such pattern in
+# ANY situation (boot/idle/typing/hook-block - 144 chunks, 0 hits),
+# which had silently killed every injection-driven feature. Transitions
+# are now executed by swapping the child process (SIGTERM ->
+# `claude --resume=<conv>` + trigger prompt), with context delivered via
+# the pending-handoff file + UserPromptSubmit hook. Only official
+# interfaces remain.
 #
-# ink-text-input이 프롬프트 커서를 그릴 때 쓰는 패턴. "❯"(UTF-8 E2 9D AF)
-# 뒤에 chalk.inverse "\x1b[7m"이 이어지는 형태. Claude Code 바이너리에서
-# \u276F와 inverse: [7, 27] 정의를 strings로 확인.
-PROMPT_POINTER = b"\xe2\x9d\xaf"
-INVERSE_VIDEO_START = b"\x1b[7m"
-
-# Cap the prompt-detection buffer to prevent unbounded growth in long
-# sessions. When truncating, keep enough tail so an in-flight multi-byte
-# sequence at the boundary isn't sliced apart.
-#
-# 장시간 세션에서 프롬프트 감지 버퍼 무한 증가 방지. 잘라낼 때는
-# 끝부분을 충분히 남겨 경계에 걸친 멀티바이트 시퀀스 보존.
-OUTPUT_BUFFER_CAP = 16 * 1024
-OUTPUT_BUFFER_TAIL_KEEP = 256
+# 참고 (R3-FIX1 재설계, docs/poc/R3-respawn.md): 래퍼는 더 이상 PTY 출력의
+# 렌더러 내부 패턴 (포인터+inverse 커서) 을 스캔하지 않고, 전환 실행을
+# 위해 TUI 에 타이핑하지 않는다. 2026-08-09 실측 — 현 렌더러는 어떤
+# 상황에서도 그 패턴을 출력하지 않으며 (부팅·유휴·타이핑·hook block,
+# 144 chunk 0회), 주입 기반 기능 전부가 조용히 죽어 있었다. 전환은 자식
+# 프로세스 교체 (SIGTERM → `claude --resume=<conv>` + 트리거 프롬프트) 로
+# 실행하고, 컨텍스트는 pending handoff 파일 + UserPromptSubmit hook 으로
+# 전달한다. 공식 인터페이스만 남는다.
 
 # Confirmation prompts that ccode auto-accepts on every spawn.
 #
@@ -123,7 +122,20 @@ CLEAR_COMMAND_RE = re.compile(r"^/clear(\s|$)")
 # 않으므로, 래퍼가 처리하기 전에 타이핑된 텍스트를 이것으로 지운다.
 ERASE_INPUT_LINE = b"\x15"
 
-Mode = Literal["passthrough", "filtering"]
+# Busy marker Ink shows next to the input box while a turn is running
+# (measured: present during generation, gone after — docs/poc/R3-back.md
+# follow-up PoC). Searched only near the prompt row so conversation text
+# QUOTING the phrase cannot false-positive; radius covers the input box
+# + status line block. Two uses: (1) a transition waits for the turn to
+# end before swapping the child, (2) the falling edge (busy → idle) is
+# the turn-end event that triggers the periodic summary-refresh check.
+# 턴 실행 중 Ink 가 입력란 곁에 표시하는 바쁨 마커 (실측: 생성 중 표시,
+# 종료 후 소멸). 대화 본문의 **인용** 오탐을 막기 위해 입력란 주변 행만
+# 검색한다. radius 는 입력 박스+상태 줄 블록을 덮는 값. 용도 둘:
+# (1) 전환이 자식 교체 전 턴 종료를 기다리는 가드, (2) 하강 에지
+# (busy → idle) 가 턴 종료 이벤트로서 주기 요약 갱신 검사를 발동한다.
+BUSY_MARKER = "esc to interrupt"
+BUSY_MARKER_RADIUS_ROWS = 4
 
 
 def _safe_fileno(stream: Any) -> int:
@@ -152,22 +164,43 @@ def _debug_log(msg: str) -> None:
 
 
 @dataclass
-class _PendingAction:
+class _PendingRespawn:
     """
-    Tracks an in-progress SWITCH or NEW action across multiple prompt events.
+    A transition waiting for the current turn to end, then a child swap.
 
-    여러 번의 프롬프트 감지 이벤트에 걸쳐 진행되는 SWITCH/NEW 액션 상태를
-    보관한다. stage 값은 다음 프롬프트에서 어떤 단계로 진입할지 결정한다.
+    턴 종료를 기다렸다가 자식 교체로 실행되는 전환 1건.
+
+    The whole former stage machine collapses into this: the handoff
+    content already sits in the pending file (handoff_store), so the
+    only remaining steps are "wait until not busy → SIGTERM → respawn
+    with --resume=<conv> + trigger".
+
+    이전의 단계 머신 전체가 이것으로 축약된다 — handoff 내용은 이미
+    pending 파일 (handoff_store) 에 있으므로, 남은 절차는 "바쁨 해제
+    대기 → SIGTERM → --resume=<conv> + 트리거로 respawn" 뿐이다.
     """
 
-    action_type: Literal["switch", "new"]
+    # Session name being switched to (mirror/logging).
+    # 전환 대상 세션 이름 (미러·로그용).
     target: str
-    handoff: dict[str, Any]
-    user_prompt: str
-    stage: str
-    # NEW 전용. SWITCH일 때는 기본값 그대로.
-    rename_current: str | None = None
-    new_session_name: str = ""
+    # Conversation to resume; None boots a fresh conversation (NEW).
+    # 재개할 conversation. None 이면 새 conversation 부팅 (NEW).
+    resume_conv: str | None
+    # Departing session name (last-transition bookkeeping).
+    # 떠나는 세션 이름 (last_transition 부기용).
+    from_name: str | None = None
+    # User prompt travelling with the transition (also in the pending
+    # file) — kept here for last-transition bookkeeping so /back can
+    # re-deliver it.
+    # 전환과 함께 이동하는 사용자 프롬프트 (pending 파일에도 있음) —
+    # /back 이 재전달할 수 있도록 last_transition 부기용으로 보관.
+    user_prompt: str = ""
+    # /back reverse switch — consumes the undo record on completion.
+    # /back 역전환 — 완료 시 undo 기록을 소비한다.
+    is_back: bool = False
+    # SIGTERM already sent (idempotence across ticks).
+    # SIGTERM 전송 여부 (틱 간 멱등).
+    terminated: bool = False
 
 
 class SessionManagerWrapper:
@@ -183,11 +216,6 @@ class SessionManagerWrapper:
 
         self.child: pexpect.spawn | None = None
         self.pty_fd: int = -1
-
-        self.mode: Mode = "passthrough"
-        self.output_buffer: bytes = b""
-        self.input_queue: bytes = b""
-        self.stdin_line_buffer: bytes = b""
 
         # 테스트 환경이나 stdin/stdout 이 redirect 된 경우 fileno() 가 실패할 수
         # 있으므로 안전하게 -1 로 폴백. 실런타임에서는 isatty/-1 검사로 가드.
@@ -209,7 +237,13 @@ class SessionManagerWrapper:
         # 슬래시 명령을 submit한 시점의 입력란 텍스트(❯ 라인) 추출에 사용.
         self.virtual_screen = VirtualScreen()
 
-        self._pending_action: _PendingAction | None = None
+        self._pending_respawn: _PendingRespawn | None = None
+
+        # Busy state from the previous PTY chunk — the falling edge
+        # (busy → idle) is the turn-end event (periodic summary check).
+        # 직전 PTY chunk 의 바쁨 상태 — 하강 에지 (busy → idle) 가 턴 종료
+        # 이벤트다 (주기 요약 검사).
+        self._was_busy: bool = False
 
         # Confirmation patterns already auto-accepted in the current child.
         # Reset on each spawn so a respawned child re-arms the auto-accept.
@@ -234,38 +268,6 @@ class SessionManagerWrapper:
         # 표시 전에 타이핑하면 자동 승인이 꺼져 수동 확인하게 되는데,
         # 이는 오발사와 달리 무해하다.
         self._auto_confirm_armed: bool = True
-
-        # AGENT_GUIDE.md injection stage machine. (Re)set inside _spawn_child
-        # based on whether the new child receives a fresh conversation.
-        # Stages must be split across separate prompt-detect cycles because
-        # injecting text and sending \r in the same cycle looks like a paste
-        # to Ink's TextInput, and Ink treats paste \r as a newline (no submit).
-        # AGENT_GUIDE 주입 stage 머신. _spawn_child에서 갱신.
-        # inject와 \r submit을 같은 prompt-detect 사이클에 보내면 Ink가 paste로
-        # 인식해 \r을 줄바꿈으로 처리(submit 안 됨)하므로, prompt-detect 사이클
-        # 사이에 분리 — SWITCH/NEW의 stage 패턴과 동일.
-        self._agent_guide_stage: Literal[
-            "needed", "injected", "submitted", "done"
-        ] = "done"
-
-        # time.monotonic() of the most recent auto-accept fire. Used by the
-        # AGENT_GUIDE inject guard to wait a brief cooldown after a
-        # confirmation gets accepted, so Claude Code has time to redraw
-        # the screen without the confirmation menu before we inject.
-        # 마지막 auto-accept 발동 시각. AGENT_GUIDE inject 가드가 자동 승인
-        # 직후의 redraw race를 피하기 위해 짧은 cooldown 대기에 사용.
-        self._last_auto_accept_at: float = 0.0
-
-        # Tracking for the AGENT_GUIDE submitted -> done transition. We
-        # don't want to drop filtering until the LLM has actually finished
-        # replying — detected as ❯ disappearing (thinking starts) then
-        # reappearing (new input field). Falls back to a hard timeout if
-        # neither transition lands.
-        # AGENT_GUIDE submitted → done 전환 추적. LLM 응답 종료 전에 filtering
-        # 풀리면 응답이 사용자 화면에 노출되므로, ❯ 사라짐→재등장 transition을
-        # 기다린다. 30초 hard timeout으로 stuck 방지.
-        self._seen_pointer_clear: bool = False
-        self._submitted_at: float = 0.0
 
         # Initial current_session_name handed back during the MCP handshake,
         # decided from CLI args:
@@ -314,9 +316,13 @@ class SessionManagerWrapper:
 
         # Most recent wrapper-executed transition, the target of /back
         # (R3-C3). Memory-first with state.json persistence so the undo
-        # survives a wrapper restart. Consumed on use (one-shot).
+        # survives a wrapper restart. Consumed when the reverse switch
+        # COMPLETES (R3-FIX1) — a stalled/crashed undo keeps the record
+        # so the user can retry.
         # 가장 최근의 래퍼 실행 전환 — /back (R3-C3) 의 대상. 메모리 우선
-        # + state.json 영속화로 래퍼 재시작을 견딘다. 사용 시 소비 (1회용).
+        # + state.json 영속화로 래퍼 재시작을 견딘다. 소비는 역전환이
+        # **완료**될 때 (R3-FIX1) — 정지·크래시 시 기록이 남아 재시도
+        # 가능하다.
         self._last_transition: dict[str, Any] | None = (
             wrapper_state.load_last_transition(Path(self.project_path))
         )
@@ -345,11 +351,19 @@ class SessionManagerWrapper:
         self.summarizer_worker.start()
         self._maybe_start_judge()
 
+        # A pending-handoff file surviving to boot belongs to a transition
+        # that never reached its trigger (crash) — dispose of it so a
+        # future unrelated prompt cannot slurp a stale handoff.
+        # 부팅까지 살아남은 pending handoff 파일은 트리거에 도달하지 못한
+        # 전환의 잔재 (크래시) — 무관한 미래 프롬프트가 낡은 handoff 를
+        # 소비하지 못하게 처분한다.
+        handoff_store.clear_stale_pending(Path(self.project_path))
+
         try:
             self._spawn_child()
             self._sync_winsize()
             self._io_loop()
-            while self._should_respawn_for_new():
+            while self._should_respawn():
                 self._spawn_child()
                 self._sync_winsize()
                 self._io_loop()
@@ -359,19 +373,80 @@ class SessionManagerWrapper:
             self.judge_host.stop()
             self.socket_server.stop()
 
+    @staticmethod
+    def _strip_resume_args(args: list[str]) -> list[str]:
+        """Drop resume/continue flags (and their values) from user args.
+
+        사용자 인자에서 resume/continue 계열 플래그 (와 값) 를 제거한다.
+        respawn 은 자체 `--resume=` 을 붙이므로 원 인자의 것과 충돌하면
+        안 된다. 그 외 인자 (--model 등) 는 그대로 유지된다.
+        """
+        out: list[str] = []
+        skip_value = False
+        for arg in args:
+            if skip_value:
+                skip_value = False
+                continue
+            if arg in ("--continue", "-c"):
+                continue
+            if arg in ("--resume", "-r"):
+                skip_value = True
+                continue
+            if arg.startswith("--resume=") or arg.startswith("-r="):
+                continue
+            out.append(arg)
+        return out
+
+    def _agent_guide_flag(self) -> list[str]:
+        """AGENT_GUIDE delivery: an official CLI flag instead of typing.
+
+        AGENT_GUIDE 전달 — 타이핑 주입 대신 공식 CLI 플래그.
+
+        ``--append-system-prompt=`` puts the manual in the system prompt
+        of every child (measured with interactive resume,
+        docs/poc/R3-respawn.md). Per-process, so respawns re-carry it;
+        never written into the transcript.
+
+        ``--append-system-prompt=`` 이 매뉴얼을 모든 자식의 시스템
+        프롬프트에 싣는다 (대화형 재개와의 조합 실측,
+        docs/poc/R3-respawn.md). 프로세스 단위라 respawn 마다 자동
+        유지되고 transcript 에는 기록되지 않는다.
+        """
+        try:
+            guide = AGENT_GUIDE_PATH.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        return [f"--append-system-prompt={guide}"]
+
+    def _build_child_args(self) -> list[str]:
+        """Assemble argv for the next child from the pending transition.
+
+        pending 전환으로부터 다음 자식의 argv 를 조립한다.
+
+        Flags use the ``--option=value`` form throughout: the space form
+        is greedy and would swallow the trailing trigger prompt
+        (measured, docs/poc/R3-respawn.md). The trigger prompt is
+        content-free — the actual handoff travels in the pending file
+        (argv is world-readable via ``ps``).
+
+        플래그는 전부 ``--옵션=값`` 형식 — 공백 형식은 탐욕적이라 뒤의
+        트리거 프롬프트를 삼킨다 (실측, docs/poc/R3-respawn.md). 트리거는
+        무내용이며 실제 handoff 는 pending 파일로 이동한다 (argv 는
+        ``ps`` 로 노출되므로).
+        """
+        pending = self._pending_respawn
+        if pending is None:
+            return list(self.claude_args) + self._agent_guide_flag()
+        args = self._strip_resume_args(self.claude_args)
+        args += self._agent_guide_flag()
+        if pending.resume_conv is not None:
+            args.append(f"--resume={pending.resume_conv}")
+        args.append(handoff_store.TRIGGER_PROMPT)
+        return args
+
     def _spawn_child(self) -> None:
-        # Detect a NEW-flow respawn before spawning so we know whether the
-        # incoming child receives a brand-new conversation that needs a
-        # fresh AGENT_GUIDE injection. (For SWITCH the conversation is
-        # reused via /resume, so the prior manual stays in scope.)
-        # spawn 전에 NEW 재spawn 여부를 미리 판별. NEW면 새 conversation이라
-        # 매뉴얼 재주입이 필요. SWITCH는 /resume으로 같은 conversation을
-        # 재사용하므로 기존 매뉴얼이 유지된다.
-        is_new_respawn = (
-            self._pending_action is not None
-            and self._pending_action.action_type == "new"
-            and self._pending_action.stage == "await_handshake"
-        )
+        pending = self._pending_respawn
+        child_args = self._build_child_args()
 
         # When ccode itself runs inside a Claude Code session, the spawned
         # claude inherits CLAUDE_CODE_CHILD_SESSION and — in interactive
@@ -398,7 +473,7 @@ class SessionManagerWrapper:
         }
         self.child = pexpect.spawn(
             "claude",
-            self.claude_args,
+            child_args,
             encoding=None,
             echo=False,
             env=child_env,
@@ -408,60 +483,47 @@ class SessionManagerWrapper:
             "SPAWN",
             "SYSTEM",
             {
-                "claude_args": list(self.claude_args),
+                "claude_args": debug_log.mask_text(" ".join(child_args)),
                 "pid": self.child.pid,
-                "is_new_respawn": is_new_respawn,
+                "respawn_target": pending.target if pending else None,
+                "respawn_resume_conv": pending.resume_conv if pending else None,
                 "initial_session_name": self._initial_session_name,
-                # input_queue carryover into a new child is a known
-                # suspect for "ghost" injection — log explicitly even
-                # though we don't reset it here.
-                # input_queue 가 새 자식으로 따라 들어가는 동작은 "유령"
-                # injection 의 의심 후보 — 여기서 reset 하지 않더라도
-                # 잔존 사실을 명시적으로 기록.
-                "input_queue_carryover_len": len(self.input_queue),
             },
         )
         self._reset_child_detection_state()
 
-        # Decide whether to inject AGENT_GUIDE on this child's first prompt:
-        # - NEW respawn → inject (fresh conversation, no manual yet).
-        # - --resume <name> → skip (existing conversation already carries the
-        #   manual from the previous start).
-        # - fresh start (no --resume) → inject.
-        # NOTE: --continue is not detected here, so it currently re-injects
-        # the manual every time. Documented limitation; can be tightened
-        # later by extending _parse_initial_session_name.
-        # AGENT_GUIDE inject 여부 결정. NEW 재spawn / fresh start면 inject,
-        # --resume이면 기존 conversation에 이미 박혀 있어 skip.
-        # --continue는 별도 감지 안 해 매번 재주입됨 (알려진 limitation).
-        if is_new_respawn:
-            self._agent_guide_stage = "needed"
-        elif self._initial_session_name is not None:
-            # --resume — existing conversation already has the manual.
-            self._agent_guide_stage = "done"
-        else:
-            self._agent_guide_stage = "needed"
-        self._seen_pointer_clear = False
-        self._submitted_at = 0.0
-        _debug_log(
-            f"spawn: is_new_respawn={is_new_respawn}, "
-            f"initial_session={self._initial_session_name!r}, "
-            f"agent_guide_stage={self._agent_guide_stage}"
-        )
+        # Transition bookkeeping happens at spawn — the moment the swap
+        # actually succeeded. A completed transition becomes the /back
+        # target; a /back reverse switch instead consumes its undo record
+        # here (crash-before-spawn keeps the record for retry).
+        # 전환 부기는 교체가 실제로 성공한 spawn 시점에 수행한다. 완료된
+        # 전환은 /back 대상이 되고, /back 역전환은 여기서 undo 기록을
+        # 소비한다 (spawn 전 크래시면 기록이 남아 재시도 가능).
+        if pending is not None:
+            if pending.is_back:
+                self._last_transition = None
+                wrapper_state.clear_last_transition(Path(self.project_path))
+            else:
+                self._record_last_transition(
+                    pending.from_name, pending.target, pending.user_prompt
+                )
+        self._pending_respawn = None
 
-    def _should_respawn_for_new(self) -> bool:
+    def _should_respawn(self) -> bool:
         """
-        Decide whether to spawn another child after the current one exits.
+        Decide whether to spawn another child after the current one exits:
+        only when a transition requested the swap. A child that exits on
+        its own (user /exit, crash) ends the wrapper as before.
 
-        현재 자식 종료 후 새 자식을 spawn할지 결정한다. NEW 흐름이 자식
-        종료 단계에 도달한 경우에만 True를 반환하고, 동시에 stage를
-        핸드셰이크 대기로 전진시킨다.
+        현재 자식 종료 후 새 자식을 spawn 할지 결정한다 — 전환이 교체를
+        요청한 경우에만. 자식이 스스로 종료한 경우 (사용자 /exit·크래시)
+        는 기존처럼 래퍼도 끝난다.
         """
         # CHILD_EXIT checkpoint — record the previous child's exit state
-        # so respawn decisions are auditable. exitstatus is the OS exit
-        # code; signalstatus is the signal number if killed.
+        # so respawn decisions are auditable.
         # CHILD_EXIT 체크포인트 — 직전 자식의 종료 상태를 기록해 respawn
         # 결정을 사후 추적 가능하게 한다.
+        pending = self._pending_respawn
         debug_log.log(
             "CHILD_EXIT",
             "SYSTEM",
@@ -472,21 +534,10 @@ class SessionManagerWrapper:
                 "signal_status": getattr(self.child, "signalstatus", None)
                 if self.child is not None
                 else None,
-                "pending_action_type": self._pending_action.action_type
-                if self._pending_action is not None
-                else None,
-                "pending_stage": self._pending_action.stage
-                if self._pending_action is not None
-                else None,
+                "pending_target": pending.target if pending else None,
             },
         )
-        pending = self._pending_action
-        if pending is None or pending.action_type != "new":
-            return False
-        if pending.stage != "await_child_exit":
-            return False
-        self._set_stage(pending, "await_handshake")
-        return True
+        return pending is not None
 
     # ------------------------------------------------------------------ I/O loop
     # I/O 루프 ------------------------------------------------------------------
@@ -536,7 +587,48 @@ class SessionManagerWrapper:
                 if fd in readable:
                     self.socket_server.handle_pending_readable(fd)
 
+            # Transition tick: when a swap is pending and the turn has
+            # ended, terminate the child (respawn happens in start()).
+            # 전환 틱 — 교체 대기 중이고 턴이 끝났으면 자식을 종료한다
+            # (respawn 은 start() 가 수행).
+            self._maybe_terminate_for_respawn()
+
         self._drain_pty()
+
+    def _maybe_terminate_for_respawn(self) -> None:
+        """Send SIGTERM once the pending transition's turn-end gate opens.
+
+        pending 전환의 턴 종료 가드가 열리면 SIGTERM 을 1회 보낸다.
+
+        The busy marker holds the swap while Claude is generating (e.g.
+        /back typed mid-response, or an MCP switch signalled mid-turn) so
+        the in-flight reply lands in the transcript first. SIGTERM
+        between turns is measured safe (transcript intact, resumable —
+        docs/poc/R3-respawn.md).
+
+        바쁨 마커가 생성 중 교체를 보류한다 (응답 중 /back, 턴 중 MCP
+        전환 신호) — 진행 중 응답이 transcript 에 먼저 남는다. 턴 사이
+        SIGTERM 은 실측으로 안전하다 (무결·재재개, docs/poc/R3-respawn.md).
+        """
+        pending = self._pending_respawn
+        if pending is None or pending.terminated:
+            return
+        if self.virtual_screen.contains_near_prompt(
+            BUSY_MARKER, BUSY_MARKER_RADIUS_ROWS
+        ):
+            return
+        pending.terminated = True
+        debug_log.log(
+            "TRANSITION",
+            "WRAPPER",
+            {"op": "terminate_child", "target": pending.target},
+            session=pending.target,
+        )
+        try:
+            if self.child is not None:
+                os.kill(self.child.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
 
     def _handle_pty_readable(self) -> bool:
         try:
@@ -548,10 +640,13 @@ class SessionManagerWrapper:
             # PTY master에서의 EOF — 자식 프로세스가 자기 쪽을 닫음.
             return False
 
-        # Mirror every chunk into the virtual screen, regardless of mode,
-        # so the input prompt line is always up to date for extraction.
-        # mode 와 무관하게 모든 chunk를 가상 화면에 반영 — 입력란 추출이
-        # 항상 최신 상태에서 가능하도록.
+        # Mirror every chunk into the virtual screen so prompt-line
+        # extraction and the busy marker are always current — the screen
+        # is the wrapper's only view of Claude Code's state (observation
+        # only; the wrapper never scans for renderer patterns).
+        # 모든 chunk 를 가상 화면에 반영 — 입력란 추출과 바쁨 마커가 항상
+        # 최신이 되게 한다. 화면은 래퍼가 Claude Code 상태를 보는 유일한
+        # 창이다 (관찰 전용 — 렌더러 패턴 스캔은 하지 않는다).
         self.virtual_screen.feed(chunk)
 
         # Auto-accept any confirmation prompts that just appeared in the
@@ -561,60 +656,34 @@ class SessionManagerWrapper:
         # 등록). 자식별로 패턴당 최대 1회 처리.
         self._auto_accept_confirmations()
 
-        # Track ❯ disappearance during the AGENT_GUIDE submitted stage so
-        # we can tell when the LLM's reply is actually complete (❯ then
-        # reappears). Without this, mode=passthrough flips before the LLM
-        # even starts thinking and the reply leaks to the user's screen.
-        # AGENT_GUIDE submitted 단계에서 ❯ 사라짐 추적 — LLM 응답 종료 시점
-        # (❯ 재등장) 감지에 사용.
-        if (
-            self._agent_guide_stage == "submitted"
-            and PROMPT_POINTER not in chunk
-        ):
-            self._seen_pointer_clear = True
-
-        self.output_buffer += chunk
-        detected = self._detect_prompt(self.output_buffer)
-        # TEMP diagnostic: trace every PTY chunk so we can see whether (a)
-        # chunks stop arriving during the gap, or (b) chunks arrive but
-        # _detect_prompt fails to match. Remove after root cause is found.
-        # 임시 진단 — 매 PTY chunk를 로그해 (a) gap 동안 chunk가 끊기는지,
-        # (b) chunk는 오는데 _detect_prompt가 못 잡는지 가린다.
-        _debug_log(
-            f"pty-chunk: len={len(chunk)} "
-            f"chunk_has_pointer={PROMPT_POINTER in chunk} "
-            f"chunk_has_inverse={INVERSE_VIDEO_START in chunk} "
-            f"buffer_len={len(self.output_buffer)} "
-            f"buffer_has_pointer={PROMPT_POINTER in self.output_buffer} "
-            f"buffer_has_inverse={INVERSE_VIDEO_START in self.output_buffer} "
-            f"detected={detected}"
+        # Turn-end event: the busy marker's falling edge. The one safe
+        # point to measure dialogue growth for the periodic summary
+        # refresh (previously hung off the dead prompt-detect signal).
+        # 턴 종료 이벤트 — 바쁨 마커의 하강 에지. 주기 요약 갱신의 대화
+        # 증가량을 재기에 안전한 유일한 지점 (이전에는 죽은 프롬프트 감지
+        # 신호에 걸려 있었다).
+        busy = self.virtual_screen.contains_near_prompt(
+            BUSY_MARKER, BUSY_MARKER_RADIUS_ROWS
         )
-        if detected:
-            # The handler decides whether to clear the buffer (it knows
-            # which stage we're in). After this call we just truncate to
-            # keep size bounded.
-            # handler가 stage를 알고 있으므로 buffer 비우기 결정도 handler에
-            # 위임. 호출 후엔 size cap만 보장.
-            self._handle_prompt_detected()
-        self._truncate_output_buffer()
+        if self._was_busy and not busy:
+            self._check_summary_refresh()
+        self._was_busy = busy
 
-        if self.mode == "passthrough":
-            os.write(self._stdout_fd, chunk)
+        os.write(self._stdout_fd, chunk)
         return True
 
     def _reset_child_detection_state(self) -> None:
         """
-        Reset per-child detection state on every spawn: the previous
-        session's tail bytes can't trigger a false prompt on the new
-        child, and the confirmation auto-accept re-arms (its matching
-        window re-opens until this child's first user keystroke — F13).
+        Reset per-child observation state on every spawn: the busy edge
+        tracker restarts, and the confirmation auto-accept re-arms (its
+        matching window re-opens until this child's first user keystroke
+        — F13).
 
-        spawn 마다 자식별 감지 상태를 초기화한다: 이전 세션의 잔여
-        바이트가 새 자식의 첫 프롬프트 감지를 오염시키지 않게 하고,
-        confirmation 자동 승인을 재무장한다 (매칭 윈도우는 이 자식의
-        첫 사용자 키 입력까지 다시 열린다 — F13).
+        spawn 마다 자식별 관찰 상태를 초기화한다: 바쁨 에지 추적을
+        재시작하고, confirmation 자동 승인을 재무장한다 (매칭 윈도우는
+        이 자식의 첫 사용자 키 입력까지 다시 열린다 — F13).
         """
-        self.output_buffer = b""
+        self._was_busy = False
         self._handled_confirmations = set()
         self._auto_confirm_armed = True
 
@@ -649,28 +718,9 @@ class SessionManagerWrapper:
             "USER_KEY",
             "USER",
             {
-                "mode": self.mode,
                 "chunk": debug_log.mask_stdin_chunk(chunk),
             },
         )
-
-        if self.mode == "filtering":
-            # Buffer keystrokes during SWITCH/NEW injection; drained back to
-            # the PTY when filtering ends. Used by SWITCH/NEW only.
-            # SWITCH/NEW 주입 중 들어온 키 입력은 큐에 보관, 필터링 종료 시
-            # PTY로 일괄 반영. SWITCH/NEW 전용 메커니즘.
-            self.input_queue += chunk
-            debug_log.log(
-                "INPUT_QUEUE",
-                "USER",
-                {
-                    "op": "append",
-                    "added_len": len(chunk),
-                    "total_len": len(self.input_queue),
-                    "reason": "filtering_mode",
-                },
-            )
-            return
 
         # Submit detection: Ink's parseKeypress only treats a lone \r as
         # Return (s === '\r'). Multi-byte chunks are typed text, not submit.
@@ -698,11 +748,6 @@ class SessionManagerWrapper:
                 # still there.
                 # /clear 는 대화를 지운다 — 아직 남아 있을 때 요약한다.
                 self._enqueue_active_summary()
-
-        self.stdin_line_buffer += chunk
-        while b"\n" in self.stdin_line_buffer:
-            line, self.stdin_line_buffer = self.stdin_line_buffer.split(b"\n", 1)
-            self._handle_user_line(line + b"\n")
 
         # Forward keystrokes to the PTY so Ink can render them in real time.
         # Ink가 실시간으로 렌더링할 수 있도록 키 입력을 PTY로 즉시 전달.
@@ -782,23 +827,24 @@ class SessionManagerWrapper:
         가장 최근의 래퍼 실행 전환을 되돌린다.
 
         The typed ``/back`` is erased with Ctrl+U (measured,
-        docs/poc/R3-back.md) since its \\r is never forwarded. Then the
-        recorded transition is executed in reverse through the ordinary
-        SWITCH machinery: resume the original session, re-inject the
-        prompt that was misrouted, and record the rejection as a
-        precedent (R3-C1) so the judge stops proposing it.
+        docs/poc/R3-back.md) since its \\r is never forwarded. The
+        rejection is recorded (precedent + calibration label), then the
+        transition runs in reverse through the ordinary respawn path —
+        the misrouted prompt travels in the pending-handoff file. The
+        undo record is consumed at respawn (completion), so a crash
+        beforehand keeps it for retry.
 
         타이핑된 ``/back`` 은 \\r 을 forward 하지 않으므로 Ctrl+U 로
-        지운다 (실측, docs/poc/R3-back.md). 이후 기록된 전환을 일반 SWITCH
-        머신으로 역방향 실행한다 — 원래 세션 resume, 잘못 이동했던
-        프롬프트 재주입, 그리고 이 거부를 판례 (R3-C1) 로 기록해 판정기가
-        같은 제안을 멈추게 한다.
+        지운다 (실측, docs/poc/R3-back.md). 거부를 기록 (판례 + 보정
+        라벨) 한 뒤 일반 respawn 경로로 역방향 전환한다 — 잘못 이동했던
+        프롬프트는 pending handoff 파일로 이동한다. undo 기록 소비는
+        respawn (완료) 시점이라 그 전 크래시면 재시도 가능하다.
         """
         try:
             os.write(self.pty_fd, ERASE_INPUT_LINE)
         except OSError:
             pass
-        if self._pending_action is not None:
+        if self._pending_respawn is not None:
             self._notify_user("세션 전환이 진행 중입니다 — /back 은 무시됩니다")
             return
         record = self._last_transition or wrapper_state.load_last_transition(
@@ -811,18 +857,23 @@ class SessionManagerWrapper:
                 session=self._current_session_name,
             )
             return
-        # One-shot undo: consume the record first so a repeated /back
-        # cannot ping-pong between the two sessions.
-        # 1회용 undo — 기록을 먼저 소비해 /back 연타가 두 세션 사이를
-        # 오가지 못하게 한다.
-        self._last_transition = None
-        wrapper_state.clear_last_transition(Path(self.project_path))
-
+        origin, wrong = record["from"], record["to"]
+        resume_conv = self._resolve_resume_conv(origin)
+        if resume_conv is None:
+            self._notify_user(
+                f"{origin} 세션의 대화 기록을 찾지 못해 되돌릴 수 없습니다"
+            )
+            debug_log.log(
+                "BACK",
+                "USER",
+                {"result": "unresolvable_origin", "origin": origin},
+                session=self._current_session_name,
+            )
+            return
         self._record_back_precedent(record)
         user_prompt = record.get("user_prompt")
         if not isinstance(user_prompt, str):
             user_prompt = ""
-        origin, wrong = record["from"], record["to"]
         # Calibration label (R3-C4): /back is a rejection — this is also
         # how auto switches feed calibration data after auto activates.
         # 보정 라벨 (R3-C4) — /back 은 거부다. auto 활성 후에도 auto
@@ -837,18 +888,16 @@ class SessionManagerWrapper:
             session=self._current_session_name,
         )
         self._notify_user(f"⇄ {origin} 세션으로 되돌립니다 (직전: {wrong})")
-        # Reverse switch. handoff["back"] marks it so completion does NOT
-        # record a new last_transition (no /back-of-/back ping-pong).
-        # 역방향 SWITCH. handoff["back"] 표시로 완료 시 새 last_transition
-        # 을 기록하지 않는다 (/back 의 /back 핑퐁 방지).
-        self._handle_switch(
-            origin,
-            {
+        self._execute_transition(
+            target=origin,
+            resume_conv=resume_conv,
+            handoff={
                 "from": wrong,
                 "back": True,
                 "message": f"/back — {wrong} 로의 직전 전환을 되돌려 복귀",
             },
-            user_prompt,
+            user_prompt=user_prompt,
+            is_back=True,
         )
         # Same pointer-invalidation path as manual /resume observation:
         # the MCP re-resolves the session from the active conversation.
@@ -1140,48 +1189,8 @@ class SessionManagerWrapper:
                 {"trigger": "boot_recovery", "error": str(exc)},
             )
 
-    # --------------------------------------------------- Detection & injection
-    # 프롬프트 감지 / 텍스트 주입 -----------------------------------------------
-
-    def _detect_prompt(self, buffer: bytes) -> bool:
-        idx = buffer.rfind(PROMPT_POINTER)
-        if idx == -1:
-            return False
-        # Look for an inverse-video sequence anywhere after the latest ❯.
-        # Ink's input field can wrap across multiple lines (especially after
-        # we inject a long @-attachment), putting the cursor's inverse far
-        # from the pointer. rfind() already pinned us to the latest ❯ so
-        # earlier stale pointers can't compete.
-        # 마지막 ❯ 이후 영역 전체에서 inverse 검색. 입력란이 multi-line wrap
-        # 되면 cursor inverse가 ❯에서 멀리 있을 수 있어 좁은 64-byte 윈도우는
-        # 누락. rfind()로 마지막 ❯ 위치를 잡으니 stale ❯과는 경합 없음.
-        return INVERSE_VIDEO_START in buffer[idx:]
-
-    def _inject_text(self, text: str) -> None:
-        # Single WRAPPER_INJECT checkpoint — every wrapper-driven write to
-        # the PTY passes through here. The caller frame name disambiguates
-        # the inject type (handoff / resume / rename / exit / agent_guide /
-        # submit) without changing every call site's signature.
-        # 단일 WRAPPER_INJECT 체크포인트 — wrapper 가 PTY 에 쓰는 모든 문장이
-        # 이 지점을 통과한다. 호출자 프레임 이름으로 inject type (handoff /
-        # resume / rename / exit / agent_guide / submit) 을 구분 — 호출 지점
-        # 시그니처를 바꾸지 않고도 분류 가능.
-        import sys as _sys
-
-        caller = _sys._getframe(1).f_code.co_name if hasattr(_sys, "_getframe") else "?"
-        debug_log.log(
-            "WRAPPER_INJECT",
-            "WRAPPER",
-            {
-                "caller": caller,
-                "stage": getattr(self._pending_action, "stage", None)
-                if self._pending_action is not None
-                else None,
-                "agent_guide_stage": self._agent_guide_stage,
-                "text": debug_log.mask_text(text),
-            },
-        )
-        os.write(self.pty_fd, text.encode("utf-8"))
+    # -------------------------------------------- Observation & auto-confirm
+    # 관찰·자동 승인 ------------------------------------------------------------
 
     def _auto_accept_confirmations(self) -> None:
         """Send \\r whenever a known confirmation prompt appears on screen.
@@ -1214,157 +1223,6 @@ class SessionManagerWrapper:
                 except OSError:
                     return
                 self._handled_confirmations.add(pattern)
-                self._last_auto_accept_at = time.monotonic()
-
-    def _submit(self) -> None:
-        """Send a standalone \\r so Ink recognises it as Return.
-
-        Ink의 parseKeypress가 Return으로 인식하도록 \\r을 단독 전송한다.
-        """
-        self._inject_text("\r")
-
-    # ------------------------------------------------------------ Extension hooks
-    # 확장 지점 -------------------------------------------------------------------
-
-    def _handle_prompt_detected(self) -> None:
-        """Process a detected prompt and decide whether to clear the buffer.
-
-        Buffer-clearing rules (in-handler so the stage machine drives them):
-        - stage=needed held (cooldown / unhandled confirmation): keep buffer
-          so the next chunk can re-trigger this stage.
-        - stage=needed advanced to injected: keep buffer so the next chunk
-          re-fires detect=True for the injected→submit step (Ink may not
-          redraw ❯ after we append text — partial redraw only).
-        - stage=injected after submit: clear buffer; we now wait for a brand
-          new ❯ that arrives after the LLM finishes its reply.
-        - stage=submitted/done: clear buffer.
-        - pending SWITCH/NEW step: clear buffer; those stage machines also
-          want a brand new ❯ for their next step.
-
-        Buffer 비우기 규칙은 stage 머신이 결정. needed→injected advance 후엔
-        buffer를 유지해야 partial redraw 환경(❯이 chunk에 새로 안 들어옴)에서
-        다음 stage가 발동된다.
-        """
-        if self._agent_guide_stage == "needed":
-            cooldown_remaining = (
-                self._last_auto_accept_at + 0.5 - time.monotonic()
-            )
-            if self._last_auto_accept_at > 0.0 and cooldown_remaining > 0:
-                _debug_log(
-                    f"prompt-detect: auto-accept cooldown "
-                    f"({cooldown_remaining:.3f}s left), holding inject"
-                )
-                return  # keep buffer
-
-            for pattern in AUTO_CONFIRM_PATTERNS:
-                if pattern in self._handled_confirmations:
-                    continue
-                if self.virtual_screen.contains(pattern):
-                    screen_dump = "|".join(self.virtual_screen._safe_display())
-                    _debug_log(
-                        f"prompt-detect: unhandled confirmation '{pattern}' "
-                        f"on screen, holding AGENT_GUIDE inject. "
-                        f"screen[:300]={screen_dump[:300]!r}"
-                    )
-                    return  # keep buffer
-
-            _debug_log(
-                f"prompt-detect: stage=needed -> injecting AGENT_GUIDE "
-                f"(handled_confirmations={sorted(self._handled_confirmations)})"
-            )
-            self.mode = "filtering"
-            # Short, directive bootstrap text. The single-line reply
-            # signals to the user that the wrapper + MCP layer have
-            # finished initialising and the manual is in scope.
-            # 짧고 지시적인 부트스트랩. 한 줄 응답이 사용자에게 wrapper + MCP
-            # layer 초기화 완료 + 매뉴얼 적용 시작을 알리는 신호.
-            self._inject_text(
-                f"@{AGENT_GUIDE_PATH} System bootstrap. "
-                f"Reply with exactly: \"MCP session-manager ready\""
-            )
-            self._agent_guide_stage = "injected"
-            # Keep buffer: Ink's partial redraw won't re-emit ❯, so we need
-            # the existing pointer in the buffer for the next chunk to
-            # re-trigger detect=True for the injected→submit step.
-            return
-
-        if self._agent_guide_stage == "injected":
-            _debug_log("prompt-detect: stage=injected -> submitting \\r")
-            self._submit()
-            self._agent_guide_stage = "submitted"
-            self._submitted_at = time.monotonic()
-            self._seen_pointer_clear = False
-            self.output_buffer = b""  # wait for LLM-reply-after-submit
-            return
-
-        if self._agent_guide_stage == "submitted":
-            # Hold filtering until the LLM has actually finished replying.
-            # Two stacked guards:
-            #   (1) Minimum wait — even if `_seen_pointer_clear` flips True
-            #       on the very next chunk, that chunk may just be a
-            #       partial redraw that happens not to contain ❯ rather
-            #       than a real "thinking-started" signal. A short wait
-            #       lets the LLM's brief reply complete first.
-            #   (2) Pointer-clear transition — once minimum wait has
-            #       elapsed, only drop filtering after we've actually seen
-            #       ❯ disappear (LLM thinking) AND now reappear (this
-            #       detect=True call = new input field).
-            # 30s hard timeout backstops both guards.
-            #
-            # filtering을 LLM 응답 종료까지 유지. 두 단계 가드:
-            #   (1) Minimum wait — submit 직후 들어온 chunk가 partial
-            #       redraw일 수 있어 너무 빨리 _seen_pointer_clear가 True가
-            #       되는 false-positive 방지.
-            #   (2) Pointer-clear transition — minimum wait가 지난 뒤에는
-            #       ❯이 실제로 사라졌다 다시 등장한 시점에만 done.
-            # 30초 hard timeout이 두 가드 모두를 백스톱.
-            elapsed = time.monotonic() - self._submitted_at
-            if elapsed < 2.0:
-                _debug_log(
-                    f"prompt-detect: stage=submitted, minimum wait "
-                    f"({elapsed:.1f}s/2.0s), holding filtering"
-                )
-                return  # buffer keep
-            if not self._seen_pointer_clear and elapsed < 30.0:
-                _debug_log(
-                    f"prompt-detect: stage=submitted, ❯ not yet cleared "
-                    f"({elapsed:.1f}s elapsed), holding filtering"
-                )
-                return  # buffer keep
-            _debug_log(
-                f"prompt-detect: stage=submitted -> done "
-                f"(seen_clear={self._seen_pointer_clear}, "
-                f"elapsed={elapsed:.1f}s)"
-            )
-            self._agent_guide_stage = "done"
-            if self._pending_action is None:
-                self.mode = "passthrough"
-                self._drain_input_queue()
-            self.output_buffer = b""
-            # fall through to pending-action processing
-
-        pending = self._pending_action
-        if pending is not None:
-            if pending.action_type == "switch":
-                self._advance_switch(pending)
-            elif pending.action_type == "new":
-                self._advance_new(pending)
-            self.output_buffer = b""  # SWITCH/NEW stages await the next ❯
-            return
-
-        # stage=done, no pending action — clear so we don't keep matching
-        # the same ❯ on every chunk.
-        # done 상태에서 pending 없으면 같은 ❯에 매번 매칭되지 않게 비움.
-        self.output_buffer = b""
-
-        # A fresh prompt with nothing else in flight means the previous turn
-        # finished — the one safe point to measure dialogue growth.
-        # 진행 중인 동작 없이 새 프롬프트가 떴다는 것은 직전 턴이 끝났다는
-        # 뜻이다 — 대화 증가량을 재기에 안전한 유일한 지점.
-        self._check_summary_refresh()
-
-    def _handle_user_line(self, line: bytes) -> None:
-        return
 
     def _maybe_start_judge(self) -> None:
         """
@@ -1420,20 +1278,52 @@ class SessionManagerWrapper:
             handoff = message.get("handoff") or {}
             if not isinstance(target, str) or not isinstance(handoff, dict):
                 return
-            user_prompt_val = handoff.get("user_prompt", "")
+            # The MCP puts user_prompt at the top level of the signal;
+            # older senders embedded it in the handoff — accept both.
+            # (The handoff-only read silently dropped MCP prompts — found
+            # by the respawn-flow integration test.)
+            # MCP 는 user_prompt 를 신호 최상위에 싣는다. 구 형식은 handoff
+            # 안에 넣었다 — 둘 다 수용. (handoff 만 읽던 코드는 MCP 경유
+            # 프롬프트를 조용히 유실했다 — respawn 통합 테스트가 발견.)
+            user_prompt_val = message.get(
+                "user_prompt", handoff.get("user_prompt", "")
+            )
             user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
-            self._handle_switch(target, handoff, user_prompt)
+            # Resume the target's recorded conversation; a target with no
+            # resolvable conversation gets a fresh one (still that
+            # session — the MCP has already moved its pointer there).
+            # 대상 세션의 기록된 conversation 을 재개한다. 해석 불가면 새
+            # conversation 으로 (여전히 그 세션 — MCP 포인터는 이미 이동).
+            self._execute_transition(
+                target=target,
+                resume_conv=self._resolve_resume_conv(target),
+                handoff=handoff,
+                user_prompt=user_prompt,
+            )
         elif action == "new":
-            rename_current = message.get("rename_current")
             new_session_name = message.get("new_session_name")
             handoff = message.get("handoff") or {}
             if not isinstance(new_session_name, str) or not isinstance(handoff, dict):
                 return
-            if rename_current is not None and not isinstance(rename_current, str):
-                return
-            user_prompt_val = handoff.get("user_prompt", "")
+            # Same top-level-first read as the switch branch.
+            # switch 분기와 동일한 최상위 우선 읽기.
+            user_prompt_val = message.get(
+                "user_prompt", handoff.get("user_prompt", "")
+            )
             user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
-            self._handle_new(rename_current, new_session_name, handoff, user_prompt)
+            # NOTE: the old flow /rename'd the departing conversation so
+            # title-based resume could find it. Resume is id-based
+            # everywhere now (conversation ids live in the metadata), so
+            # rename_current is accepted but unused.
+            # 참고 — 구 흐름은 title 기반 resume 을 위해 떠나는 conversation
+            # 을 /rename 했다. 이제 resume 은 전부 id 기반 (id 는 메타데이터
+            # 에 기록) 이므로 rename_current 는 받되 사용하지 않는다.
+            self._execute_transition(
+                target=new_session_name,
+                resume_conv=None,
+                handoff=handoff,
+                user_prompt=user_prompt,
+            )
         elif action == "route_switch":
             # Auto-routing path (R2): the hook blocked the prompt and
             # delegated the switch here. The hook doesn't know session
@@ -1454,7 +1344,12 @@ class SessionManagerWrapper:
                 reason = verdict.get("reason")
                 if isinstance(reason, str) and reason:
                     handoff["router_reason"] = reason
-            self._handle_switch(target, handoff, user_prompt)
+            self._execute_transition(
+                target=target,
+                resume_conv=self._resolve_resume_conv(target),
+                handoff=handoff,
+                user_prompt=user_prompt,
+            )
             # Status line for the unattended switch (Plan R3-C4 wording)
             # — the user must learn about it and how to undo it.
             # 무인 전환의 상태 줄 (Plan R3-C4 원문) — 사용자는 전환 사실과
@@ -1486,90 +1381,80 @@ class SessionManagerWrapper:
     # ----------------------------------------------------------- Action handlers
     # 세션 액션 처리 ------------------------------------------------------------
 
-    def _set_stage(self, pending: _PendingAction, new_stage: str) -> None:
-        """Centralised stage transition with logging.
-
-        Every SWITCH/NEW stage move goes through here so the log shows the
-        full state machine path for one action.
-
-        중앙화된 stage 전환 + 로깅. 모든 SWITCH/NEW stage 이동이 이 지점을
-        통과해 한 액션의 전체 상태 머신 경로가 로그에 남는다.
-        """
-        debug_log.log(
-            "STAGE",
-            "WRAPPER",
-            {
-                "action_type": pending.action_type,
-                "target": pending.target,
-                "new_session_name": pending.new_session_name,
-                "before": pending.stage,
-                "after": new_stage,
-            },
-        )
-        pending.stage = new_stage
-
-    def _handle_switch(
+    def _execute_transition(
         self,
+        *,
         target: str,
+        resume_conv: str | None,
         handoff: dict[str, Any],
         user_prompt: str,
+        is_back: bool = False,
     ) -> None:
-        """
-        Register a SWITCH action; advanced on subsequent prompt detections.
+        """Register a transition: pending file + child swap request.
 
-        SWITCH 액션을 등록한다. 실제 진행은 이후 프롬프트 감지 이벤트마다
-        단계적으로 일어난다.
+        전환을 등록한다 — pending 파일 기록 + 자식 교체 요청.
+
+        No TUI interaction happens here or later: the handoff content
+        goes to the pending file (the hook injects it after respawn),
+        and the swap itself is process control (_maybe_terminate_for_
+        respawn → _should_respawn → _spawn_child).
+
+        여기서도 이후에도 TUI 상호작용은 없다 — handoff 내용은 pending
+        파일로 (respawn 후 hook 이 주입), 교체는 프로세스 제어로 실행된다
+        (_maybe_terminate_for_respawn → _should_respawn → _spawn_child).
         """
+        if self._pending_respawn is not None:
+            # One transition at a time; a second signal before the swap
+            # completes is dropped with a log (the MCP retries naturally
+            # on the next user action).
+            # 전환은 한 번에 하나 — 교체 완료 전의 두 번째 신호는 로그만
+            # 남기고 버린다 (다음 사용자 행동에서 자연 재시도).
+            debug_log.log(
+                "TRANSITION",
+                "WRAPPER",
+                {"op": "register", "result": "busy_dropped", "target": target},
+                session=target,
+            )
+            return
+        from_name = handoff.get("from")
         # Queue a background summary for the departing session while its
         # conversation is still the active one, and move the wrapper-side
         # current-session mirror to the target.
-        # 떠나는 세션의 conversation 이 아직 활성인 시점에 백그라운드 요약을
-        # 큐에 넣고, 래퍼 측 현재 세션 미러를 target 으로 이동.
-        self._enqueue_departed_summary(handoff.get("from"))
+        # 떠나는 세션의 conversation 이 아직 활성인 시점에 백그라운드
+        # 요약을 큐에 넣고, 래퍼 측 현재 세션 미러를 target 으로 이동.
+        self._enqueue_departed_summary(from_name)
         self._current_session_name = target
-
-        # Strip user_prompt from the JSON body so it isn't shown twice
-        # (once inside [handoff], once as the prompt text below).
-        # JSON 본문에서 user_prompt를 제거 — [handoff] 블록과 그 아래 본문에
-        # 같은 텍스트가 두 번 노출되지 않도록 한다.
         handoff_clean = {k: v for k, v in handoff.items() if k != "user_prompt"}
-        self._pending_action = _PendingAction(
-            action_type="switch",
+        handoff_store.write_pending(
+            Path(self.project_path), target, handoff_clean, user_prompt
+        )
+        self._pending_respawn = _PendingRespawn(
             target=target,
-            handoff=handoff_clean,
+            resume_conv=resume_conv,
+            from_name=from_name if isinstance(from_name, str) else None,
             user_prompt=user_prompt,
-            stage="await_resume_prompt",
+            is_back=is_back,
         )
         debug_log.log(
-            "STAGE",
+            "TRANSITION",
             "WRAPPER",
             {
-                "action_type": "switch",
+                "op": "register",
                 "target": target,
-                "before": None,
-                "after": "await_resume_prompt",
+                "resume_conv": resume_conv,
+                "is_back": is_back,
                 "user_prompt": debug_log.mask_text(user_prompt),
             },
+            session=target,
         )
 
-    def _resolve_resume_arg(self, target: str) -> str:
-        """
-        Resolve what to pass to ``/resume``: the target session's latest
-        conversation id when one is recorded, else the session name.
+    def _resolve_resume_conv(self, target: str) -> str | None:
+        """Resolve *target*'s latest conversation id with a live transcript.
 
-        Measured semantics (docs/poc/R2-hook.md §7): a conversation uuid
-        resumes directly; a name only matches when a ``/rename`` made
-        the conversation title equal it, otherwise the picker opens and
-        the injection stalls on user input. The id makes every path
-        deterministic.
-
-        ``/resume`` 에 넘길 인자를 결정한다: 대상 세션에 기록된 최신
-        conversation id 가 있으면 그것, 없으면 세션 이름.
-
-        실측 의미론 (docs/poc/R2-hook.md §7): conversation uuid 는 직행
-        재개되고, 이름은 ``/rename`` 으로 대화 title 이 일치할 때만
-        매칭된다 — 아니면 picker 가 열려 주입이 사용자 입력에 멈춘다.
-        id 를 쓰면 전 경로가 결정적이다.
+        *target* 세션의 최신 conversation id 를 해석한다 — transcript 가
+        실제로 존재할 때만. (Claude Code 자체 정리로 지워진 stale id 로
+        ``--resume`` 하면 자식이 부팅 실패로 즉사하므로 사전 확인한다.)
+        None 이면 호출자가 새 conversation 부팅 또는 중단을 택한다.
         """
         try:
             session = SessionStore(Path(self.project_path)).load_session_by_name(
@@ -1577,156 +1462,34 @@ class SessionManagerWrapper:
             )
         except Exception:
             session = None
-        if session is not None and session.claude_conversation_ids:
-            return session.claude_conversation_ids[-1]
-        return target
-
-    def _advance_switch(self, pending: _PendingAction) -> None:
-        if pending.stage == "await_resume_prompt":
-            # First prompt after the LLM finished its turn — start filtering
-            # so the user doesn't see the raw `/resume` injection, then
-            # inject it.  Submit is deferred to await_resume_submit.
-            # LLM 응답이 끝난 직후의 첫 프롬프트 — 필터링을 켜서 raw `/resume`
-            # 주입이 사용자에게 보이지 않게 한 뒤 주입. 제출은
-            # await_resume_submit으로 지연.
-            self.mode = "filtering"
-            self._inject_text(f"/resume {self._resolve_resume_arg(pending.target)}")
-            self._set_stage(pending, "await_resume_submit")
-        elif pending.stage == "await_resume_submit":
-            self._submit()
-            self._set_stage(pending, "await_handoff_prompt")
-        elif pending.stage == "await_handoff_prompt":
-            # The resumed session is ready for input. Inject the handoff
-            # block plus the user's prompt.  Submit deferred to next detection.
-            # 복귀 세션이 입력 대기 중. handoff 블록과 사용자 프롬프트를
-            # 주입한다. 제출은 다음 감지로 지연.
-            text = format_handoff_injection(pending.handoff, pending.user_prompt)
-            self._inject_text(text)
-            self._set_stage(pending, "await_handoff_submit")
-        elif pending.stage == "await_handoff_submit":
-            self._submit()
-            self.mode = "passthrough"
-            self._drain_input_queue()
-            # Completed transition becomes the /back target — unless this
-            # switch IS a /back (marked in the handoff), which must not
-            # re-arm the undo toward the rejected session.
-            # 완료된 전환이 /back 대상이 된다 — 단 이 전환 자체가 /back
-            # (handoff 에 표시) 이면 거부한 세션 쪽으로 undo 를 재장전하지
-            # 않는다.
-            if not pending.handoff.get("back"):
-                self._record_last_transition(
-                    pending.handoff.get("from"), pending.target, pending.user_prompt
-                )
-            self._set_stage(pending, "done")
-            self._pending_action = None
-
-    def _drain_input_queue(self) -> None:
-        if not self.input_queue:
-            return
-        # Replace newlines with spaces so a buffered Enter doesn't auto-submit
-        # text the user typed during filtering; let them press Enter explicitly.
-        # 필터링 중 사용자가 친 입력의 개행을 공백으로 치환 — 쌓인 Enter가
-        # 자동으로 submit되지 않도록 하고, 사용자가 다시 눌러 보내게 한다.
-        cleaned = self.input_queue.replace(b"\n", b" ")
-        debug_log.log(
-            "INPUT_QUEUE",
-            "USER",
-            {
-                "op": "drain",
-                "queue_len": len(self.input_queue),
-                "cleaned_len": len(cleaned),
-                "raw_chunk": debug_log.mask_stdin_chunk(self.input_queue),
-            },
+        if session is None or not session.claude_conversation_ids:
+            return None
+        conv = session.claude_conversation_ids[-1]
+        transcript = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / encode_cwd(Path(self.project_path))
+            / f"{conv}.jsonl"
         )
-        os.write(self.pty_fd, cleaned)
-        self.input_queue = b""
-
-    def _handle_new(
-        self,
-        rename_current: str | None,
-        new_session_name: str,
-        handoff: dict[str, Any],
-        user_prompt: str,
-    ) -> None:
-        """
-        Register a NEW action; advanced on subsequent prompt detections.
-
-        NEW 액션을 등록한다. 실제 진행은 이후 프롬프트 감지 이벤트마다
-        단계적으로 일어난다.
-        """
-        # Same departing-session summary + mirror handling as SWITCH.
-        # SWITCH 와 동일한 떠나는 세션 요약 큐 적재 + 미러 갱신.
-        self._enqueue_departed_summary(handoff.get("from"))
-        self._current_session_name = new_session_name
-
-        # Same JSON-vs-text de-duplication as SWITCH: keep user_prompt out
-        # of the JSON body since it appears as plain text below.
-        # SWITCH와 동일하게 JSON 본문에서는 user_prompt 제거 — 아래쪽
-        # 평문 본문과 중복으로 노출되지 않도록.
-        handoff_clean = {k: v for k, v in handoff.items() if k != "user_prompt"}
-        self._pending_action = _PendingAction(
-            action_type="new",
-            target="",
-            handoff=handoff_clean,
-            user_prompt=user_prompt,
-            stage="await_rename_or_exit_prompt",
-            rename_current=rename_current,
-            new_session_name=new_session_name,
-        )
-        debug_log.log(
-            "STAGE",
-            "WRAPPER",
-            {
-                "action_type": "new",
-                "rename_current": rename_current,
-                "new_session_name": new_session_name,
-                "before": None,
-                "after": "await_rename_or_exit_prompt",
-                "user_prompt": debug_log.mask_text(user_prompt),
-            },
-        )
+        return conv if transcript.is_file() else None
 
     def _handle_handshake_request(self) -> None:
         """
-        Reply to MCP's handshake. NEW respawns return new_session_name;
-        all other startups return whatever was decided from CLI args.
+        Reply to MCP's handshake with the wrapper's current-session
+        mirror (moved at transition registration), falling back to the
+        CLI-args decision on a fresh start.
 
-        MCP의 핸드셰이크 요청에 응답한다. NEW로 인한 재시작 흐름이라면
-        새 세션 이름을 돌려주고, 그 외 일반 시작에서는 CLI 인자에서
-        결정된 값(또는 None)을 돌려준다.
+        MCP 핸드셰이크에 래퍼의 현재 세션 미러 (전환 등록 시 이동) 로
+        응답한다. 신규 시작이면 CLI 인자에서 결정된 값으로 폴백.
         """
-        pending = self._pending_action
-        if (
-            pending is not None
-            and pending.action_type == "new"
-            and pending.stage == "await_handshake"
-        ):
-            debug_log.log(
-                "HANDSHAKE",
-                "WRAPPER",
-                {
-                    "phase": "wrapper_response",
-                    "branch": "new_respawn",
-                    "current_session_name": pending.new_session_name,
-                },
-            )
-            self.socket_server.send(
-                {"current_session_name": pending.new_session_name}
-            )
-            self._set_stage(pending, "await_new_session_prompt")
-            return
+        name = self._current_session_name or self._initial_session_name
         debug_log.log(
             "HANDSHAKE",
             "WRAPPER",
-            {
-                "phase": "wrapper_response",
-                "branch": "initial",
-                "current_session_name": self._initial_session_name,
-            },
+            {"phase": "wrapper_response", "current_session_name": name},
         )
-        self.socket_server.send(
-            {"current_session_name": self._initial_session_name}
-        )
+        self.socket_server.send({"current_session_name": name})
 
     @staticmethod
     def _parse_initial_session_name(args: list[str]) -> str | None:
@@ -1737,71 +1500,8 @@ class SessionManagerWrapper:
                 return arg[len("--resume=") :]
         return None
 
-    def _advance_new(self, pending: _PendingAction) -> None:
-        if pending.stage == "await_rename_or_exit_prompt":
-            # First prompt after the LLM finished its turn. Start filtering
-            # so neither /rename nor /exit is visible to the user.
-            # LLM 응답이 끝난 직후의 첫 프롬프트. 필터링을 켜서 /rename·/exit이
-            # 사용자에게 보이지 않게 한다.
-            self.mode = "filtering"
-            if pending.rename_current is not None:
-                self._inject_text(f"/rename {pending.rename_current}")
-                self._set_stage(pending, "await_rename_submit")
-            else:
-                self._inject_text("/exit")
-                self._set_stage(pending, "await_exit_submit")
-        elif pending.stage == "await_rename_submit":
-            self._submit()
-            self._set_stage(pending, "await_exit_prompt")
-        elif pending.stage == "await_exit_prompt":
-            # /rename has been processed; now exit the current session.
-            # /rename 처리 완료, 이제 현재 세션 종료.
-            self._inject_text("/exit")
-            self._set_stage(pending, "await_exit_submit")
-        elif pending.stage == "await_exit_submit":
-            self._submit()
-            self._set_stage(pending, "await_child_exit")
-        elif pending.stage == "await_new_session_prompt":
-            # New child has spawned, MCP handshake completed, and the first
-            # prompt of the fresh session is up. Inject the handoff plus the
-            # user's prompt. Submit deferred to next detection.
-            # 새 자식이 spawn되고 MCP 핸드셰이크가 끝난 뒤 새 세션의 첫
-            # 프롬프트가 떴다. handoff와 사용자 프롬프트를 주입. 제출은 다음
-            # 감지로 지연.
-            text = format_handoff_injection(pending.handoff, pending.user_prompt)
-            self._inject_text(text)
-            self._set_stage(pending, "await_new_handoff_submit")
-        elif pending.stage == "await_new_handoff_submit":
-            self._submit()
-            self.mode = "passthrough"
-            self._drain_input_queue()
-            # NEW is also a /back-able transition: the previous
-            # conversation still exists, so /resume can return to it.
-            # NEW 도 /back 가능한 전환이다 — 이전 conversation 은 그대로
-            # 남아 있어 /resume 으로 복귀할 수 있다.
-            self._record_last_transition(
-                pending.handoff.get("from"),
-                pending.new_session_name,
-                pending.user_prompt,
-            )
-            self._set_stage(pending, "done")
-            self._pending_action = None
-        # `await_child_exit`와 `await_handshake` 단계에서는 프롬프트 감지로
-        # 진행하지 않는다 — 자식 종료(outer loop)와 소켓 핸드셰이크(별도
-        # 메시지 경로)가 각각 stage를 전진시킨다.
-
-    # ------------------------------------------------------ Buffer management
-    # 버퍼 관리 -----------------------------------------------------------------
-
-    def _truncate_output_buffer(self) -> None:
-        if len(self.output_buffer) <= OUTPUT_BUFFER_CAP:
-            return
-        # Drop the front but keep the tail so a partial multi-byte prompt
-        # sequence at the boundary survives across truncation.
-        #
-        # 앞부분은 버리고 끝부분만 유지. 경계에 걸친 멀티바이트 프롬프트
-        # 시퀀스가 다음 매칭에서도 살아남도록 함.
-        self.output_buffer = self.output_buffer[-OUTPUT_BUFFER_TAIL_KEEP:]
+    # ---------------------------------------------------------- PTY drainage
+    # PTY 배수 -------------------------------------------------------------------
 
     def _drain_pty(self) -> None:
         try:
@@ -1810,8 +1510,7 @@ class SessionManagerWrapper:
                 if not chunk:
                     return
                 self.virtual_screen.feed(chunk)
-                if self.mode == "passthrough":
-                    os.write(self._stdout_fd, chunk)
+                os.write(self._stdout_fd, chunk)
         except OSError:
             return
 
