@@ -230,10 +230,11 @@ class TestJudgmentFlow:
             second_theirs.close()
 
 
-class TestPrecedentsInPrompt:
-    """Current session's precedents enter the judge prompt, recent first.
+class TestPrecedentGate:
+    """Deterministic precedent suppression (R3-FIX2).
 
-    현재 세션의 판례가 최근 우선으로 판정 프롬프트에 들어간다.
+    결정적 판례 억제 (R3-FIX2) — 거부된 대상으로의 SWITCH 는 모델 판단이
+    아니라 코드가 강등한다. 판례는 판정 프롬프트에 들어가지 않는다.
     """
 
     @pytest.fixture
@@ -246,86 +247,100 @@ class TestPrecedentsInPrompt:
             name="frontend", title="차트", summary="차트 리팩토링"
         )
         frontend.claude_conversation_ids = ["conv-1"]
-        # Two precedents with an out-of-insertion-order timestamp pair —
-        # the prompt must sort by `at`, not by list position.
-        # 삽입 순서와 시각 순서가 어긋난 판례 두 건 — 프롬프트는 리스트
-        # 위치가 아니라 `at` 으로 정렬해야 한다.
         frontend.precedents = [
-            PrecedentRecord(
-                prompt_gist="오래된 거부",
+            PrecedentRecord.new(
+                prompt_gist="로그인 오류 조사",
                 kept_in="frontend",
                 rejected="backend",
-                at="2026-08-01T00:00:00+00:00",
-            ),
-            PrecedentRecord(
-                prompt_gist="최근 거부",
-                kept_in="frontend",
-                rejected="infra",
-                at="2026-08-03T00:00:00+00:00",
-            ),
+            )
         ]
         store.save_session(frontend)
         store.save_session(
             SessionMetadata.new(name="backend", title="API", summary="JWT 교체 완료")
+        )
+        store.save_session(
+            SessionMetadata.new(name="infra", title="배포", summary="CI 구성")
         )
         monkeypatch.setattr(JudgeHost, "_spawn_and_warm", lambda self: True)
         h = JudgeHost(tmp_path)
         yield h
         h.stop()
 
-    def test_precedents_included_most_recent_first(
-        self, host: JudgeHost, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def _judge(self, host: JudgeHost, monkeypatch, verdict_json: str) -> dict:
         prompts: list[str] = []
 
         def fake_round_trip(self, text: str, timeout: float) -> str:
             prompts.append(text)
-            return VERDICT_JSON
+            return verdict_json
 
         monkeypatch.setattr(JudgeHost, "_round_trip", fake_round_trip)
         host.ensure_started()
         assert _wait_until(lambda: host._ready)
-
         ours, theirs = socket.socketpair()
         try:
             host.handle_request(
-                {"prompt": "배포 설정을 바꾸자", "session_id": "conv-1"}, ours
+                {"prompt": "로그인 오류 관련해서 봐줘", "session_id": "conv-1"},
+                ours,
             )
-            assert _recv_reply(theirs)["ok"] is True
+            reply = _recv_reply(theirs)
         finally:
             theirs.close()
+        reply["_prompts"] = prompts
+        return reply
 
-        judge_prompt = prompts[-1]
-        assert "오래된 거부" in judge_prompt
-        assert "최근 거부" in judge_prompt
-        assert judge_prompt.index("최근 거부") < judge_prompt.index("오래된 거부")
-
-    def test_unknown_conversation_gets_empty_precedents(
+    def test_switch_to_rejected_target_suppressed(
         self, host: JudgeHost, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        prompts: list[str] = []
+        reply = self._judge(host, monkeypatch, VERDICT_JSON)  # SWITCH backend
+        assert reply["ok"] is True
+        assert reply["verdict"]["action"] == "STAY"
+        assert reply["verdict"]["reason"] == "suppressed_by_precedent: backend"
 
-        def fake_round_trip(self, text: str, timeout: float) -> str:
-            prompts.append(text)
-            return VERDICT_JSON
+    def test_switch_to_other_target_unaffected(
+        self, host: JudgeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        other = (
+            '{"action":"SWITCH","target":"infra","confidence":0.9,'
+            '"evidence":"CI 구성","reason":"배포 소관"}'
+        )
+        reply = self._judge(host, monkeypatch, other)
+        assert reply["verdict"]["action"] == "SWITCH"
+        assert reply["verdict"]["target"] == "infra"
 
-        monkeypatch.setattr(JudgeHost, "_round_trip", fake_round_trip)
+    def test_precedents_never_enter_the_prompt(
+        self, host: JudgeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The model must not even see the precedent (measured 3/3: it
+        # inverted the meaning when asked to weigh it).
+        # 모델은 판례를 보지도 않아야 한다 (실측 3/3 의미 반전).
+        reply = self._judge(host, monkeypatch, VERDICT_JSON)
+        assert "로그인 오류 조사" not in reply["_prompts"][-1]
+        assert "판례" not in reply["_prompts"][-1]
+
+    def test_unknown_conversation_skips_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Without a resolvable current session there is no kept_in side —
+        # the verdict passes through untouched.
+        # 현재 세션을 해석할 수 없으면 kept_in 쪽이 없다 — 판정 그대로 통과.
+        _seed_sessions(tmp_path)
+        monkeypatch.setattr(JudgeHost, "_spawn_and_warm", lambda self: True)
+        host = JudgeHost(tmp_path)
+        monkeypatch.setattr(
+            JudgeHost, "_round_trip", lambda self, text, timeout: VERDICT_JSON
+        )
         host.ensure_started()
         assert _wait_until(lambda: host._ready)
-
         ours, theirs = socket.socketpair()
         try:
             host.handle_request(
                 {"prompt": "질문", "session_id": "conv-없음"}, ours
             )
-            assert _recv_reply(theirs)["ok"] is True
+            reply = _recv_reply(theirs)
         finally:
             theirs.close()
-
-        assert "오래된 거부" not in prompts[-1]
-        # The precedents block (right after the rule text) renders empty.
-        # 판례 블록 (규칙 문구 바로 뒤) 이 빈 상태로 렌더링된다.
-        assert "사용하라] (없음)" in prompts[-1]
+        host.stop()
+        assert reply["verdict"]["action"] == "SWITCH"
 
 
 class TestRefuteRound:

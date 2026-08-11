@@ -34,7 +34,6 @@ class TestBuildJudgePrompt:
         assert "user: 차트 고쳐줘" in prompt
         assert "- frontend (현재 세션): 차트 작업 — React 차트 리팩토링 진행 중" in prompt
         assert "- backend: API — JWT 교체 완료" in prompt
-        assert "(없음)" in prompt  # 판례 블록 (R3 전까지 빈 값)
 
     def test_empty_excerpt_and_sessions(self) -> None:
         prompt = judge.build_judge_prompt(

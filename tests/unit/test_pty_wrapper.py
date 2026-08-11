@@ -1557,3 +1557,106 @@ class TestMcpSignalRouting:
     ) -> None:
         wrapper._handle_mcp_signal({"action": "new", "handoff": {}})
         assert wrapper._pending_respawn is None
+
+
+class TestManualMovePrecedentDrop:
+    """R3-FIX2: manually resuming a session overturns precedents against it.
+
+    R3-FIX2 — 세션으로의 수동 이동은 그 세션에 대한 판례를 뒤집는다.
+    결정적 억제 게이트의 유일한 소멸 경로 (수락·롤오버 외) 이므로, 이게
+    없으면 억제된 대상이 영원히 막힌다.
+    """
+
+    def _seed(self, wrapper: SessionManagerWrapper) -> SessionStore:
+        from session_manager.models import PrecedentRecord
+
+        store = SessionStore(Path(wrapper.project_path))
+        frontend = SessionMetadata.new(name="frontend", title="차트")
+        frontend.precedents = [
+            PrecedentRecord.new(
+                prompt_gist="로그인 오류", kept_in="frontend", rejected="backend"
+            ),
+            PrecedentRecord.new(
+                prompt_gist="배포", kept_in="frontend", rejected="infra"
+            ),
+        ]
+        store.save_session(frontend)
+        backend = SessionMetadata.new(name="backend", title="API")
+        backend.claude_conversation_ids = ["conv-backend"]
+        store.save_session(backend)
+        wrapper._current_session_name = "frontend"
+        return store
+
+    def test_resume_by_session_name_drops_matching(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        store = self._seed(wrapper)
+        wrapper._drop_precedents_on_manual_move("backend")
+        frontend = store.load_session_by_name("frontend")
+        assert [p.rejected for p in frontend.precedents] == ["infra"]
+
+    def test_resume_by_conversation_id_drops_matching(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        store = self._seed(wrapper)
+        wrapper._drop_precedents_on_manual_move("conv-backend")
+        frontend = store.load_session_by_name("frontend")
+        assert [p.rejected for p in frontend.precedents] == ["infra"]
+
+    def test_unknown_argument_is_noop(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        store = self._seed(wrapper)
+        wrapper._drop_precedents_on_manual_move("서치어-없는-대상")
+        frontend = store.load_session_by_name("frontend")
+        assert len(frontend.precedents) == 2
+
+    def test_without_current_session_is_noop(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        store = self._seed(wrapper)
+        wrapper._current_session_name = None
+        wrapper._drop_precedents_on_manual_move("backend")
+        frontend = store.load_session_by_name("frontend")
+        assert len(frontend.precedents) == 2
+
+    def test_observed_resume_command_triggers_drop(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # End-to-end within the wrapper: the observation path calls the
+        # drop with the /resume argument.
+        # 래퍼 내부 관통 — 관찰 경로가 /resume 인자로 소멸을 호출한다.
+        from session_manager.wrapper.command_matcher import InterceptedCommand
+
+        store = self._seed(wrapper)
+        monkeypatch.setattr(
+            wrapper.socket_server, "send", lambda msg: True
+        )
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.get_active_conversation_id",
+            lambda _cwd: None,
+        )
+        wrapper._observe_session_command(
+            InterceptedCommand(command="resume", args="backend")
+        )
+        frontend = store.load_session_by_name("frontend")
+        assert [p.rejected for p in frontend.precedents] == ["infra"]
+
+    def test_bare_resume_does_not_drop(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Picker destination is unknown — nothing may be invalidated.
+        # picker 는 목적지 불명 — 아무것도 무효화하면 안 된다.
+        from session_manager.wrapper.command_matcher import InterceptedCommand
+
+        store = self._seed(wrapper)
+        monkeypatch.setattr(wrapper.socket_server, "send", lambda msg: True)
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.get_active_conversation_id",
+            lambda _cwd: None,
+        )
+        wrapper._observe_session_command(
+            InterceptedCommand(command="resume", args="")
+        )
+        frontend = store.load_session_by_name("frontend")
+        assert len(frontend.precedents) == 2
