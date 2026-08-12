@@ -259,3 +259,123 @@ class TestSkips:
             registration.ensure_hook_registered(project, ask_user=_fail_ask)
             == "error"
         )
+
+
+class TestStatuslineRegistration:
+    """R4-C1: statusline collector registration.
+
+    R4-C1: statusline 수집기 등록.
+    """
+
+    def test_registers_with_consent(
+        self, project: Path, which_found: None
+    ) -> None:
+        status = registration.ensure_statusline_registered(
+            project, ask_user=lambda _p: "y"
+        )
+        assert status == "registered"
+        settings = _read_settings(project)
+        assert settings["statusLine"] == {
+            "type": "command",
+            "command": "/opt/bin/ccode-statusline",
+        }
+
+    def test_preserves_existing_settings_keys(
+        self, project: Path, which_found: None
+    ) -> None:
+        path = _settings_path(project)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"env": {"FOO": "1"}}), encoding="utf-8")
+        registration.ensure_statusline_registered(
+            project, ask_user=lambda _p: "y"
+        )
+        settings = _read_settings(project)
+        assert settings["env"] == {"FOO": "1"}
+        assert "statusLine" in settings
+
+    def test_own_registration_is_idempotent(
+        self, project: Path, which_found: None
+    ) -> None:
+        registration.ensure_statusline_registered(
+            project, ask_user=lambda _p: "y"
+        )
+        status = registration.ensure_statusline_registered(
+            project, ask_user=_fail_ask
+        )
+        assert status == "already_registered"
+
+    def test_foreign_statusline_is_never_touched(
+        self, project: Path, which_found: None
+    ) -> None:
+        # The user's own statusline always wins — detection falls back
+        # to the model mapping instead.
+        # 사용자 자신의 statusline 이 항상 우선 — 감지는 모델 매핑
+        # 폴백으로 동작한다.
+        path = _settings_path(project)
+        path.parent.mkdir(parents=True)
+        original = {"statusLine": {"type": "command", "command": "/my/own.sh"}}
+        path.write_text(json.dumps(original), encoding="utf-8")
+        status = registration.ensure_statusline_registered(
+            project, ask_user=_fail_ask
+        )
+        assert status == "foreign_statusline"
+        assert _read_settings(project) == original
+
+    def test_decline_is_recorded_and_remembered(
+        self, project: Path, which_found: None
+    ) -> None:
+        status = registration.ensure_statusline_registered(
+            project, ask_user=lambda _p: "n"
+        )
+        assert status == "declined"
+        config = json.loads(
+            (project / ".session-manager" / "config.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert config["statusline_registration_declined"] is True
+        status = registration.ensure_statusline_registered(
+            project, ask_user=_fail_ask
+        )
+        assert status == "declined_previously"
+
+    def test_statusline_decline_does_not_block_hooks(
+        self, project: Path, which_found: None
+    ) -> None:
+        # The two consents are independent keys in config.json.
+        # 두 동의는 config.json 의 독립 키다.
+        registration.ensure_statusline_registered(
+            project, ask_user=lambda _p: "n"
+        )
+        status = registration.ensure_hook_registered(
+            project, ask_user=lambda _p: "y"
+        )
+        assert status == "registered"
+
+    def test_broken_settings_skips(self, project: Path) -> None:
+        path = _settings_path(project)
+        path.parent.mkdir(parents=True)
+        path.write_text("{broken", encoding="utf-8")
+        status = registration.ensure_statusline_registered(
+            project, ask_user=_fail_ask
+        )
+        assert status == "broken_settings"
+        assert path.read_text(encoding="utf-8") == "{broken"
+
+    def test_script_not_found_skips(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(registration.shutil, "which", lambda _n: None)
+        status = registration.ensure_statusline_registered(
+            project, ask_user=_fail_ask
+        )
+        assert status == "script_not_found"
+        assert not _settings_path(project).exists()
+
+    def test_non_interactive_skips(
+        self, project: Path, which_found: None
+    ) -> None:
+        status = registration.ensure_statusline_registered(
+            project, ask_user=None
+        )
+        assert status == "non_interactive"
