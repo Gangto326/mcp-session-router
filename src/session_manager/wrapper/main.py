@@ -22,7 +22,10 @@ import sys
 from pathlib import Path
 
 from session_manager import debug_log
-from session_manager.hooks.registration import ensure_hook_registered
+from session_manager.hooks.registration import (
+    ensure_hook_registered,
+    ensure_statusline_registered,
+)
 from session_manager.wrapper.pty_wrapper import SessionManagerWrapper
 
 SOCKET_ENV_VAR = "SESSION_MANAGER_SOCKET"
@@ -108,11 +111,15 @@ def main() -> int:
     )
 
     # Routing-hook registration check runs before the PTY takes over the
-    # terminal, while a plain input() prompt is still possible.
+    # terminal, while a plain input() prompt is still possible. The
+    # statusline collector (R4-C1 context detection) follows the same
+    # window and the same --no-hooks opt-out.
     # 라우팅 hook 등록 검사는 PTY 가 터미널을 점유하기 전 — 평범한
-    # input() 프롬프트가 아직 가능한 시점 — 에 수행한다.
+    # input() 프롬프트가 아직 가능한 시점 — 에 수행한다. statusline
+    # 수집기 (R4-C1 컨텍스트 감지) 도 같은 시점·같은 --no-hooks 옵트아웃.
     if not no_hooks:
         ensure_hook_registered(Path(project_path))
+        ensure_statusline_registered(Path(project_path))
 
     wrapper = SessionManagerWrapper(
         socket_path=socket_path,

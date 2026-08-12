@@ -68,6 +68,23 @@ _CONSENT_PROMPT = (
     ".claude/settings.json 에 등록할까요? [y/N] "
 )
 
+# Statusline collector (R4-C1): the script Claude Code feeds context
+# facts to. Registered under the same consent/decline machinery as
+# hooks, but with one extra rule — an existing statusLine entry that is
+# not ours is NEVER touched (the user's statusline wins; rollover
+# detection then falls back to the model mapping).
+# statusline 수집기 (R4-C1): Claude Code 가 컨텍스트 사실을 떠먹여 주는
+# 스크립트. hook 과 같은 동의·거절 장치로 등록하되 추가 규칙 하나 —
+# 우리 것이 아닌 기존 statusLine 항목은 절대 건드리지 않는다 (사용자의
+# statusline 이 우선, 롤오버 감지는 모델 매핑 폴백으로 동작).
+STATUSLINE_SCRIPT_NAME = "ccode-statusline"
+_STATUSLINE_DECLINED_KEY = "statusline_registration_declined"
+
+_STATUSLINE_CONSENT_PROMPT = (
+    "session-manager: 컨텍스트 사용률 감지(롤오버)를 위해 statusline 을 "
+    ".claude/settings.json 에 등록할까요? [y/N] "
+)
+
 
 def _log(result: str, **extra: Any) -> None:
     debug_log.log("HOOK_REGISTRATION", "WRAPPER", {"result": result, **extra})
@@ -124,15 +141,15 @@ def _config_path(project_path: Path) -> Path:
     return project_path / _SESSION_MANAGER_DIRNAME / _CONFIG_FILENAME
 
 
-def _was_declined(project_path: Path) -> bool:
+def _was_declined(project_path: Path, key: str = _DECLINED_KEY) -> bool:
     try:
         data = json.loads(_config_path(project_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(data, dict) and data.get(_DECLINED_KEY) is True
+    return isinstance(data, dict) and data.get(key) is True
 
 
-def _record_declined(project_path: Path) -> None:
+def _record_declined(project_path: Path, key: str = _DECLINED_KEY) -> None:
     """
     Raw read-modify-write that preserves every key the user may have
     hand-written (routing_mode etc.) — the Config model is deliberately
@@ -153,7 +170,7 @@ def _record_declined(project_path: Path) -> None:
         # Unparsable config: don't compound the damage by rewriting it.
         # 파싱 불가 config 는 재작성으로 손상을 키우지 않는다.
         return
-    data[_DECLINED_KEY] = True
+    data[key] = True
     try:
         _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
     except OSError:
@@ -256,4 +273,98 @@ def ensure_hook_registered(
         # Registration is a convenience — a bug here must never stop ccode.
         # 등록은 편의 기능 — 여기서의 버그가 ccode 를 멈춰선 안 된다.
         _log("error", error=str(exc))
+        return "error"
+
+
+def _statusline_log(result: str, **extra: Any) -> None:
+    debug_log.log(
+        "STATUSLINE_REGISTRATION", "WRAPPER", {"result": result, **extra}
+    )
+
+
+def ensure_statusline_registered(
+    project_path: Path,
+    ask_user: Callable[[str], str] | None = None,
+) -> str:
+    """
+    Check and (with consent) register the statusline collector. Returns
+    a status string for logging/tests; never raises.
+
+    An existing statusLine that is not ours is never modified — the
+    user's own statusline always wins, and context detection falls back
+    to the model mapping (R4-C1).
+
+    statusline 수집기 등록을 검사하고 (동의 시) 등록한다. 로깅·테스트용
+    상태 문자열을 반환하며 예외를 던지지 않는다.
+
+    우리 것이 아닌 기존 statusLine 은 절대 수정하지 않는다 — 사용자의
+    statusline 이 항상 우선하고, 컨텍스트 감지는 모델 매핑 폴백으로
+    동작한다 (R4-C1).
+    """
+    try:
+        settings_path = project_path / _SETTINGS_RELPATH
+        settings = _load_settings(settings_path)
+        if settings is None:
+            print(
+                "session-manager: .claude/settings.json 을 파싱할 수 없어 "
+                "statusline 등록을 건너뜁니다 (파일은 수정하지 않았습니다).",
+                file=sys.stderr,
+            )
+            _statusline_log("broken_settings")
+            return "broken_settings"
+
+        existing = settings.get("statusLine")
+        if isinstance(existing, dict):
+            command = existing.get("command")
+            if isinstance(command, str) and STATUSLINE_SCRIPT_NAME in command:
+                _statusline_log("already_registered")
+                return "already_registered"
+            # The user's own statusline — never touch it.
+            # 사용자 자신의 statusline — 절대 건드리지 않는다.
+            _statusline_log("foreign_statusline")
+            return "foreign_statusline"
+
+        if _was_declined(project_path, _STATUSLINE_DECLINED_KEY):
+            _statusline_log("declined_previously")
+            return "declined_previously"
+
+        command = shutil.which(STATUSLINE_SCRIPT_NAME)
+        if command is None:
+            print(
+                f"session-manager: '{STATUSLINE_SCRIPT_NAME}' 스크립트를 "
+                "PATH 에서 찾지 못해 statusline 등록을 건너뜁니다.",
+                file=sys.stderr,
+            )
+            _statusline_log("script_not_found")
+            return "script_not_found"
+
+        if ask_user is None:
+            if not sys.stdin.isatty():
+                _statusline_log("non_interactive")
+                return "non_interactive"
+            ask_user = input
+
+        answer = ask_user(_STATUSLINE_CONSENT_PROMPT).strip().lower()
+        if answer not in ("y", "yes"):
+            _record_declined(project_path, _STATUSLINE_DECLINED_KEY)
+            print(
+                "session-manager: 등록하지 않았습니다. 나중에 등록하려면 "
+                ".session-manager/config.json 의 "
+                f"{_STATUSLINE_DECLINED_KEY} 를 지우고 ccode 를 재시작하세요."
+            )
+            _statusline_log("declined")
+            return "declined"
+
+        settings["statusLine"] = {"type": "command", "command": command}
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(
+            settings_path, json.dumps(settings, ensure_ascii=False, indent=2)
+        )
+        print("session-manager: statusline 을 등록했습니다.")
+        _statusline_log("registered")
+        return "registered"
+    except Exception as exc:
+        # Registration is a convenience — a bug here must never stop ccode.
+        # 등록은 편의 기능 — 여기서의 버그가 ccode 를 멈춰선 안 된다.
+        _statusline_log("error", error=str(exc))
         return "error"
