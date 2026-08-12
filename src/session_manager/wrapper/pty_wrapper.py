@@ -55,7 +55,7 @@ from session_manager.routing import decision_log
 from session_manager.storage.file_store import _SESSION_MANAGER_DIRNAME, SessionStore
 from session_manager.summarizer import SummarizerWorker, SummaryTask
 from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS, scan_dialogue_growth
-from session_manager.wrapper import wrapper_state
+from session_manager.wrapper import context_monitor, wrapper_state
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
     match_back_command,
@@ -314,6 +314,12 @@ class SessionManagerWrapper:
         self._dialogue_scan_conv_id: str | None = None
         self._dialogue_scan_offset: int = 0
         self._dialogue_scan_chars: int = 0
+
+        # Conversation currently marked rollover-pending (R4-C1). None =
+        # no mark; acting on the mark is R4-C3/C4.
+        # 현재 롤오버 pending 으로 마킹된 conversation (R4-C1). None =
+        # 마킹 없음. 마킹에 대한 행동은 R4-C3/C4.
+        self._rollover_pending_conv_id: str | None = None
 
         # Most recent wrapper-executed transition, the target of /back
         # (R3-C3). Memory-first with state.json persistence so the undo
@@ -714,6 +720,7 @@ class SessionManagerWrapper:
         )
         if self._was_busy and not busy:
             self._check_summary_refresh()
+            self._check_context_usage()
         self._was_busy = busy
 
         os.write(self._stdout_fd, chunk)
@@ -1224,6 +1231,54 @@ class SessionManagerWrapper:
         # the queue, so re-checking every turn costs nothing.
         # 대기 중 중복 적재는 큐가 버리므로 매 턴 재확인해도 비용이 없다.
         self._enqueue_active_summary()
+
+    def _check_context_usage(self) -> None:
+        """Mark the rollover pending once the active conversation is full.
+
+        활성 대화가 발동점에 닿으면 롤오버 pending 을 마킹한다 (R4-C1).
+
+        Detection only — acting on the mark (Handoff request, respawn) is
+        R4-C3/C4. The mark is per-conversation: a conversation change
+        (switch, /clear, rollover itself) clears it, and the pending →
+        marked transition is logged exactly once.
+
+        감지만 한다 — 마킹에 대한 행동 (Handoff 요청·respawn) 은
+        R4-C3/C4. 마킹은 conversation 단위다: conversation 이 바뀌면
+        (전환·/clear·롤오버 자신) 해제되고, 미마킹 → 마킹 전이는 정확히
+        1회만 기록한다.
+        """
+        project = Path(self.project_path)
+        conv_id = get_active_conversation_id(project)
+        if conv_id is None:
+            return
+        if conv_id != self._rollover_pending_conv_id:
+            self._rollover_pending_conv_id = None
+        jsonl_path = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / encode_cwd(project)
+            / f"{conv_id}.jsonl"
+        )
+        usage = context_monitor.check_context_usage(project, conv_id, jsonl_path)
+        if usage is None or not usage.exceeded:
+            return
+        if self._rollover_pending_conv_id == conv_id:
+            return
+        self._rollover_pending_conv_id = conv_id
+        debug_log.log(
+            "ROLLOVER_PENDING",
+            "WRAPPER",
+            {
+                "used_tokens": usage.used_tokens,
+                "window_tokens": usage.window_tokens,
+                "trigger_tokens": usage.trigger_tokens,
+                "numerator_source": usage.numerator_source,
+                "denominator_source": usage.denominator_source,
+            },
+            conv_id=conv_id,
+            session=self._current_session_name,
+        )
 
     def _enqueue_stale_summaries(self) -> None:
         """Boot-time recovery: queue sessions whose summary refresh was lost.

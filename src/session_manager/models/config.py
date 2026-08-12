@@ -40,6 +40,40 @@ DEFAULT_ROUTING_MODE = "confirm"
 # 사용자가 config.json 에서 조정한다.
 DEFAULT_AUTO_ERROR_TOLERANCE = 0.05
 
+# Rollover trigger (R4-C1). Both are empirical parameters (rule 8):
+#
+# - DEFAULT_ROLLOVER_THRESHOLD_PCT: the Claude Code team's proactive
+#   compact guidance is 50-60% of the window (Thariq Shihipar), and
+#   effective context is 50-65% of nominal (NVIDIA RULER). 60 is the
+#   upper bound of that guidance; auto-compact's hard limit (~83%)
+#   stays comfortably above the trigger.
+# - DEFAULT_ROLLOVER_ABSOLUTE_CAP_TOKENS: quality degradation onset is
+#   an absolute token count, not a percentage (Chroma "Context Rot" —
+#   task-dependent onset at 32K~100K+); the 50-60% team guidance was
+#   given against a 200K window = 100~120K absolute. The cap prevents
+#   a 1M window from computing 60% = 600K, far past the degradation
+#   zone. Actual trigger = min(window × pct, cap).
+# - DEFAULT_CONTEXT_BUDGET_TOKENS: user override for the denominator
+#   (window size). None = auto-detect (statusline collector first,
+#   model mapping fallback — R4-C1).
+#
+# 롤오버 트리거 (R4-C1). 둘 다 경험 파라미터 (규칙 8):
+#
+# - DEFAULT_ROLLOVER_THRESHOLD_PCT: Claude Code 팀의 proactive compact
+#   권고가 창의 50~60% (Thariq Shihipar), RULER 실효 컨텍스트가 공칭의
+#   50~65% (NVIDIA RULER). 60 은 그 권고의 상한이며 auto-compact 하드
+#   한계 (~83%) 보다 충분히 이르다.
+# - DEFAULT_ROLLOVER_ABSOLUTE_CAP_TOKENS: 품질 저하 시작점은 %가 아니라
+#   절대 토큰량 (Chroma "Context Rot" — 과제별 32K~100K대 시작); 팀 권고
+#   50~60% 도 200K 창 기준 = 절대 100~120K. 1M 창에서 60% = 600K 처럼
+#   저하 구간을 지나치는 것을 상한이 막는다. 실제 트리거 =
+#   min(창 × pct, 상한).
+# - DEFAULT_CONTEXT_BUDGET_TOKENS: 분모 (창 크기) 사용자 override.
+#   None = 자동 감지 (statusline 수집기 우선, 모델 매핑 폴백 — R4-C1).
+DEFAULT_ROLLOVER_THRESHOLD_PCT = 60
+DEFAULT_ROLLOVER_ABSOLUTE_CAP_TOKENS = 120_000
+DEFAULT_CONTEXT_BUDGET_TOKENS: int | None = None
+
 
 @dataclass
 class Config:
@@ -47,6 +81,9 @@ class Config:
     cleanup_period_days: int = DEFAULT_CLEANUP_PERIOD_DAYS
     routing_mode: str = DEFAULT_ROUTING_MODE
     auto_error_tolerance: float = DEFAULT_AUTO_ERROR_TOLERANCE
+    rollover_threshold_pct: int = DEFAULT_ROLLOVER_THRESHOLD_PCT
+    rollover_absolute_cap_tokens: int = DEFAULT_ROLLOVER_ABSOLUTE_CAP_TOKENS
+    context_budget_tokens: int | None = DEFAULT_CONTEXT_BUDGET_TOKENS
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +91,9 @@ class Config:
             "cleanup_period_days": self.cleanup_period_days,
             "routing_mode": self.routing_mode,
             "auto_error_tolerance": self.auto_error_tolerance,
+            "rollover_threshold_pct": self.rollover_threshold_pct,
+            "rollover_absolute_cap_tokens": self.rollover_absolute_cap_tokens,
+            "context_budget_tokens": self.context_budget_tokens,
         }
 
     @classmethod
@@ -66,5 +106,15 @@ class Config:
             routing_mode=data.get("routing_mode", DEFAULT_ROUTING_MODE),
             auto_error_tolerance=data.get(
                 "auto_error_tolerance", DEFAULT_AUTO_ERROR_TOLERANCE
+            ),
+            rollover_threshold_pct=data.get(
+                "rollover_threshold_pct", DEFAULT_ROLLOVER_THRESHOLD_PCT
+            ),
+            rollover_absolute_cap_tokens=data.get(
+                "rollover_absolute_cap_tokens",
+                DEFAULT_ROLLOVER_ABSOLUTE_CAP_TOKENS,
+            ),
+            context_budget_tokens=data.get(
+                "context_budget_tokens", DEFAULT_CONTEXT_BUDGET_TOKENS
             ),
         )
