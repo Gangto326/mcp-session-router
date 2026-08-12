@@ -1233,6 +1233,81 @@ class TestBuildChildArgs:
         assert "--model" in args
 
 
+class TestCheckContextUsage:
+    """R4-C1: rollover-pending marking at turn end.
+
+    R4-C1: 턴 종료 시 롤오버 pending 마킹.
+    """
+
+    def _arm(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        conv_id: str | None,
+        exceeded: bool,
+    ) -> list[object]:
+        from session_manager.wrapper import context_monitor as cm
+        from session_manager.wrapper import pty_wrapper as pw
+
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: conv_id
+        )
+        calls: list[object] = []
+        usage = cm.ContextUsage(
+            used_tokens=130_000,
+            window_tokens=200_000,
+            trigger_tokens=120_000,
+            exceeded=exceeded,
+            numerator_source="transcript",
+            denominator_source="mapping",
+        )
+        monkeypatch.setattr(
+            pw.context_monitor,
+            "check_context_usage",
+            lambda *a: calls.append(a) or usage,
+        )
+        return calls
+
+    def test_marks_pending_once(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._arm(wrapper, monkeypatch, "conv-1", exceeded=True)
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+        # A second exceeded check on the same conversation stays marked
+        # (no re-log path — the mark is idempotent).
+        # 같은 conversation 의 재검사는 마킹 유지 (마킹은 멱등).
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+
+    def test_below_trigger_does_not_mark(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._arm(wrapper, monkeypatch, "conv-1", exceeded=False)
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id is None
+
+    def test_conversation_change_clears_mark(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._arm(wrapper, monkeypatch, "conv-1", exceeded=True)
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+        # The next conversation is not full — its check clears the mark.
+        # 다음 conversation 은 안 찼다 — 그 검사가 마킹을 해제한다.
+        self._arm(wrapper, monkeypatch, "conv-2", exceeded=False)
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id is None
+
+    def test_no_active_conversation_is_noop(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._arm(wrapper, monkeypatch, None, exceeded=True)
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id is None
+        assert calls == []
+
+
 class TestMcpConfigFlag:
     """--mcp-config= injection (F4 fix — docs/poc/R3-mcp-config.md).
 
