@@ -1308,6 +1308,41 @@ class TestCheckContextUsage:
         assert calls == []
 
 
+class TestRolloverSignal:
+    """R4-C2: PreCompact hook's rollover signal dispatch.
+
+    R4-C2: PreCompact hook 롤오버 신호 dispatch.
+    """
+
+    def test_marks_pending_from_signal(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._handle_mcp_signal(
+            {"action": "rollover_signal", "conversation_id": "conv-9"}
+        )
+        assert wrapper._rollover_pending_conv_id == "conv-9"
+
+    def test_missing_conversation_falls_back_to_active(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from session_manager.wrapper import pty_wrapper as pw
+
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: "conv-active"
+        )
+        wrapper._handle_mcp_signal({"action": "rollover_signal"})
+        assert wrapper._rollover_pending_conv_id == "conv-active"
+
+    def test_no_resolvable_conversation_is_noop(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from session_manager.wrapper import pty_wrapper as pw
+
+        monkeypatch.setattr(pw, "get_active_conversation_id", lambda _p: None)
+        wrapper._handle_mcp_signal({"action": "rollover_signal"})
+        assert wrapper._rollover_pending_conv_id is None
+
+
 class TestMcpConfigFlag:
     """--mcp-config= injection (F4 fix — docs/poc/R3-mcp-config.md).
 

@@ -66,6 +66,18 @@ class TestRegister:
                 "hooks": [{"type": "command", "command": FAKE_GUARD_COMMAND}],
             }
         ]
+        # R4-C2: the auto-compact blocker joins the managed set.
+        # R4-C2: auto-compact 차단 hook 도 관리 세트에 포함된다.
+        assert settings["hooks"]["PreCompact"] == [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/opt/bin/ccode-hook-pre-compact",
+                    }
+                ]
+            }
+        ]
 
     def test_partial_registration_adds_only_missing(
         self, project: Path, which_found: None
@@ -163,6 +175,18 @@ class TestRegister:
                                     ),
                                 }
                             ],
+                        }
+                    ],
+                    "PreCompact": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        f"/x/{registration.PRE_COMPACT_SCRIPT_NAME}"
+                                    ),
+                                }
+                            ]
                         }
                     ],
                 }
