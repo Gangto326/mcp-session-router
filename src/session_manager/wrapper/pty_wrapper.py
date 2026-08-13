@@ -39,7 +39,13 @@ from typing import Any
 
 import pexpect
 
-from session_manager import debug_log, handoff_store, summarizer
+from session_manager import (
+    debug_log,
+    handoff_store,
+    rollover,
+    statusline,
+    summarizer,
+)
 from session_manager.claude_conversation import (
     encode_cwd,
     get_active_conversation_id,
@@ -54,7 +60,11 @@ from session_manager.models.session import PrecedentRecord
 from session_manager.routing import decision_log
 from session_manager.storage.file_store import _SESSION_MANAGER_DIRNAME, SessionStore
 from session_manager.summarizer import SummarizerWorker, SummaryTask
-from session_manager.transcript_excerpt import EXCERPT_MAX_CHARS, scan_dialogue_growth
+from session_manager.transcript_excerpt import (
+    EXCERPT_MAX_CHARS,
+    extract_full_text,
+    scan_dialogue_growth,
+)
 from session_manager.wrapper import context_monitor, wrapper_state
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
@@ -138,6 +148,25 @@ ERASE_INPUT_LINE = b"\x15"
 BUSY_MARKER = "esc to interrupt"
 BUSY_MARKER_RADIUS_ROWS = 4
 
+# Second busy marker: the spinner's ellipsis ("Sprouting… ❯"). Measured
+# (R4-C3 e2e screen logs, 2026-08-13): short turns (~2s) render the
+# spinner verb + "…" but NOT "esc to interrupt" — the footer hint
+# rotates and may never reach it, so the marker alone misses short
+# turns entirely (no falling edge → no turn-end checks). The ellipsis
+# is present during any generation. False-positive direction is safe:
+# conversation text near the prompt containing "…" only DELAYS a swap
+# or a turn-end check until the next redraw — it can never kill a turn
+# mid-generation (that would require a false NEGATIVE).
+# 두 번째 바쁨 마커 — 스피너의 말줄임표 ("Sprouting… ❯"). 실측 (R4-C3
+# e2e 스크린 로그, 2026-08-13): 짧은 턴 (~2초) 은 스피너 동사+"…" 는
+# 그리지만 "esc to interrupt" 는 안 그린다 — 푸터 힌트가 로테이션이라
+# 도달하지 못할 수 있고, 그 마커만으로는 짧은 턴을 통째로 놓친다 (하강
+# 에지 없음 → 턴 종료 검사 전부 침묵). 말줄임표는 생성 중 항상 표시된다.
+# 오탐 방향은 안전하다: 프롬프트 주변 본문의 "…" 는 교체·검사를 다음
+# redraw 까지 **지연**시킬 뿐, 생성 중인 턴을 죽이려면 거짓 음성이
+# 필요하다.
+BUSY_SPINNER_ELLIPSIS = "…"
+
 
 def _safe_fileno(stream: Any) -> int:
     try:
@@ -196,6 +225,11 @@ class _PendingRespawn:
     # 전환과 함께 이동하는 사용자 프롬프트 (pending 파일에도 있음) —
     # /back 이 재전달할 수 있도록 last_transition 부기용으로 보관.
     user_prompt: str = ""
+    # Rollover handoff-request respawn (R4-C3): same session, same
+    # conversation — no /back bookkeeping, no departed summary.
+    # 롤오버 handoff 요청 respawn (R4-C3): 같은 세션·같은 conversation —
+    # /back 부기도 departed 요약도 없다.
+    is_rollover_request: bool = False
     # /back reverse switch — consumes the undo record on completion.
     # /back 역전환 — 완료 시 undo 기록을 소비한다.
     is_back: bool = False
@@ -320,6 +354,37 @@ class SessionManagerWrapper:
         # 현재 롤오버 pending 으로 마킹된 conversation (R4-C1). None =
         # 마킹 없음. 마킹에 대한 행동은 R4-C3/C4.
         self._rollover_pending_conv_id: str | None = None
+
+        # Rollover handoff request in flight (R4-C3). Keys: session, n,
+        # conv_id, attempts, phase ("requested" until the dedicated turn
+        # spawns, then "writing"). None = no request running.
+        # 진행 중인 롤오버 handoff 요청 (R4-C3). 키: session, n, conv_id,
+        # attempts, phase (전용 턴 spawn 전 "requested", 이후 "writing").
+        # None = 요청 없음.
+        self._rollover_request_state: dict[str, Any] | None = None
+
+        # Validated handoff waiting for the actual swap (R4-C4). Keys:
+        # session, n, conv_id, path.
+        # 실제 교체 (R4-C4) 를 기다리는 검증된 handoff. 키: session, n,
+        # conv_id, path.
+        self._rollover_ready: dict[str, Any] | None = None
+
+        # Context percentage at marking time (status-line wording).
+        # 마킹 시점의 컨텍스트 퍼센트 (상태 줄 문구용).
+        self._rollover_pending_pct: int | None = None
+
+        # context.json observation state (second turn-end signal): file
+        # signature (mtime_ns, size) gates the cheap stat-per-tick path;
+        # the (conversation_id, used_tokens) key fires _on_turn_end only
+        # when the USAGE actually changed — the collector rewrites the
+        # file several times per turn with unchanged usage.
+        # context.json 관찰 상태 (제2 턴 종료 신호). 파일 서명 (mtime_ns,
+        # size) 이 틱당 stat 경로를 gate 하고, (conversation_id,
+        # used_tokens) 키가 **usage 가 실제로 바뀐** 때만 _on_turn_end 를
+        # 발동한다 — 수집기는 한 턴에 여러 번, usage 무변경으로도 파일을
+        # 다시 쓴다.
+        self._context_file_sig: tuple[int, int] | None = None
+        self._context_usage_key: tuple[Any, Any] | None = None
 
         # Most recent wrapper-executed transition, the target of /back
         # (R3-C3). Memory-first with state.json persistence so the undo
@@ -553,7 +618,16 @@ class SessionManagerWrapper:
         # 전환은 /back 대상이 되고, /back 역전환은 여기서 undo 기록을
         # 소비한다 (spawn 전 크래시면 기록이 남아 재시도 가능).
         if pending is not None:
-            if pending.is_back:
+            if pending.is_rollover_request:
+                # Same session, same conversation — not a transition, so
+                # no /back bookkeeping. The handoff turn starts now:
+                # advance the rollover machine to its validation phase.
+                # 같은 세션·같은 conversation — 전환이 아니므로 /back
+                # 부기 없음. handoff 턴이 지금 시작된다 — 롤오버 머신을
+                # 검증 단계로 진행.
+                if self._rollover_request_state is not None:
+                    self._rollover_request_state["phase"] = "writing"
+            elif pending.is_back:
                 self._last_transition = None
                 wrapper_state.clear_last_transition(Path(self.project_path))
             else:
@@ -646,7 +720,108 @@ class SessionManagerWrapper:
             # (respawn 은 start() 가 수행).
             self._maybe_terminate_for_respawn()
 
+            # Second turn-end signal: a usage change in context.json.
+            # 제2 턴 종료 신호 — context.json 의 usage 변화.
+            self._observe_context_update()
+
+            # Handoff-turn completion can outrun the transcript flush —
+            # watch the transcript itself while a handoff is pending.
+            # handoff 턴 종료 신호가 transcript flush 를 앞지를 수 있다 —
+            # handoff 대기 중에는 transcript 자체를 관찰한다.
+            self._poll_handoff_transcript()
+
         self._drain_pty()
+
+    def _poll_handoff_transcript(self) -> None:
+        """Re-validate the handoff turn whenever its transcript changes.
+
+        handoff 턴의 transcript 가 바뀔 때마다 재검증한다.
+
+        The dedicated turn's LAST turn-end signal can arrive milliseconds
+        BEFORE the response event is flushed to the JSONL (measured —
+        R4-C3 e2e: busy edge at .397, body event stamped .337 but not
+        yet readable; no further signal ever came and the machine hung
+        in "waiting"). The condition we actually await is "the
+        transcript gained the reply", so watch exactly that resource:
+        one stat(2) per idle tick while a handoff turn is in flight,
+        re-running validation on any (mtime, size) change.
+
+        전용 턴의 마지막 턴 종료 신호가 응답 이벤트의 JSONL flush 보다
+        수 ms 먼저 도착할 수 있다 (실측 — R4-C3 e2e: busy 에지 .397,
+        본문 이벤트 스탬프 .337 이지만 아직 읽히지 않음. 이후 신호가
+        더는 오지 않아 머신이 "waiting" 에 매달렸다). 실제로 기다리는
+        조건은 "transcript 에 응답이 실렸다" 이므로 정확히 그 자원을
+        관찰한다 — handoff 턴 진행 중에만 유휴 틱당 stat(2) 1회,
+        (mtime, size) 변화마다 재검증.
+        """
+        state = self._rollover_request_state
+        if state is None or state.get("phase") != "writing":
+            return
+        path = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / encode_cwd(Path(self.project_path))
+            / f"{state['conv_id']}.jsonl"
+        )
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        sig = (stat.st_mtime_ns, stat.st_size)
+        if sig == state.get("jsonl_sig"):
+            return
+        state["jsonl_sig"] = sig
+        self._finish_handoff_turn(state)
+
+    def _observe_context_update(self) -> None:
+        """Fire _on_turn_end when the statusline collector saw new usage.
+
+        statusline 수집기가 새 usage 를 봤으면 _on_turn_end 를 발동한다.
+
+        Why a second signal exists: short turns (~2s) may never render
+        the busy footer hint, so the falling edge misses them entirely
+        (measured — R4-C3 e2e, 2026-08-13); a session full of short
+        turns would never run its context checks. The collector writes
+        context.json after every API completion, which IS the turn-end
+        fact, delivered through an official interface. One stat(2) per
+        idle tick (≤10/s) is the entire cost. The first observation
+        after boot only sets the baseline — a stale pre-existing file
+        must not fire checks for a turn that ended in a previous run.
+
+        제2 신호가 필요한 이유: 짧은 턴 (~2초) 은 바쁨 푸터 힌트를 아예
+        안 그릴 수 있어 하강 에지가 통째로 놓친다 (실측 — R4-C3 e2e,
+        2026-08-13). 짧은 턴만 이어지는 세션은 컨텍스트 검사가 영영 안
+        돈다. 수집기는 매 API 완결 후 context.json 을 쓰며, 그것이 곧
+        공식 인터페이스로 전달되는 턴 종료 사실이다. 비용은 유휴 틱당
+        stat(2) 1회 (초당 ≤10회) 가 전부. 부팅 후 첫 관찰은 기준선만
+        잡는다 — 이전 실행에서 끝난 턴의 잔존 파일이 검사를 발동하면
+        안 된다.
+        """
+        path = (
+            Path(self.project_path)
+            / _SESSION_MANAGER_DIRNAME
+            / statusline.CONTEXT_FILENAME
+        )
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        sig = (stat.st_mtime_ns, stat.st_size)
+        if sig == self._context_file_sig:
+            return
+        first_observation = self._context_file_sig is None
+        self._context_file_sig = sig
+        record = statusline.read_context(Path(self.project_path))
+        if not isinstance(record, dict):
+            return
+        key = (record.get("conversation_id"), record.get("used_tokens"))
+        if key == self._context_usage_key:
+            return
+        self._context_usage_key = key
+        if first_observation:
+            return
+        self._on_turn_end("context_update")
 
     def _maybe_terminate_for_respawn(self) -> None:
         """Send SIGTERM once the pending transition's turn-end gate opens.
@@ -666,9 +841,7 @@ class SessionManagerWrapper:
         pending = self._pending_respawn
         if pending is None or pending.terminated:
             return
-        if self.virtual_screen.contains_near_prompt(
-            BUSY_MARKER, BUSY_MARKER_RADIUS_ROWS
-        ):
+        if self._screen_busy():
             return
         pending.terminated = True
         debug_log.log(
@@ -715,16 +888,49 @@ class SessionManagerWrapper:
         # 턴 종료 이벤트 — 바쁨 마커의 하강 에지. 주기 요약 갱신의 대화
         # 증가량을 재기에 안전한 유일한 지점 (이전에는 죽은 프롬프트 감지
         # 신호에 걸려 있었다).
-        busy = self.virtual_screen.contains_near_prompt(
-            BUSY_MARKER, BUSY_MARKER_RADIUS_ROWS
-        )
+        busy = self._screen_busy()
         if self._was_busy and not busy:
-            self._check_summary_refresh()
-            self._check_context_usage()
+            self._on_turn_end("busy_edge")
         self._was_busy = busy
 
         os.write(self._stdout_fd, chunk)
         return True
+
+    def _screen_busy(self) -> bool:
+        """Is a turn running, judged from the virtual screen?
+
+        가상 화면 기준으로 턴이 실행 중인가?
+
+        Either marker counts — the footer hint rotates, so short turns
+        may show only the spinner ellipsis (see BUSY_SPINNER_ELLIPSIS).
+        어느 마커든 인정 — 푸터 힌트는 로테이션이라 짧은 턴은 스피너
+        말줄임표만 보일 수 있다 (BUSY_SPINNER_ELLIPSIS 참조).
+        """
+        return self.virtual_screen.contains_near_prompt(
+            BUSY_MARKER, BUSY_MARKER_RADIUS_ROWS
+        ) or self.virtual_screen.contains_near_prompt(
+            BUSY_SPINNER_ELLIPSIS, BUSY_MARKER_RADIUS_ROWS
+        )
+
+    def _on_turn_end(self, source: str) -> None:
+        """Run the turn-end check battery (summary, context, rollover).
+
+        턴 종료 검사 일괄 실행 (요약·컨텍스트·롤오버).
+
+        Fired by either turn-end signal: the busy falling edge, or an
+        observed context.json usage change (statusline collector — the
+        only signal short turns reliably produce, see _observe_context_
+        update). Every check is idempotent, so double firing for one
+        turn is harmless.
+        두 턴 종료 신호 중 무엇이든 발동한다 — 바쁨 하강 에지, 또는
+        context.json usage 변화 관찰 (statusline 수집기 — 짧은 턴이
+        확실히 만드는 유일한 신호, _observe_context_update 참조). 모든
+        검사는 멱등이라 한 턴에 이중 발동해도 무해하다.
+        """
+        debug_log.log("TURN_END", "WRAPPER", {"source": source})
+        self._check_summary_refresh()
+        self._check_context_usage()
+        self._advance_rollover()
 
     def _reset_child_detection_state(self) -> None:
         """
@@ -1266,6 +1472,10 @@ class SessionManagerWrapper:
         if self._rollover_pending_conv_id == conv_id:
             return
         self._rollover_pending_conv_id = conv_id
+        if usage.window_tokens:
+            self._rollover_pending_pct = round(
+                usage.used_tokens * 100 / usage.window_tokens
+            )
         debug_log.log(
             "ROLLOVER_PENDING",
             "WRAPPER",
@@ -1278,6 +1488,170 @@ class SessionManagerWrapper:
             },
             conv_id=conv_id,
             session=self._current_session_name,
+        )
+
+    def _advance_rollover(self) -> None:
+        """Rollover machine, driven by turn-end edges (R4-C3).
+
+        턴 종료 에지가 구동하는 롤오버 머신 (R4-C3).
+
+        Two legs / 두 단계:
+        1. A conversation is marked pending and nothing is in flight →
+           start the dedicated handoff turn (same-conversation respawn;
+           the request text rides the pending file as user_prompt, so
+           the existing trigger/injection path needs no changes).
+           pending 마킹이 있고 진행 중인 것이 없으면 → handoff 전용 턴
+           개시 (같은 conversation respawn. 요청문은 pending 파일의
+           user_prompt 로 실리므로 기존 트리거·주입 경로 무변경).
+        2. The dedicated turn just ended → extract the response from the
+           transcript, validate, write the file; one retry, then the
+           excerpt fallback. Acting on the ready handoff is R4-C4.
+           전용 턴이 방금 끝났으면 → transcript 에서 응답 추출·검증·파일
+           기록. 재시도 1회, 그 다음은 발췌 폴백. ready handoff 에 대한
+           행동은 R4-C4.
+        """
+        state = self._rollover_request_state
+        if state is not None and state.get("phase") == "writing":
+            self._finish_handoff_turn(state)
+            return
+        if state is not None:
+            return  # requested — the dedicated turn has not spawned yet
+        if self._rollover_ready is not None or self._pending_respawn is not None:
+            return
+        conv_id = self._rollover_pending_conv_id
+        if conv_id is None:
+            return
+        if conv_id != get_active_conversation_id(Path(self.project_path)):
+            return
+        session_name = self._current_session_name
+        if session_name is None:
+            return
+        self._start_handoff_turn(session_name, conv_id, attempts=1)
+
+    def _start_handoff_turn(
+        self, session_name: str, conv_id: str, attempts: int
+    ) -> None:
+        project = Path(self.project_path)
+        try:
+            session = SessionStore(project).load_session_by_name(session_name)
+        except Exception:
+            session = None
+        requirements = list(session.requirements) if session else []
+        n = rollover.next_handoff_number(project, session_name)
+        request = rollover.build_request(
+            project, session_name, n, conv_id, requirements
+        )
+        if attempts == 1:
+            pct = self._rollover_pending_pct
+            self._notify_user(
+                f"⚠ 컨텍스트 {pct}% — 세션을 이어갈 준비를 합니다"
+                if pct is not None
+                else "⚠ 컨텍스트 한계 근접 — 세션을 이어갈 준비를 합니다"
+            )
+        self._rollover_request_state = {
+            "session": session_name,
+            "n": n,
+            "conv_id": conv_id,
+            "attempts": attempts,
+            "phase": "requested",
+            # Validation anchor: only transcript events after this moment
+            # belong to the dedicated turn (see rollover.check_trigger_turn).
+            # 검증 앵커 — 이 시각 이후의 transcript 이벤트만 전용 턴의
+            # 것이다 (rollover.check_trigger_turn 참조).
+            "request_at": wrapper_state.utc_now_iso(),
+        }
+        debug_log.log(
+            "ROLLOVER_HANDOFF",
+            "WRAPPER",
+            {"op": "request", "n": n, "attempts": attempts},
+            conv_id=conv_id,
+            session=session_name,
+        )
+        self._execute_transition(
+            target=session_name,
+            resume_conv=conv_id,
+            handoff={"kind": "rollover_handoff_request", "from": session_name},
+            user_prompt=request,
+            is_rollover_request=True,
+        )
+
+    def _finish_handoff_turn(self, state: dict[str, Any]) -> None:
+        """Validate the dedicated turn's output; retry once, then fallback.
+
+        전용 턴 산출물을 검증한다 — 재시도 1회, 그 다음 발췌 폴백.
+
+        Anchored on transcript content, not screen edges: the dedicated
+        child's boot produces a spurious falling edge before the trigger
+        is delivered (measured race — the first e2e burned both attempts
+        on the previous conversation's reply). "waiting" keeps the
+        attempt alive; only a delivered-and-answered or lost request
+        consumes it.
+
+        화면 에지가 아니라 transcript 내용에 앵커한다: 전용 자식의 부팅이
+        트리거 전달 전에 가짜 하강 에지를 만든다 (실측 레이스 — 첫 e2e 가
+        직전 대화의 응답으로 시도 2회를 전부 태웠다). "waiting" 은 시도를
+        보존하고, 전달·응답 완료 또는 유실만 시도를 소진한다.
+        """
+        project = Path(self.project_path)
+        session_name = state["session"]
+        conv_id = state["conv_id"]
+        jsonl_path = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / encode_cwd(project)
+            / f"{conv_id}.jsonl"
+        )
+        status, text = rollover.check_trigger_turn(
+            jsonl_path,
+            handoff_store.TRIGGER_PROMPT,
+            state.get("request_at", ""),
+        )
+        if status == "waiting":
+            return
+        if status == "answered" and rollover.validate_handoff_text(text):
+            path = rollover.write_handoff(project, session_name, state["n"], text)
+            self._rollover_request_state = None
+            self._rollover_ready = {**state, "path": str(path)}
+            self._notify_user(
+                f"⚠ Handoff 준비 완료 — {path.relative_to(project)}"
+            )
+            return
+        if state["attempts"] < 2:
+            debug_log.log(
+                "ROLLOVER_HANDOFF",
+                "WRAPPER",
+                {
+                    "op": "retry",
+                    "reason": "delivery_lost"
+                    if status == "missing"
+                    else "validation_failed",
+                },
+                conv_id=conv_id,
+                session=session_name,
+            )
+            self._rollover_request_state = None
+            self._start_handoff_turn(session_name, conv_id, attempts=2)
+            return
+        # Two failures: excerpt fallback — low quality, but the rollover
+        # proceeds (Plan R4-C3).
+        # 2회 실패: 발췌 폴백 — 품질은 낮아도 롤오버는 진행 (Plan R4-C3).
+        excerpt = extract_full_text(jsonl_path)
+        body = rollover.build_fallback_handoff(
+            session_name, state["n"], conv_id, excerpt
+        )
+        path = rollover.write_handoff(project, session_name, state["n"], body)
+        debug_log.log(
+            "ROLLOVER_HANDOFF",
+            "WRAPPER",
+            {"op": "fallback", "path": str(path)},
+            conv_id=conv_id,
+            session=session_name,
+        )
+        self._rollover_request_state = None
+        self._rollover_ready = {**state, "path": str(path)}
+        self._notify_user(
+            f"⚠ Handoff 준비 완료 (발췌 폴백) — {path.relative_to(project)}"
         )
 
     def _enqueue_stale_summaries(self) -> None:
@@ -1565,6 +1939,7 @@ class SessionManagerWrapper:
         handoff: dict[str, Any],
         user_prompt: str,
         is_back: bool = False,
+        is_rollover_request: bool = False,
     ) -> None:
         """Register a transition: pending file + child swap request.
 
@@ -1595,10 +1970,15 @@ class SessionManagerWrapper:
         from_name = handoff.get("from")
         # Queue a background summary for the departing session while its
         # conversation is still the active one, and move the wrapper-side
-        # current-session mirror to the target.
+        # current-session mirror to the target. A rollover handoff
+        # request departs nothing (same session, same conversation), so
+        # no summary is queued for it.
         # 떠나는 세션의 conversation 이 아직 활성인 시점에 백그라운드
         # 요약을 큐에 넣고, 래퍼 측 현재 세션 미러를 target 으로 이동.
-        self._enqueue_departed_summary(from_name)
+        # 롤오버 handoff 요청은 떠나는 것이 없으므로 (같은 세션·같은
+        # conversation) 요약을 큐에 넣지 않는다.
+        if not is_rollover_request:
+            self._enqueue_departed_summary(from_name)
         self._current_session_name = target
         handoff_clean = {k: v for k, v in handoff.items() if k != "user_prompt"}
         handoff_store.write_pending(
@@ -1610,6 +1990,7 @@ class SessionManagerWrapper:
             from_name=from_name if isinstance(from_name, str) else None,
             user_prompt=user_prompt,
             is_back=is_back,
+            is_rollover_request=is_rollover_request,
         )
         debug_log.log(
             "TRANSITION",
