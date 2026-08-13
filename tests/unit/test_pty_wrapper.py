@@ -1308,6 +1308,382 @@ class TestCheckContextUsage:
         assert calls == []
 
 
+class TestAdvanceRollover:
+    """R4-C3: the handoff-turn state machine.
+
+    R4-C3: handoff 전용 턴 상태 머신.
+    """
+
+    def _mark(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        conv_id: str = "conv-1",
+    ) -> None:
+        from session_manager.wrapper import pty_wrapper as pw
+
+        wrapper._rollover_pending_conv_id = conv_id
+        wrapper._current_session_name = "backend"
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: conv_id
+        )
+
+    def test_starts_dedicated_turn_when_pending(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mark(wrapper, monkeypatch)
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        wrapper._advance_rollover()
+        state = wrapper._rollover_request_state
+        assert state["phase"] == "requested"
+        assert state["session"] == "backend"
+        assert state["n"] == 1
+        assert wrapper._pending_respawn.is_rollover_request is True
+        assert wrapper._pending_respawn.resume_conv == "conv-1"
+        assert any("세션을 이어갈 준비" in n for n in notes)
+
+    def test_noop_without_pending_mark(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from session_manager.wrapper import pty_wrapper as pw
+
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: "conv-1"
+        )
+        wrapper._advance_rollover()
+        assert wrapper._rollover_request_state is None
+        assert wrapper._pending_respawn is None
+
+    def test_noop_when_ready_or_conv_changed(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mark(wrapper, monkeypatch, conv_id="conv-1")
+        wrapper._rollover_ready = {"session": "backend"}
+        wrapper._advance_rollover()
+        assert wrapper._rollover_request_state is None
+        # Conversation moved on (switch/clear) — the stale mark must not
+        # fire a handoff turn for the new conversation.
+        # conversation 이 바뀌면 낡은 마킹이 새 대화에 발동하면 안 된다.
+        wrapper._rollover_ready = None
+        wrapper._rollover_pending_conv_id = "conv-0"
+        wrapper._advance_rollover()
+        assert wrapper._rollover_request_state is None
+
+    def test_finish_valid_writes_file_and_marks_ready(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from session_manager import rollover as ro
+
+        body = (
+            "# Handoff: backend #1\n"
+            "## 1. 지금 바로 할 일 (재개 지점)\n다음 액션\n"
+            "## 2. 사용자 요구사항\n목록\n"
+        )
+        monkeypatch.setattr(
+            ro, "check_trigger_turn", lambda *_a, **_k: ("answered", body)
+        )
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        wrapper._rollover_request_state = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "conv-1",
+            "attempts": 1,
+            "phase": "writing",
+        }
+        wrapper._advance_rollover()
+        assert wrapper._rollover_request_state is None
+        ready = wrapper._rollover_ready
+        assert ready["session"] == "backend"
+        written = Path(ready["path"])
+        assert written.read_text(encoding="utf-8") == body
+        assert any("Handoff 준비 완료" in n for n in notes)
+
+    def test_finish_invalid_retries_once(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from session_manager import rollover as ro
+
+        monkeypatch.setattr(
+            ro,
+            "check_trigger_turn",
+            lambda *_a, **_k: ("answered", "엉뚱한 답"),
+        )
+        started: list[int] = []
+        monkeypatch.setattr(
+            wrapper,
+            "_start_handoff_turn",
+            lambda _s, _c, attempts: started.append(attempts),
+        )
+        wrapper._rollover_request_state = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "conv-1",
+            "attempts": 1,
+            "phase": "writing",
+        }
+        wrapper._advance_rollover()
+        assert started == [2]
+        assert wrapper._rollover_ready is None
+
+    def test_finish_second_failure_writes_fallback(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from session_manager import rollover as ro
+        from session_manager.wrapper import pty_wrapper as pw
+
+        monkeypatch.setattr(
+            ro, "check_trigger_turn", lambda *_a, **_k: ("answered", "")
+        )
+        monkeypatch.setattr(pw, "extract_full_text", lambda _p: "대화 발췌")
+        monkeypatch.setattr(wrapper, "_notify_user", lambda _t: None)
+        wrapper._rollover_request_state = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "conv-1",
+            "attempts": 2,
+            "phase": "writing",
+        }
+        wrapper._advance_rollover()
+        ready = wrapper._rollover_ready
+        body = Path(ready["path"]).read_text(encoding="utf-8")
+        assert ro.validate_handoff_text(body) is True
+        assert "대화 발췌" in body
+
+    def test_waiting_status_preserves_attempt(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Boot-edge race (measured): a turn-end signal before the trigger
+        # is delivered must leave the attempt intact.
+        # 부팅 에지 레이스 (실측) — 트리거 전달 전의 턴 종료 신호가 시도를
+        # 소진하면 안 된다.
+        from session_manager import rollover as ro
+
+        monkeypatch.setattr(
+            ro, "check_trigger_turn", lambda *_a, **_k: ("waiting", "")
+        )
+        state = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "conv-1",
+            "attempts": 1,
+            "phase": "writing",
+        }
+        wrapper._rollover_request_state = state
+        wrapper._advance_rollover()
+        assert wrapper._rollover_request_state is state
+        assert wrapper._rollover_ready is None
+
+    def test_missing_status_consumes_attempt(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from session_manager import rollover as ro
+
+        monkeypatch.setattr(
+            ro, "check_trigger_turn", lambda *_a, **_k: ("missing", "")
+        )
+        started: list[int] = []
+        monkeypatch.setattr(
+            wrapper,
+            "_start_handoff_turn",
+            lambda _s, _c, attempts: started.append(attempts),
+        )
+        wrapper._rollover_request_state = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "conv-1",
+            "attempts": 1,
+            "phase": "writing",
+        }
+        wrapper._advance_rollover()
+        assert started == [2]
+
+    def test_transcript_poll_revalidates_on_change(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # The turn-end signal can outrun the transcript flush (measured)
+        # — a later file change alone must re-run validation.
+        # 턴 종료 신호가 transcript flush 를 앞지를 수 있다 (실측) —
+        # 이후의 파일 변화만으로 재검증이 돌아야 한다.
+        from session_manager.wrapper import pty_wrapper as pw
+
+        jsonl_dir = tmp_path / "proj"
+        jsonl_dir.mkdir()
+        monkeypatch.setattr(pw, "encode_cwd", lambda _p: "proj")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "h"))
+        jsonl = tmp_path / "h" / ".claude" / "projects" / "proj" / "c1.jsonl"
+        jsonl.parent.mkdir(parents=True)
+        jsonl.write_text("{}\n", encoding="utf-8")
+
+        finished: list[dict] = []
+        monkeypatch.setattr(wrapper, "_finish_handoff_turn", finished.append)
+        state = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "c1",
+            "attempts": 1,
+            "phase": "writing",
+        }
+        wrapper._rollover_request_state = state
+        wrapper._poll_handoff_transcript()
+        assert len(finished) == 1  # first sighting establishes + checks
+        wrapper._poll_handoff_transcript()
+        assert len(finished) == 1  # unchanged file — no re-run
+        jsonl.write_text('{}\n{"type": "assistant"}\n', encoding="utf-8")
+        wrapper._poll_handoff_transcript()
+        assert len(finished) == 2  # changed file — re-validated
+
+    def test_transcript_poll_noop_outside_writing_phase(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        finished: list[dict] = []
+        monkeypatch.setattr(wrapper, "_finish_handoff_turn", finished.append)
+        wrapper._poll_handoff_transcript()
+        wrapper._rollover_request_state = {"phase": "requested", "conv_id": "c"}
+        wrapper._poll_handoff_transcript()
+        assert finished == []
+
+    def test_requested_phase_waits_for_spawn(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A turn-end edge in the OLD child (user typed during the swap
+        # wait) must not validate prematurely.
+        # 교체 대기 중 옛 자식의 턴 종료 에지가 조기 검증하면 안 된다.
+        wrapper._rollover_request_state = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "conv-1",
+            "attempts": 1,
+            "phase": "requested",
+        }
+        wrapper._advance_rollover()
+        assert wrapper._rollover_request_state["phase"] == "requested"
+        assert wrapper._rollover_ready is None
+
+
+class TestObserveContextUpdate:
+    """R4-C3: the context.json-based second turn-end signal.
+
+    R4-C3: context.json 기반 제2 턴 종료 신호.
+    """
+
+    def _write_record(
+        self, project: Path, conv: str = "conv-1", used: int = 10_000
+    ) -> None:
+        from session_manager import statusline
+
+        statusline.write_context(
+            project,
+            {
+                "conversation_id": conv,
+                "used_tokens": used,
+                "context_window_size": 200_000,
+                "at": f"t-{used}",
+            },
+        )
+
+    def _arm(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> list[str]:
+        fired: list[str] = []
+        monkeypatch.setattr(wrapper, "_on_turn_end", fired.append)
+        return fired
+
+    def test_first_observation_is_baseline_only(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # A stale file from a previous run must not fire checks at boot.
+        # 이전 실행의 잔존 파일이 부팅 시 검사를 발동하면 안 된다.
+        fired = self._arm(wrapper, monkeypatch)
+        self._write_record(tmp_path, used=10_000)
+        wrapper._observe_context_update()
+        assert fired == []
+
+    def test_usage_change_fires_turn_end(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        fired = self._arm(wrapper, monkeypatch)
+        self._write_record(tmp_path, used=10_000)
+        wrapper._observe_context_update()
+        self._write_record(tmp_path, used=12_345)
+        wrapper._observe_context_update()
+        assert fired == ["context_update"]
+
+    def test_rewrite_without_usage_change_is_silent(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # The collector rewrites the file several times per turn with
+        # the same usage — only a real change may fire.
+        # 수집기는 한 턴에 같은 usage 로도 여러 번 파일을 다시 쓴다 —
+        # 실제 변화만 발동해야 한다.
+        fired = self._arm(wrapper, monkeypatch)
+        self._write_record(tmp_path, used=10_000)
+        wrapper._observe_context_update()
+        self._write_record(tmp_path, used=10_000)
+        wrapper._observe_context_update()
+        assert fired == []
+
+    def test_missing_file_is_noop(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fired = self._arm(wrapper, monkeypatch)
+        wrapper._observe_context_update()
+        assert fired == []
+
+
+class TestScreenBusy:
+    """R4-C3: spinner-ellipsis busy marker (short turns render no hint).
+
+    R4-C3: 스피너 말줄임표 바쁨 마커 (짧은 턴은 힌트 미렌더).
+    """
+
+    def _screen(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        present: set[str],
+    ) -> None:
+        monkeypatch.setattr(
+            wrapper.virtual_screen,
+            "contains_near_prompt",
+            lambda needle, radius: needle in present,
+        )
+
+    def test_hint_marker_counts(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._screen(wrapper, monkeypatch, {"esc to interrupt"})
+        assert wrapper._screen_busy() is True
+
+    def test_spinner_ellipsis_counts(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._screen(wrapper, monkeypatch, {"…"})
+        assert wrapper._screen_busy() is True
+
+    def test_idle_screen(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._screen(wrapper, monkeypatch, set())
+        assert wrapper._screen_busy() is False
+
+
 class TestRolloverSignal:
     """R4-C2: PreCompact hook's rollover signal dispatch.
 
