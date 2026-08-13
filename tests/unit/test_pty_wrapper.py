@@ -1266,6 +1266,11 @@ class TestCheckContextUsage:
             "check_context_usage",
             lambda *a: calls.append(a) or usage,
         )
+        # Known below-trigger birth by default — the loop guard passes.
+        # 기본은 트리거 미만의 확정 태생 — 루프 가드 통과.
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: 39_000
+        )
         return calls
 
     def test_marks_pending_once(
@@ -1306,6 +1311,70 @@ class TestCheckContextUsage:
         wrapper._check_context_usage()
         assert wrapper._rollover_pending_conv_id is None
         assert calls == []
+
+    def test_birth_at_trigger_suppresses_rollover(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Loop guard (measured: 4 rollovers in one run with a too-low
+        # budget): a conversation born at/over the trigger must never
+        # mark — the successor would be born equally full.
+        # 루프 가드 (실관측 — 과소 budget 으로 1회 실행에 롤오버 4번):
+        # 트리거 이상으로 태어난 대화는 마킹하면 안 된다 — 후계도 똑같이
+        # 찬 채 태어난다.
+        from session_manager.wrapper import pty_wrapper as pw
+
+        self._arm(wrapper, monkeypatch, "conv-1", exceeded=True)
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: 130_000
+        )
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id is None
+        assert wrapper._rollover_suppressed_conv_id == "conv-1"
+        # Re-check stays suppressed without re-reading the birth usage.
+        # 재검사도 억제 유지 (태생 재판독 없음).
+        monkeypatch.setattr(
+            pw.context_monitor,
+            "read_first_usage",
+            lambda _p: pytest.fail("must not re-read"),
+        )
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id is None
+
+    def test_birth_below_trigger_marks(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from session_manager.wrapper import pty_wrapper as pw
+
+        self._arm(wrapper, monkeypatch, "conv-1", exceeded=True)
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: 39_000
+        )
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+
+    def test_unknown_birth_defers_marking(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Flush race (measured): birth unknown must DEFER, not bypass
+        # the guard — a successor rolled over through this window.
+        # flush 레이스 (실관측) — 태생 미상은 가드 우회가 아니라 **연기**
+        # 여야 한다. 이 창으로 후계가 롤오버됐었다.
+        from session_manager.wrapper import pty_wrapper as pw
+
+        self._arm(wrapper, monkeypatch, "conv-1", exceeded=True)
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: None
+        )
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id is None
+        assert wrapper._rollover_suppressed_conv_id is None
+        # Birth becomes known below trigger → the retry marks normally.
+        # 태생이 트리거 미만으로 확정되면 재시도가 정상 마킹한다.
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: 39_000
+        )
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id == "conv-1"
 
 
 class TestAdvanceRollover:
@@ -1355,17 +1424,35 @@ class TestAdvanceRollover:
         assert wrapper._rollover_request_state is None
         assert wrapper._pending_respawn is None
 
-    def test_noop_when_ready_or_conv_changed(
+    def test_ready_retries_swap_leg(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Ready whose swap could not register earlier → the advance
+        # retries the swap, never a new handoff request (R4-C4).
+        # 교체 등록이 밀린 ready → advance 는 교체를 재시도하고 새
+        # handoff 요청은 내지 않는다 (R4-C4).
         self._mark(wrapper, monkeypatch, conv_id="conv-1")
-        wrapper._rollover_ready = {"session": "backend"}
+        wrapper._rollover_ready = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "conv-1",
+            "path": "/x/backend-1.md",
+        }
+        swaps: list[None] = []
+        monkeypatch.setattr(
+            wrapper, "_start_rollover_swap", lambda: swaps.append(None)
+        )
         wrapper._advance_rollover()
+        assert swaps == [None]
         assert wrapper._rollover_request_state is None
+
+    def test_noop_when_conv_changed(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Conversation moved on (switch/clear) — the stale mark must not
         # fire a handoff turn for the new conversation.
         # conversation 이 바뀌면 낡은 마킹이 새 대화에 발동하면 안 된다.
-        wrapper._rollover_ready = None
+        self._mark(wrapper, monkeypatch, conv_id="conv-1")
         wrapper._rollover_pending_conv_id = "conv-0"
         wrapper._advance_rollover()
         assert wrapper._rollover_request_state is None
@@ -1397,11 +1484,17 @@ class TestAdvanceRollover:
         }
         wrapper._advance_rollover()
         assert wrapper._rollover_request_state is None
-        ready = wrapper._rollover_ready
-        assert ready["session"] == "backend"
-        written = Path(ready["path"])
-        assert written.read_text(encoding="utf-8") == body
+        # R4-C4: ready is consumed immediately by the swap leg.
+        # R4-C4: ready 는 교체 단계가 즉시 소비한다.
+        assert wrapper._rollover_ready is None
+        swap = wrapper._rollover_swap_state
+        assert swap["session"] == "backend"
+        assert swap["predecessor_conv"] == "conv-1"
+        assert Path(swap["path"]).read_text(encoding="utf-8") == body
+        assert wrapper._pending_respawn.is_rollover_swap is True
+        assert wrapper._pending_respawn.resume_conv is None
         assert any("Handoff 준비 완료" in n for n in notes)
+        assert any("롤오버" in n for n in notes)
 
     def test_finish_invalid_retries_once(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
@@ -1449,10 +1542,11 @@ class TestAdvanceRollover:
             "phase": "writing",
         }
         wrapper._advance_rollover()
-        ready = wrapper._rollover_ready
-        body = Path(ready["path"]).read_text(encoding="utf-8")
+        swap = wrapper._rollover_swap_state
+        body = Path(swap["path"]).read_text(encoding="utf-8")
         assert ro.validate_handoff_text(body) is True
         assert "대화 발췌" in body
+        assert wrapper._pending_respawn.is_rollover_swap is True
 
     def test_waiting_status_preserves_attempt(
         self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
@@ -1682,6 +1776,191 @@ class TestScreenBusy:
     ) -> None:
         self._screen(wrapper, monkeypatch, set())
         assert wrapper._screen_busy() is False
+
+
+class TestPollRolloverFinalize:
+    """R4-C4: successor-observed finalize.
+
+    R4-C4: 후계 관찰 시 finalize.
+    """
+
+    def _seed_session(self, project: Path) -> None:
+        from session_manager.models.session import (
+            PrecedentRecord,
+            SessionMetadata,
+        )
+        from session_manager.storage.file_store import SessionStore
+
+        session = SessionMetadata.new(name="backend", title="t")
+        session.link_conversation("conv-old")
+        session.precedents.append(
+            PrecedentRecord(
+                prompt_gist="g",
+                kept_in="backend",
+                rejected="frontend",
+                at="2026-08-13T00:00:00+00:00",
+            )
+        )
+        SessionStore(project).save_session(session)
+
+    def _arm(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        active_conv: str | None,
+    ) -> list[None]:
+        from session_manager.wrapper import pty_wrapper as pw
+
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: active_conv
+        )
+        enqueued: list[None] = []
+        monkeypatch.setattr(
+            wrapper, "_enqueue_active_summary", lambda: enqueued.append(None)
+        )
+        wrapper._rollover_swap_state = {
+            "session": "backend",
+            "n": 1,
+            "path": "/x/backend-1.md",
+            "predecessor_conv": "conv-old",
+        }
+        wrapper._rollover_pending_conv_id = "conv-old"
+        return enqueued
+
+    def test_waits_while_predecessor_still_active(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        self._seed_session(tmp_path)
+        enqueued = self._arm(wrapper, monkeypatch, "conv-old")
+        wrapper._poll_rollover_finalize()
+        assert wrapper._rollover_swap_state is not None
+        assert enqueued == []
+
+    def test_finalizes_on_successor(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from session_manager.storage.file_store import SessionStore
+
+        self._seed_session(tmp_path)
+        enqueued = self._arm(wrapper, monkeypatch, "conv-new")
+        wrapper._poll_rollover_finalize()
+        assert wrapper._rollover_swap_state is None
+        assert wrapper._rollover_pending_conv_id is None
+        assert enqueued == [None]
+        session = SessionStore(tmp_path).load_session_by_name("backend")
+        # Deterministic bookkeeping: successor linked to the SAME
+        # session, precedents gone (invalidation event ③).
+        # 결정적 부기 — 후계가 같은 세션에 link, 판례 소멸 (이벤트 ③).
+        assert session.claude_conversation_ids == ["conv-old", "conv-new"]
+        assert session.precedents == []
+
+    def test_finalize_links_unrecorded_predecessor(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # Lineage must not depend on the LLM having called an MCP tool
+        # in the predecessor (observed missing in e2e).
+        # 계보가 선대에서의 MCP 도구 호출 여부에 의존하면 안 된다 (e2e
+        # 누락 실관측).
+        from session_manager.models.session import SessionMetadata
+        from session_manager.storage.file_store import SessionStore
+
+        SessionStore(tmp_path).save_session(
+            SessionMetadata.new(name="backend", title="t")
+        )
+        self._arm(wrapper, monkeypatch, "conv-new")
+        wrapper._poll_rollover_finalize()
+        session = SessionStore(tmp_path).load_session_by_name("backend")
+        assert session.claude_conversation_ids == ["conv-old", "conv-new"]
+
+    def test_link_failure_does_not_loop(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from session_manager.storage.file_store import SessionStore
+
+        self._seed_session(tmp_path)
+        enqueued = self._arm(wrapper, monkeypatch, "conv-new")
+        monkeypatch.setattr(
+            SessionStore,
+            "mutate_session_by_name",
+            lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk")),
+        )
+        wrapper._poll_rollover_finalize()
+        # State must clear (the MCP's own tracking is the backstop) —
+        # a permanent storage failure must not retry every tick forever.
+        # 상태는 해제돼야 한다 (MCP 자체 추적이 백스톱) — 영구 저장 실패가
+        # 매 틱 무한 재시도되면 안 된다.
+        assert wrapper._rollover_swap_state is None
+        assert enqueued == [None]
+
+    def test_noop_without_state(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapper._poll_rollover_finalize()
+        assert wrapper._rollover_swap_state is None
+
+
+class TestHandleHandoffCommand:
+    """R4-C4: manual /handoff.
+
+    R4-C4: 수동 /handoff.
+    """
+
+    def test_marks_and_advances(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from session_manager.wrapper import pty_wrapper as pw
+
+        wrapper.pty_fd = -1  # ERASE write fails silently / ERASE 쓰기는 조용히 실패
+        wrapper._current_session_name = "backend"
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: "conv-1"
+        )
+        advanced: list[None] = []
+        monkeypatch.setattr(
+            wrapper, "_advance_rollover", lambda: advanced.append(None)
+        )
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        wrapper._handle_handoff_command()
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+        assert advanced == [None]
+        assert notes == []
+
+    def test_refused_while_in_flight(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapper.pty_fd = -1
+        wrapper._rollover_request_state = {"phase": "writing"}
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        wrapper._handle_handoff_command()
+        assert any("이미 진행" in n for n in notes)
+        assert wrapper._rollover_pending_conv_id is None
+
+    def test_refused_without_active_conversation(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from session_manager.wrapper import pty_wrapper as pw
+
+        wrapper.pty_fd = -1
+        wrapper._current_session_name = "backend"
+        monkeypatch.setattr(pw, "get_active_conversation_id", lambda _p: None)
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        wrapper._handle_handoff_command()
+        assert any("활성 대화가 없습니다" in n for n in notes)
 
 
 class TestRolloverSignal:

@@ -100,6 +100,28 @@ class TestReadTailUsageAndModel:
         assert context_monitor.read_tail_usage_and_model(jsonl) == (None, None)
 
 
+class TestReadFirstUsage:
+    def test_first_assistant_usage(self, tmp_path: Path) -> None:
+        jsonl = tmp_path / "c.jsonl"
+        _write_jsonl(
+            jsonl,
+            [
+                {"type": "user", "message": {}},
+                _assistant(
+                    {"input_tokens": 5, "cache_creation_input_tokens": 35_000}
+                ),
+                _assistant({"input_tokens": 90_000}),
+            ],
+        )
+        assert context_monitor.read_first_usage(jsonl) == 35_005
+
+    def test_missing_file_or_no_assistant(self, tmp_path: Path) -> None:
+        assert context_monitor.read_first_usage(tmp_path / "no.jsonl") is None
+        jsonl = tmp_path / "c.jsonl"
+        _write_jsonl(jsonl, [{"type": "user", "message": {}}])
+        assert context_monitor.read_first_usage(jsonl) is None
+
+
 class TestLoadRolloverConfig:
     def test_defaults_without_config(self, tmp_path: Path) -> None:
         assert context_monitor._load_rollover_config(tmp_path) == (

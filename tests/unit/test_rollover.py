@@ -159,6 +159,17 @@ class TestCheckTriggerTurn:
         ) == ("waiting", "")
 
 
+class TestSuccessorInjection:
+    def test_dict_and_prompt(self, tmp_path: Path) -> None:
+        handoff, prompt = rollover.successor_injection(tmp_path, "backend", 2)
+        assert handoff["kind"] == "rollover"
+        assert handoff["from"] == "backend"
+        assert handoff["handoff_file"] == ".session-manager/handoffs/backend-2.md"
+        assert handoff["read"][0] == handoff["handoff_file"]
+        assert ".session-manager/handoffs/backend-2.md" in prompt
+        assert "재개 지점" in prompt
+
+
 class TestFallback:
     def test_fallback_passes_validation(self) -> None:
         body = rollover.build_fallback_handoff("s", 3, "conv-1", "발췌 텍스트")

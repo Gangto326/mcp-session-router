@@ -5,6 +5,7 @@ command_matcher 단위 테스트.
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
     match_back_command,
+    match_handoff_command,
     match_intercept_command,
 )
 
@@ -216,3 +217,25 @@ class TestMatchBackCommand:
         assert match_back_command(None) is False
         assert match_back_command("") is False
         assert match_back_command("   ") is False
+
+
+class TestMatchHandoffCommand:
+    """/handoff matching (R4-C4) — wrapper-native, argument-free.
+    /handoff 매칭 (R4-C4) — 래퍼 자체 명령, 인자 없음.
+    """
+
+    def test_bare_handoff(self):
+        assert match_handoff_command("/handoff") is True
+
+    def test_trailing_whitespace(self):
+        assert match_handoff_command("/handoff   ") is True
+
+    def test_with_argument_not_matched(self):
+        assert match_handoff_command("/handoff now") is False
+
+    def test_prefix_not_matched(self):
+        assert match_handoff_command("/handoffs") is False
+
+    def test_none_and_empty(self):
+        assert match_handoff_command(None) is False
+        assert match_handoff_command("   ") is False
