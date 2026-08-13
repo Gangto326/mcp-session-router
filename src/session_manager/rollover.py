@@ -263,6 +263,45 @@ def check_trigger_turn(
     return ("waiting", "")
 
 
+def successor_injection(
+    project_path: Path, session: str, n: int
+) -> tuple[dict, str]:
+    """(handoff dict, user prompt) for the successor conversation's first turn.
+
+    후계 대화 첫 턴에 실릴 (handoff dict, 사용자 프롬프트).
+
+    The dict rides the pending file and reaches the LLM as the
+    ``[handoff]`` block (existing injection path, unchanged); the prompt
+    is the Plan §5 read instruction — handoff file first, the shared
+    static field and project context when present.
+
+    dict 는 pending 파일을 타고 ``[handoff]`` 블록으로 LLM 에 도달한다
+    (기존 주입 경로 무변경). 프롬프트는 Plan §5 의 읽기 지시 — handoff
+    파일 우선, 공유 static field·project context 는 있으면.
+    """
+    relpath = str(
+        handoff_path(project_path, session, n).relative_to(Path(project_path))
+    )
+    handoff = {
+        "kind": "rollover",
+        "from": session,
+        "handoff_file": relpath,
+        "read": [
+            relpath,
+            ".session-manager/static-field.json",
+            ".session-manager/project-context.md",
+        ],
+    }
+    prompt = (
+        f"[session-manager 롤오버] 이전 대화가 컨텍스트 한계에 도달해 이 새 "
+        f"대화로 이어졌다. {relpath} 를 읽고 (있으면 "
+        ".session-manager/static-field.json 과 "
+        ".session-manager/project-context.md 도), §1 재개 지점부터 작업을 "
+        "이어가라."
+    )
+    return handoff, prompt
+
+
 def build_fallback_handoff(
     session: str, n: int, conversation_id: str, excerpt: str
 ) -> str:

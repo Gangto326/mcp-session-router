@@ -69,6 +69,7 @@ from session_manager.wrapper import context_monitor, wrapper_state
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
     match_back_command,
+    match_handoff_command,
     match_intercept_command,
 )
 from session_manager.wrapper.judge_host import JudgeHost
@@ -230,6 +231,13 @@ class _PendingRespawn:
     # 롤오버 handoff 요청 respawn (R4-C3): 같은 세션·같은 conversation —
     # /back 부기도 departed 요약도 없다.
     is_rollover_request: bool = False
+    # Rollover swap respawn (R4-C4): same session, NEW conversation —
+    # /back to one's own predecessor would be a pointless self-switch,
+    # so no bookkeeping; the session summary refresh happens at finalize.
+    # 롤오버 교체 respawn (R4-C4): 같은 세션·새 conversation — 자기
+    # 선대로의 /back 은 무의미한 자기 전환이라 부기 없음. 세션 요약
+    # 갱신은 finalize 에서.
+    is_rollover_swap: bool = False
     # /back reverse switch — consumes the undo record on completion.
     # /back 역전환 — 완료 시 undo 기록을 소비한다.
     is_back: bool = False
@@ -355,6 +363,13 @@ class SessionManagerWrapper:
         # 마킹 없음. 마킹에 대한 행동은 R4-C3/C4.
         self._rollover_pending_conv_id: str | None = None
 
+        # Conversation whose rollover is suppressed by the loop guard
+        # (birth footprint ≥ trigger — see _check_context_usage). Logged
+        # once per conversation.
+        # 루프 가드로 롤오버가 억제된 conversation (태생 점유 ≥ 트리거 —
+        # _check_context_usage 참조). conversation 당 1회만 로그.
+        self._rollover_suppressed_conv_id: str | None = None
+
         # Rollover handoff request in flight (R4-C3). Keys: session, n,
         # conv_id, attempts, phase ("requested" until the dedicated turn
         # spawns, then "writing"). None = no request running.
@@ -368,6 +383,15 @@ class SessionManagerWrapper:
         # 실제 교체 (R4-C4) 를 기다리는 검증된 handoff. 키: session, n,
         # conv_id, path.
         self._rollover_ready: dict[str, Any] | None = None
+
+        # Swap in flight, awaiting the successor conversation (R4-C4).
+        # Keys: session, n, path, predecessor_conv. Finalize (link +
+        # precedent clearing + summary) runs when a NEW active
+        # conversation id is observed.
+        # 진행 중인 교체 — 후계 conversation 대기 (R4-C4). 키: session,
+        # n, path, predecessor_conv. 새 활성 conversation id 가 관찰되면
+        # finalize (link + 판례 소멸 + 요약) 가 돈다.
+        self._rollover_swap_state: dict[str, Any] | None = None
 
         # Context percentage at marking time (status-line wording).
         # 마킹 시점의 컨텍스트 퍼센트 (상태 줄 문구용).
@@ -627,6 +651,14 @@ class SessionManagerWrapper:
                 # 검증 단계로 진행.
                 if self._rollover_request_state is not None:
                     self._rollover_request_state["phase"] = "writing"
+            elif pending.is_rollover_swap:
+                # Successor boot — finalize runs when its conversation
+                # is observed (_poll_rollover_finalize); no /back record
+                # (a self-switch to one's own predecessor is pointless).
+                # 후계 부팅 — finalize 는 conversation 관찰 시
+                # (_poll_rollover_finalize). /back 기록 없음 (자기 선대
+                # 로의 자기 전환은 무의미).
+                pass
             elif pending.is_back:
                 self._last_transition = None
                 wrapper_state.clear_last_transition(Path(self.project_path))
@@ -729,6 +761,11 @@ class SessionManagerWrapper:
             # handoff 턴 종료 신호가 transcript flush 를 앞지를 수 있다 —
             # handoff 대기 중에는 transcript 자체를 관찰한다.
             self._poll_handoff_transcript()
+
+            # Swap in flight: finalize once the successor conversation
+            # is observed (R4-C4).
+            # 교체 진행 중 — 후계 conversation 관찰 시 finalize (R4-C4).
+            self._poll_rollover_finalize()
 
         self._drain_pty()
 
@@ -1002,6 +1039,11 @@ class SessionManagerWrapper:
                 # 래퍼 자체 명령 — forward 금지. Claude Code 에 /back 은
                 # 없으므로 \r 은 unknown command 제출만 만든다.
                 self._handle_back_command()
+                return
+            elif match_handoff_command(prompt_text):
+                # Wrapper-native manual rollover (R4-C4) — same contract.
+                # 래퍼 자체 수동 롤오버 (R4-C4) — 동일 계약.
+                self._handle_handoff_command()
                 return
             elif prompt_text and CLEAR_COMMAND_RE.match(prompt_text.strip()):
                 # /clear wipes the conversation — summarise it while it's
@@ -1471,6 +1513,47 @@ class SessionManagerWrapper:
             return
         if self._rollover_pending_conv_id == conv_id:
             return
+        # Loop guard: a rollover cannot shrink a conversation below its
+        # birth footprint. If that already meets the trigger, a successor
+        # would be born equally full and the wrapper would roll over
+        # forever (observed — R4-C4 e2e with a too-low budget override:
+        # 4 rollovers in one run). Suppress and log instead; the log is
+        # R5's measurement source for misconfigured thresholds.
+        # 루프 가드 — 롤오버는 대화를 태생 점유량 아래로 줄일 수 없다.
+        # 태생 점유가 이미 트리거 이상이면 후계도 똑같이 찬 채 태어나
+        # 영원히 반복된다 (실관측 — 과소 budget override 의 R4-C4 e2e 에서
+        # 1회 실행에 롤오버 4번). 억제하고 로그만 남긴다 — 이 로그가 R5
+        # 의 임계 오설정 계측 원천이다.
+        if self._rollover_suppressed_conv_id == conv_id:
+            return
+        birth = context_monitor.read_first_usage(jsonl_path)
+        if birth is None:
+            # Unknown birth: the numerator arrived (statusline) but the
+            # transcript's first assistant event is not flushed yet (the
+            # measured flush race). Marking now would bypass the guard —
+            # defer; the next turn-end signal retries with the event
+            # present. (Observed: a successor rolled over through this
+            # window — 3 conversations from one /handoff.)
+            # 태생 미상 — 분자 (statusline) 는 왔는데 transcript 의 첫
+            # assistant 이벤트가 아직 flush 전 (실측된 flush 레이스).
+            # 지금 마킹하면 가드가 우회된다 — 미룬다. 다음 턴 종료 신호가
+            # 이벤트가 실린 뒤 재시도한다. (실관측: 이 창으로 후계가
+            # 롤오버돼 /handoff 1회에 대화 3개.)
+            return
+        if birth >= usage.trigger_tokens:
+            self._rollover_suppressed_conv_id = conv_id
+            debug_log.log(
+                "ROLLOVER_SUPPRESSED",
+                "WRAPPER",
+                {
+                    "reason": "birth_exceeds_trigger",
+                    "birth_tokens": birth,
+                    "trigger_tokens": usage.trigger_tokens,
+                },
+                conv_id=conv_id,
+                session=self._current_session_name,
+            )
+            return
         self._rollover_pending_conv_id = conv_id
         if usage.window_tokens:
             self._rollover_pending_pct = round(
@@ -1516,7 +1599,14 @@ class SessionManagerWrapper:
             return
         if state is not None:
             return  # requested — the dedicated turn has not spawned yet
-        if self._rollover_ready is not None or self._pending_respawn is not None:
+        if self._rollover_ready is not None:
+            # Ready but the swap could not register earlier (another
+            # transition was in flight) — retry the swap leg.
+            # ready 인데 교체 등록이 밀렸다 (다른 전환 진행 중) — 교체
+            # 단계 재시도.
+            self._start_rollover_swap()
+            return
+        if self._rollover_swap_state is not None or self._pending_respawn is not None:
             return
         conv_id = self._rollover_pending_conv_id
         if conv_id is None:
@@ -1616,6 +1706,7 @@ class SessionManagerWrapper:
             self._notify_user(
                 f"⚠ Handoff 준비 완료 — {path.relative_to(project)}"
             )
+            self._start_rollover_swap()
             return
         if state["attempts"] < 2:
             debug_log.log(
@@ -1653,6 +1744,159 @@ class SessionManagerWrapper:
         self._notify_user(
             f"⚠ Handoff 준비 완료 (발췌 폴백) — {path.relative_to(project)}"
         )
+        self._start_rollover_swap()
+
+    def _start_rollover_swap(self) -> None:
+        """Consume the ready handoff: swap to a NEW conversation (R4-C4).
+
+        ready handoff 를 소비해 새 conversation 으로 교체한다 (R4-C4).
+
+        Same respawn path as every transition; ``resume_conv=None`` boots
+        the successor. Atomicity (§5.4-g): nothing about the predecessor
+        is touched here — linking, precedent clearing and the summary
+        refresh all wait for the successor to be OBSERVED (finalize), so
+        a failure in between leaves the predecessor fully active.
+
+        모든 전환과 같은 respawn 경로. ``resume_conv=None`` 이 후계를
+        부팅한다. 원자성 (§5.4-g): 여기서는 선대를 일절 건드리지 않는다 —
+        link·판례 소멸·요약 갱신 전부 후계가 **관찰된** 뒤 (finalize) 로
+        미루므로, 중간 실패 시 선대는 온전히 활성으로 남는다.
+        """
+        ready = self._rollover_ready
+        if ready is None or self._pending_respawn is not None:
+            return
+        project = Path(self.project_path)
+        handoff, prompt = rollover.successor_injection(
+            project, ready["session"], ready["n"]
+        )
+        self._rollover_ready = None
+        self._rollover_swap_state = {
+            "session": ready["session"],
+            "n": ready["n"],
+            "path": ready["path"],
+            "predecessor_conv": ready["conv_id"],
+        }
+        self._notify_user("⚠ 롤오버 — 새 대화로 이어갑니다")
+        self._execute_transition(
+            target=ready["session"],
+            resume_conv=None,
+            handoff=handoff,
+            user_prompt=prompt,
+            is_rollover_swap=True,
+        )
+
+    def _poll_rollover_finalize(self) -> None:
+        """Finalize the rollover once the successor conversation appears.
+
+        후계 conversation 이 나타나면 롤오버를 마무리한다.
+
+        Entry confirmation = a new active conversation id (the successor
+        writes its transcript on its trigger turn). Deterministic
+        bookkeeping, not delegated to the LLM: link the successor to the
+        SAME session, clear the session's precedents (invalidation event
+        ③ — the rollover changes the session's topical make-up), refresh
+        the summary from the new conversation, and drop every rollover
+        mark so detection restarts cleanly for the successor.
+
+        진입 확인 = 새 활성 conversation id (후계는 트리거 턴에서
+        transcript 를 쓴다). LLM 에 맡기지 않는 결정적 부기 — 후계를
+        **같은** 세션에 link, 세션 판례 소멸 (무효화 이벤트 ③ — 롤오버는
+        세션의 주제 구성을 바꾼다), 새 conversation 기준 요약 갱신, 롤오버
+        마킹 전부 해제 (후계에 대한 감지가 깨끗이 재시작).
+        """
+        state = self._rollover_swap_state
+        if state is None:
+            return
+        project = Path(self.project_path)
+        conv_id = get_active_conversation_id(project)
+        if conv_id is None or conv_id == state["predecessor_conv"]:
+            return
+        try:
+            # Link the predecessor too: the lineage (§1.4) must not
+            # depend on the LLM having called an MCP tool in the old
+            # conversation (observed missing in e2e). Idempotent —
+            # chronological order predecessor → successor.
+            # 선대도 link 한다 — 계보 (§1.4) 가 옛 대화에서의 MCP 도구
+            # 호출 여부에 의존하면 안 된다 (e2e 에서 누락 실관측). 멱등,
+            # 시간순 선대 → 후계.
+            SessionStore(project).mutate_session_by_name(
+                state["session"],
+                lambda s: (
+                    s.link_conversation(state["predecessor_conv"]),
+                    s.link_conversation(conv_id),
+                    s.clear_precedents(),
+                ),
+            )
+        except Exception as exc:
+            # Linking is retried on the next tick only if the state is
+            # kept; a persistent storage failure must not loop forever —
+            # log and finish (the MCP's own conversation tracking links
+            # the successor on its next tool call as a backstop).
+            # link 실패를 영구 재시도하면 안 된다 — 로그 후 마무리 (MCP 의
+            # 자체 conversation 추적이 다음 도구 호출에서 후계를 link 하는
+            # 백스톱이 있다).
+            debug_log.log(
+                "ROLLOVER_COMPLETE",
+                "WRAPPER",
+                {"result": "link_failed", "error": str(exc)},
+                conv_id=conv_id,
+                session=state["session"],
+            )
+        self._enqueue_active_summary()
+        self._rollover_swap_state = None
+        self._rollover_pending_conv_id = None
+        self._rollover_pending_pct = None
+        debug_log.log(
+            "ROLLOVER_COMPLETE",
+            "WRAPPER",
+            {
+                "predecessor_conv": state["predecessor_conv"],
+                "successor_conv": conv_id,
+                "handoff_path": state["path"],
+                "n": state["n"],
+            },
+            conv_id=conv_id,
+            session=state["session"],
+        )
+
+    def _handle_handoff_command(self) -> None:
+        """Manual rollover: /handoff marks the active conversation now.
+
+        수동 롤오버 — /handoff 가 활성 conversation 을 즉시 마킹한다.
+
+        Same flow as the threshold trigger (R4-C1) from the mark onward;
+        the only difference is who decided. Refused with a notice while
+        another rollover step or transition is in flight.
+
+        마킹 이후는 임계 트리거 (R4-C1) 와 동일 흐름 — 다른 점은 결정
+        주체뿐. 다른 롤오버 단계·전환이 진행 중이면 안내 후 거절한다.
+        """
+        try:
+            os.write(self.pty_fd, ERASE_INPUT_LINE)
+        except OSError:
+            pass
+        if (
+            self._rollover_request_state is not None
+            or self._rollover_swap_state is not None
+            or self._rollover_ready is not None
+            or self._pending_respawn is not None
+        ):
+            self._notify_user("롤오버가 이미 진행 중입니다")
+            return
+        conv_id = get_active_conversation_id(Path(self.project_path))
+        if conv_id is None or self._current_session_name is None:
+            self._notify_user("롤오버할 활성 대화가 없습니다")
+            return
+        self._rollover_pending_conv_id = conv_id
+        self._rollover_pending_pct = None
+        debug_log.log(
+            "ROLLOVER_PENDING",
+            "WRAPPER",
+            {"trigger": "manual_handoff_command"},
+            conv_id=conv_id,
+            session=self._current_session_name,
+        )
+        self._advance_rollover()
 
     def _enqueue_stale_summaries(self) -> None:
         """Boot-time recovery: queue sessions whose summary refresh was lost.
@@ -1940,6 +2184,7 @@ class SessionManagerWrapper:
         user_prompt: str,
         is_back: bool = False,
         is_rollover_request: bool = False,
+        is_rollover_swap: bool = False,
     ) -> None:
         """Register a transition: pending file + child swap request.
 
@@ -1977,7 +2222,11 @@ class SessionManagerWrapper:
         # 요약을 큐에 넣고, 래퍼 측 현재 세션 미러를 target 으로 이동.
         # 롤오버 handoff 요청은 떠나는 것이 없으므로 (같은 세션·같은
         # conversation) 요약을 큐에 넣지 않는다.
-        if not is_rollover_request:
+        if not (is_rollover_request or is_rollover_swap):
+            # A rollover swap departs its own predecessor — its summary
+            # refresh happens at finalize from the successor instead.
+            # 롤오버 교체는 자기 선대를 떠난다 — 요약 갱신은 finalize 가
+            # 후계 기준으로 수행한다.
             self._enqueue_departed_summary(from_name)
         self._current_session_name = target
         handoff_clean = {k: v for k, v in handoff.items() if k != "user_prompt"}
@@ -1991,6 +2240,7 @@ class SessionManagerWrapper:
             user_prompt=user_prompt,
             is_back=is_back,
             is_rollover_request=is_rollover_request,
+            is_rollover_swap=is_rollover_swap,
         )
         debug_log.log(
             "TRANSITION",

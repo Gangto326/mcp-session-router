@@ -57,6 +57,13 @@ _COMMAND_RE = re.compile(
 # 인자는 허용하지 않는다: "/back x" 는 undo 요청이 아니므로 TUI 로 흘려보낸다.
 _BACK_COMMAND_RE = re.compile(r"^/back\s*$")
 
+# /handoff (R4-C4): manual rollover before the threshold — same
+# wrapper-native contract as /back (intercept, never forward, no
+# arguments).
+# /handoff (R4-C4): 임계 전 수동 롤오버 — /back 과 같은 래퍼 자체 명령
+# 계약 (가로채고 forward 하지 않으며 인자 불허).
+_HANDOFF_COMMAND_RE = re.compile(r"^/handoff\s*$")
+
 # Heuristic: strip Ink-style placeholder hints like
 # ``[conversation id or search term]`` that may follow the user's input.
 # False-positive risk if a user genuinely types ``[...]`` as the argument —
@@ -150,5 +157,23 @@ def match_back_command(prompt_text: str | None) -> bool:
             "CMD_MATCH",
             "USER",
             {"matched": True, "command": "back", "prompt": prompt_text},
+        )
+    return matched
+
+
+def match_handoff_command(prompt_text: str | None) -> bool:
+    """Return True if ``prompt_text`` is the wrapper-native ``/handoff``.
+
+    ``prompt_text`` 가 래퍼 자체 명령 ``/handoff`` 이면 True.
+    """
+    if not prompt_text or not prompt_text.strip():
+        return False
+    cleaned = _PLACEHOLDER_RE.sub("", prompt_text)
+    matched = _HANDOFF_COMMAND_RE.match(cleaned) is not None
+    if matched:
+        debug_log.log(
+            "CMD_MATCH",
+            "USER",
+            {"matched": True, "command": "handoff", "prompt": prompt_text},
         )
     return matched

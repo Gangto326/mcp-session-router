@@ -159,6 +159,56 @@ def read_tail_usage_and_model(
     return usage, model
 
 
+def read_first_usage(jsonl_path: Path) -> int | None:
+    """Birth footprint: the FIRST assistant event's usage sum.
+
+    태생 점유량 — 첫 assistant 이벤트의 usage 합.
+
+    A conversation can never shrink below what its very first turn
+    already occupied (system prompt, tools, guide). If that birth
+    footprint meets the rollover trigger, rolling over cannot improve
+    anything — the successor would be born equally full and the wrapper
+    would roll over forever (observed with an aggressively low
+    ``context_budget_tokens`` — R4-C4 e2e, 4 rollovers in one run).
+    Head-scan stops at the first hit; None when no assistant event.
+
+    대화는 첫 턴이 이미 점유한 양 (시스템 프롬프트·도구·가이드) 아래로
+    줄어들 수 없다. 태생 점유가 롤오버 트리거 이상이면 롤오버는 아무것도
+    개선하지 못한다 — 후계도 똑같이 찬 채 태어나 래퍼가 영원히 롤오버를
+    반복한다 (공격적으로 낮춘 ``context_budget_tokens`` 로 실관측 —
+    R4-C4 e2e, 1회 실행에 롤오버 4번). 머리부터 첫 히트에서 중단. 없으면
+    None.
+    """
+    try:
+        with jsonl_path.open(encoding="utf-8") as fp:
+            for raw in fp:
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                if (
+                    not isinstance(event, dict)
+                    or event.get("type") != "assistant"
+                ):
+                    continue
+                message = event.get("message")
+                if not isinstance(message, dict):
+                    continue
+                usage = message.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                total = sum(
+                    v
+                    for f in USAGE_FIELDS
+                    if isinstance((v := usage.get(f)), int)
+                )
+                if total > 0:
+                    return total
+    except OSError:
+        return None
+    return None
+
+
 def _load_rollover_config(project_path: Path) -> tuple[int, int, int | None]:
     """(threshold_pct, cap_tokens, budget_override) from raw config.json.
 
