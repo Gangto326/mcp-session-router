@@ -1512,6 +1512,27 @@ class SessionManagerWrapper:
             self._notify_user(
                 f"⇄ {target} 세션으로 전환됨 (이전: {origin}) — 되돌리려면 /back"
             )
+        elif action == "rollover_signal":
+            # PreCompact hook (R4-C2): auto-compact was blocked in this
+            # conversation — mark the rollover pending immediately. A
+            # second trigger converging with the R4-C1 threshold check;
+            # acting on the mark is R4-C3/C4.
+            # PreCompact hook (R4-C2): 이 conversation 의 auto-compact 가
+            # 차단됐다 — 즉시 롤오버 pending 마킹. R4-C1 임계 검사와
+            # 합류하는 제2 트리거이며, 마킹에 대한 행동은 R4-C3/C4.
+            conv_id = message.get("conversation_id")
+            if not isinstance(conv_id, str) or not conv_id:
+                conv_id = get_active_conversation_id(Path(self.project_path))
+            if conv_id is None or self._rollover_pending_conv_id == conv_id:
+                return
+            self._rollover_pending_conv_id = conv_id
+            debug_log.log(
+                "ROLLOVER_PENDING",
+                "WRAPPER",
+                {"trigger": "pre_compact_hook"},
+                conv_id=conv_id,
+                session=self._current_session_name,
+            )
         elif action == "current_session":
             # MCP resolved or changed the current session. The wrapper has
             # no other way to learn it — the handshake only flows
