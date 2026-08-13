@@ -1963,6 +1963,133 @@ class TestHandleHandoffCommand:
         assert any("활성 대화가 없습니다" in n for n in notes)
 
 
+class TestHandleTurnEndSignal:
+    """Stop-hook turn-end signal consumption (primary path).
+
+    Stop hook 턴 종료 신호 소비 (주 경로).
+    """
+
+    def _battery(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> list[str]:
+        ran: list[str] = []
+        for name in (
+            "_check_summary_refresh",
+            "_check_context_usage",
+            "_advance_rollover",
+        ):
+            monkeypatch.setattr(
+                wrapper, name, lambda n=name: ran.append(n)
+            )
+        return ran
+
+    def test_ordinary_signal_runs_battery_and_mirrors(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ran = self._battery(wrapper, monkeypatch)
+        wrapper._handle_mcp_signal(
+            {"action": "turn_end", "conversation_id": "conv-1"}
+        )
+        assert wrapper._active_conv_from_hook == "conv-1"
+        assert len(ran) == 3
+
+    def test_turn_duration_mark_is_consumed(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._battery(wrapper, monkeypatch)
+        wrapper._last_submit_monotonic = 0.0  # 아득한 과거 / distant past
+        wrapper._handle_mcp_signal(
+            {"action": "turn_end", "conversation_id": "conv-1"}
+        )
+        assert wrapper._last_submit_monotonic is None
+
+    def test_writing_phase_concludes_from_payload_text(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ran = self._battery(wrapper, monkeypatch)
+        concluded: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            wrapper,
+            "_conclude_handoff_attempt",
+            lambda _s, status, text: concluded.append((status, text)),
+        )
+        wrapper._rollover_request_state = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "conv-1",
+            "attempts": 1,
+            "phase": "writing",
+        }
+        wrapper._handle_mcp_signal(
+            {
+                "action": "turn_end",
+                "conversation_id": "conv-1",
+                "last_assistant_message": "# Handoff 본문",
+            }
+        )
+        assert concluded == [("answered", "# Handoff 본문")]
+        assert ran == []  # battery 미실행 — 배타 분기 / exclusive branch
+
+    def test_writing_phase_empty_reply_is_missing(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._battery(wrapper, monkeypatch)
+        concluded: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            wrapper,
+            "_conclude_handoff_attempt",
+            lambda _s, status, text: concluded.append((status, text)),
+        )
+        wrapper._rollover_request_state = {
+            "session": "backend",
+            "n": 1,
+            "conv_id": "conv-1",
+            "attempts": 1,
+            "phase": "writing",
+        }
+        wrapper._handle_mcp_signal(
+            {
+                "action": "turn_end",
+                "conversation_id": "conv-1",
+                "last_assistant_message": "   ",
+            }
+        )
+        assert concluded == [("missing", "   ")]
+
+    def test_swap_phase_routes_successor_to_finalize(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ran = self._battery(wrapper, monkeypatch)
+        finalized: list[str] = []
+        monkeypatch.setattr(wrapper, "_finalize_rollover", finalized.append)
+        wrapper._rollover_swap_state = {
+            "session": "backend",
+            "n": 1,
+            "path": "/x",
+            "predecessor_conv": "conv-old",
+        }
+        # Successor's first turn → finalize. / 후계 첫 턴 → finalize.
+        wrapper._handle_mcp_signal(
+            {"action": "turn_end", "conversation_id": "conv-new"}
+        )
+        assert finalized == ["conv-new"]
+        # Predecessor's stale signal → neither finalize nor battery.
+        # 선대의 잔존 신호 → finalize 도 battery 도 아님.
+        wrapper._handle_mcp_signal(
+            {"action": "turn_end", "conversation_id": "conv-old"}
+        )
+        assert finalized == ["conv-new"]
+        assert ran == []
+
+    def test_invalid_conversation_is_noop(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ran = self._battery(wrapper, monkeypatch)
+        wrapper._handle_mcp_signal({"action": "turn_end"})
+        assert ran == []
+        assert wrapper._active_conv_from_hook is None
+
+
 class TestRolloverSignal:
     """R4-C2: PreCompact hook's rollover signal dispatch.
 

@@ -78,6 +78,15 @@ class TestRegister:
                 ]
             }
         ]
+        # Stop-hook promotion: the contract turn-end signal joins too.
+        # Stop hook 승격 — 계약 턴 종료 신호도 포함된다.
+        assert settings["hooks"]["Stop"] == [
+            {
+                "hooks": [
+                    {"type": "command", "command": "/opt/bin/ccode-hook-stop"}
+                ]
+            }
+        ]
 
     def test_partial_registration_adds_only_missing(
         self, project: Path, which_found: None
@@ -184,6 +193,18 @@ class TestRegister:
                                     "type": "command",
                                     "command": (
                                         f"/x/{registration.PRE_COMPACT_SCRIPT_NAME}"
+                                    ),
+                                }
+                            ]
+                        }
+                    ],
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        f"/x/{registration.STOP_SCRIPT_NAME}"
                                     ),
                                 }
                             ]
