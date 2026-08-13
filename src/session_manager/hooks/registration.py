@@ -49,6 +49,7 @@ from session_manager.storage.file_store import (
 HOOK_SCRIPT_NAME = "ccode-hook-user-prompt-submit"
 PRE_TOOL_USE_SCRIPT_NAME = "ccode-hook-pre-tool-use"
 PRE_COMPACT_SCRIPT_NAME = "ccode-hook-pre-compact"
+STOP_SCRIPT_NAME = "ccode-hook-stop"
 
 # All hooks ccode manages: (event name, matcher or None, script name).
 # One consent covers the set; a partially-registered project only gets
@@ -60,6 +61,7 @@ MANAGED_HOOKS: tuple[tuple[str, str | None, str], ...] = (
     ("UserPromptSubmit", None, HOOK_SCRIPT_NAME),
     ("PreToolUse", "Read|Bash", PRE_TOOL_USE_SCRIPT_NAME),
     ("PreCompact", None, PRE_COMPACT_SCRIPT_NAME),
+    ("Stop", None, STOP_SCRIPT_NAME),
 )
 
 _SETTINGS_RELPATH = Path(".claude") / "settings.json"

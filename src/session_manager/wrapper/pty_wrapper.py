@@ -31,6 +31,7 @@ import select
 import signal
 import sys
 import termios
+import time
 import tty
 from dataclasses import dataclass
 from datetime import datetime
@@ -369,6 +370,19 @@ class SessionManagerWrapper:
         # 루프 가드로 롤오버가 억제된 conversation (태생 점유 ≥ 트리거 —
         # _check_context_usage 참조). conversation 당 1회만 로그.
         self._rollover_suppressed_conv_id: str | None = None
+
+        # Active conversation id as delivered by the Stop hook (contract
+        # source, F18-safe). Mirror only for now — consumers migrate from
+        # the mtime scan incrementally.
+        # Stop hook 이 전달한 활성 conversation id (계약 소스, F18 안전).
+        # 지금은 미러만 — 소비처는 mtime 스캔에서 점진 전환.
+        self._active_conv_from_hook: str | None = None
+
+        # monotonic time of the last user submit (\r) — turn-duration
+        # measurement's start mark (end mark = the Stop-hook signal).
+        # 마지막 사용자 제출 (\r) 의 monotonic 시각 — 턴 지속시간 계측의
+        # 시작점 (끝점 = Stop hook 신호).
+        self._last_submit_monotonic: float | None = None
 
         # Rollover handoff request in flight (R4-C3). Keys: session, n,
         # conv_id, attempts, phase ("requested" until the dedicated turn
@@ -949,6 +963,76 @@ class SessionManagerWrapper:
             BUSY_SPINNER_ELLIPSIS, BUSY_MARKER_RADIUS_ROWS
         )
 
+    def _handle_turn_end_signal(self, message: dict[str, Any]) -> None:
+        """Consume one Stop-hook turn-end signal (primary path).
+
+        Stop hook 턴 종료 신호 1건을 소비한다 (주 경로).
+
+        Routing by rollover phase / 롤오버 단계별 분기:
+        - handoff turn in flight and the signal is its conversation →
+          conclude the attempt from the payload text (no transcript
+          read — measured: the transcript is not yet flushed at Stop
+          time, but the payload carries the response).
+          handoff 턴 진행 중 + 그 conversation 의 신호 → payload 본문으로
+          시도 판정 (transcript 무읽기 — 실측: Stop 시점에 transcript 는
+          아직 flush 전이지만 payload 에 응답이 실려 있다).
+        - swap in flight and the signal is NOT the predecessor → it is
+          the successor's first turn: finalize directly.
+          교체 진행 중 + 선대가 아닌 신호 → 후계의 첫 턴: 즉시 finalize.
+        - otherwise → the ordinary turn-end battery.
+          그 외 → 일반 턴 종료 검사 일괄.
+        """
+        conv_id = message.get("conversation_id")
+        if not isinstance(conv_id, str) or not conv_id:
+            return
+        # Active-conversation mirror (adoption step 3): hook-delivered id
+        # is authoritative; consumers migrate incrementally (F18).
+        # 활성 대화 미러 (채택 3번): hook 전달 id 가 신뢰 소스. 소비처는
+        # 점진 전환 (F18).
+        self._active_conv_from_hook = conv_id
+
+        # Turn duration: submit (\r) → Stop signal. Measurement source
+        # for R5 --stats and the C3 backstop derivation.
+        # 턴 지속시간 — 제출 (\r) → Stop 신호. R5 --stats 와 C3 백스톱
+        # 도출의 계측 원천.
+        duration_ms: int | None = None
+        if self._last_submit_monotonic is not None:
+            duration_ms = int(
+                (time.monotonic() - self._last_submit_monotonic) * 1000
+            )
+            self._last_submit_monotonic = None
+        debug_log.log(
+            "TURN_END",
+            "WRAPPER",
+            {"source": "stop_hook", "turn_duration_ms": duration_ms},
+            conv_id=conv_id,
+        )
+
+        request_state = self._rollover_request_state
+        if (
+            request_state is not None
+            and request_state.get("phase") == "writing"
+            and request_state.get("conv_id") == conv_id
+        ):
+            text_val = message.get("last_assistant_message")
+            text = text_val if isinstance(text_val, str) else ""
+            # An empty reply is a settled failure, not "waiting": this
+            # signal IS the dedicated turn's end.
+            # 빈 응답은 "waiting" 이 아니라 확정 실패다 — 이 신호 자체가
+            # 전용 턴의 종료이므로.
+            self._conclude_handoff_attempt(
+                request_state, "answered" if text.strip() else "missing", text
+            )
+            return
+        swap_state = self._rollover_swap_state
+        if swap_state is not None:
+            if conv_id != swap_state["predecessor_conv"]:
+                self._finalize_rollover(conv_id)
+            return
+        self._check_summary_refresh()
+        self._check_context_usage()
+        self._advance_rollover()
+
     def _on_turn_end(self, source: str) -> None:
         """Run the turn-end check battery (summary, context, rollover).
 
@@ -1050,6 +1134,15 @@ class SessionManagerWrapper:
                 # still there.
                 # /clear 는 대화를 지운다 — 아직 남아 있을 때 요약한다.
                 self._enqueue_active_summary()
+
+            # Forwarded \r = a turn submit: start mark for the turn
+            # duration (end mark = the Stop-hook signal). A \r on an
+            # empty input line just moves the mark — harmless for a
+            # measurement-only value.
+            # 전달되는 \r = 턴 제출 — 턴 지속시간의 시작점 (끝점 = Stop
+            # hook 신호). 빈 입력란의 \r 은 시작점만 옮길 뿐이라 계측
+            # 전용 값에는 무해하다.
+            self._last_submit_monotonic = time.monotonic()
 
         # Forward keystrokes to the PTY so Ink can render them in real time.
         # Ink가 실시간으로 렌더링할 수 있도록 키 입력을 PTY로 즉시 전달.
@@ -1682,15 +1775,12 @@ class SessionManagerWrapper:
         직전 대화의 응답으로 시도 2회를 전부 태웠다). "waiting" 은 시도를
         보존하고, 전달·응답 완료 또는 유실만 시도를 소진한다.
         """
-        project = Path(self.project_path)
-        session_name = state["session"]
-        conv_id = state["conv_id"]
         jsonl_path = (
             Path.home()
             / ".claude"
             / "projects"
-            / encode_cwd(project)
-            / f"{conv_id}.jsonl"
+            / encode_cwd(Path(self.project_path))
+            / f"{state['conv_id']}.jsonl"
         )
         status, text = rollover.check_trigger_turn(
             jsonl_path,
@@ -1699,6 +1789,26 @@ class SessionManagerWrapper:
         )
         if status == "waiting":
             return
+        self._conclude_handoff_attempt(state, status, text)
+
+    def _conclude_handoff_attempt(
+        self, state: dict[str, Any], status: str, text: str
+    ) -> None:
+        """Shared attempt conclusion: write / retry once / excerpt fallback.
+
+        시도 판정 공용부 — 기록 / 재시도 1회 / 발췌 폴백.
+
+        Called with a settled status ("answered" or "missing") from
+        either delivery path: the Stop-hook signal (primary — the text
+        arrives in the payload) or the transcript anchor (fallback).
+
+        확정 status ("answered"·"missing") 로 두 전달 경로에서 호출된다:
+        Stop hook 신호 (주 — 본문이 payload 로 도착) 또는 transcript
+        앵커 (폴백).
+        """
+        project = Path(self.project_path)
+        session_name = state["session"]
+        conv_id = state["conv_id"]
         if status == "answered" and rollover.validate_handoff_text(text):
             path = rollover.write_handoff(project, session_name, state["n"], text)
             self._rollover_request_state = None
@@ -1727,7 +1837,13 @@ class SessionManagerWrapper:
         # Two failures: excerpt fallback — low quality, but the rollover
         # proceeds (Plan R4-C3).
         # 2회 실패: 발췌 폴백 — 품질은 낮아도 롤오버는 진행 (Plan R4-C3).
-        excerpt = extract_full_text(jsonl_path)
+        excerpt = extract_full_text(
+            Path.home()
+            / ".claude"
+            / "projects"
+            / encode_cwd(project)
+            / f"{conv_id}.jsonl"
+        )
         body = rollover.build_fallback_handoff(
             session_name, state["n"], conv_id, excerpt
         )
@@ -1807,10 +1923,27 @@ class SessionManagerWrapper:
         state = self._rollover_swap_state
         if state is None:
             return
-        project = Path(self.project_path)
-        conv_id = get_active_conversation_id(project)
+        conv_id = get_active_conversation_id(Path(self.project_path))
         if conv_id is None or conv_id == state["predecessor_conv"]:
             return
+        self._finalize_rollover(conv_id)
+
+    def _finalize_rollover(self, conv_id: str) -> None:
+        """Run the finalize bookkeeping for observed successor *conv_id*.
+
+        관찰된 후계 *conv_id* 에 대해 finalize 부기를 수행한다.
+
+        Reached from either entry-confirmation path: the successor's own
+        Stop-hook signal (primary — carries its conversation id) or the
+        mtime-poll fallback above.
+
+        두 진입 확인 경로 어느 쪽에서든 도달한다: 후계 자신의 Stop hook
+        신호 (주 — conversation id 를 실어 옴) 또는 위의 mtime 폴링 폴백.
+        """
+        state = self._rollover_swap_state
+        if state is None or conv_id == state["predecessor_conv"]:
+            return
+        project = Path(self.project_path)
         try:
             # Link the predecessor too: the lineage (§1.4) must not
             # depend on the LLM having called an MCP tool in the old
@@ -2130,6 +2263,14 @@ class SessionManagerWrapper:
             self._notify_user(
                 f"⇄ {target} 세션으로 전환됨 (이전: {origin}) — 되돌리려면 /back"
             )
+        elif action == "turn_end":
+            # Stop hook (contract-based turn end): the PRIMARY turn-end
+            # signal. Screen edges / context.json observation remain as
+            # fallbacks for hook-declined users.
+            # Stop hook (계약 기반 턴 종료) — **주** 턴 종료 신호. 화면
+            # 에지·context.json 관찰은 hook 미동의 사용자용 폴백으로
+            # 유지된다.
+            self._handle_turn_end_signal(message)
         elif action == "rollover_signal":
             # PreCompact hook (R4-C2): auto-compact was blocked in this
             # conversation — mark the rollover pending immediately. A

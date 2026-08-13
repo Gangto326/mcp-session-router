@@ -14,6 +14,7 @@ ccode = "session_manager.wrapper.main:main"
 ccode-hook-user-prompt-submit = "session_manager.hooks.user_prompt_submit:main"
 ccode-hook-pre-tool-use = "session_manager.hooks.pre_tool_use:main"
 ccode-hook-pre-compact = "session_manager.hooks.pre_compact:main"
+ccode-hook-stop = "session_manager.hooks.stop:main"
 ccode-statusline = "session_manager.statusline:main"
 
 [build-system]
