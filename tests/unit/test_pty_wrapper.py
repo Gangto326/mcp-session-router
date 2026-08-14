@@ -545,6 +545,38 @@ class TestSummaryTriggers:
         assert tasks[0].kind == summarizer.KIND_DEPARTED
         assert wrapper._current_session_name == "payments"
 
+    def test_current_session_signal_updates_mirror(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._handle_mcp_signal({"action": "current_session", "name": "backend"})
+        assert wrapper._current_session_name == "backend"
+
+    def test_stale_current_session_ignored_while_transition_pending(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        # R4-C5 e2e finding: right after the switch signal the MCP
+        # notifies its own (pre-redirect) target as current — that must
+        # not clobber the wrapper mirror the redirect just moved.
+        # R4-C5 e2e 발견 — switch 신호 직후 MCP 는 자신의 (재지향 이전)
+        # target 을 current 로 통보한다. 재지향이 방금 옮긴 래퍼 미러를
+        # 덮어써선 안 된다.
+        wrapper._current_session_name = "alpha"
+        wrapper._pending_respawn = _PendingRespawn(
+            target="alpha", resume_conv=None
+        )
+        wrapper._handle_mcp_signal({"action": "current_session", "name": "old-x"})
+        assert wrapper._current_session_name == "alpha"
+
+    def test_matching_current_session_applied_while_transition_pending(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        wrapper._current_session_name = None
+        wrapper._pending_respawn = _PendingRespawn(
+            target="alpha", resume_conv=None
+        )
+        wrapper._handle_mcp_signal({"action": "current_session", "name": "alpha"})
+        assert wrapper._current_session_name == "alpha"
+
     def test_departed_skipped_without_from_session(
         self, wrapper: SessionManagerWrapper
     ) -> None:
@@ -1117,6 +1149,198 @@ class TestExecuteTransition:
         )
         assert wrapper._pending_respawn is not None
         assert wrapper._pending_respawn.target == "a"
+
+
+class TestExecuteTransitionRetiredRecheck:
+    """R4-C5: last-moment retirement re-check before the swap.
+
+    R4-C5: 전환 직전 만료 재확인.
+    """
+
+    def test_retired_target_redirects_to_successor(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # Successor is a live, resumable session; the retired target
+        # points at it. The transition must land on the successor with a
+        # re-resolved resume conversation.
+        # 후계는 살아 있는 resumable 세션이고 만료 대상이 그를 가리킨다.
+        # 전환은 후계에 도착해야 하며 resume conversation 도 재해석된다.
+        _seed_resumable_session(
+            wrapper, monkeypatch, tmp_path / "home", name="heir", conv="conv-h"
+        )
+        retired = SessionMetadata.new(name="old", title="t")
+        retired.retire("manual", successor="heir")
+        SessionStore(Path(wrapper.project_path)).save_session(retired)
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+
+        wrapper._execute_transition(
+            target="old", resume_conv=None, handoff={"from": "x"}, user_prompt="p"
+        )
+
+        pending = wrapper._pending_respawn
+        assert pending is not None
+        assert pending.target == "heir"
+        assert pending.resume_conv == "conv-h"
+        assert wrapper._current_session_name == "heir"
+        stored = handoff_store.take_pending(Path(wrapper.project_path))
+        assert stored is not None
+        assert stored["target"] == "heir"
+        assert any("heir" in n for n in notes)
+
+    def test_retired_target_without_heir_aborts(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        retired = SessionMetadata.new(name="old", title="t")
+        retired.retire("manual")
+        SessionStore(Path(wrapper.project_path)).save_session(retired)
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+
+        wrapper._execute_transition(
+            target="old", resume_conv=None, handoff={}, user_prompt="p"
+        )
+
+        assert wrapper._pending_respawn is None
+        assert handoff_store.take_pending(Path(wrapper.project_path)) is None
+        assert any("중단" in n for n in notes)
+
+    def test_unknown_target_passes_through(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        # NEW creates a session not yet in the store — the re-check must
+        # let it through untouched.
+        # NEW 는 스토어에 아직 없는 세션을 만든다 — 재확인은 건드리지 않고
+        # 통과시켜야 한다.
+        wrapper._execute_transition(
+            target="brand-new", resume_conv=None, handoff={}, user_prompt=""
+        )
+        assert wrapper._pending_respawn is not None
+        assert wrapper._pending_respawn.target == "brand-new"
+
+    def test_active_target_keeps_given_resume_conv(
+        self, wrapper: SessionManagerWrapper
+    ) -> None:
+        SessionStore(Path(wrapper.project_path)).save_session(
+            SessionMetadata.new(name="alive", title="t")
+        )
+        wrapper._execute_transition(
+            target="alive", resume_conv="conv-5", handoff={}, user_prompt=""
+        )
+        assert wrapper._pending_respawn is not None
+        assert wrapper._pending_respawn.resume_conv == "conv-5"
+
+
+class TestHandleRetireCommand:
+    """R4-C5: manual /retire <name>.
+
+    R4-C5: 수동 /retire <name>.
+    """
+
+    def _notes(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> list[str]:
+        wrapper.pty_fd = -1  # ERASE write fails silently / ERASE 쓰기는 조용히 실패
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        return notes
+
+    def test_retires_and_persists(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = SessionStore(Path(wrapper.project_path))
+        store.save_session(SessionMetadata.new(name="backend", title="t"))
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._handle_retire_command("backend")
+        reloaded = store.load_session_by_name("backend")
+        assert reloaded is not None
+        assert reloaded.status.value == "retired"
+        assert reloaded.retired is not None
+        assert reloaded.retired.reason == "manual"
+        assert reloaded.retired.successor is None
+        assert any("만료했습니다" in n for n in notes)
+
+    def test_refuses_current_session(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = SessionStore(Path(wrapper.project_path))
+        store.save_session(SessionMetadata.new(name="here", title="t"))
+        wrapper._current_session_name = "here"
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._handle_retire_command("here")
+        reloaded = store.load_session_by_name("here")
+        assert reloaded is not None
+        assert reloaded.status.value == "active"
+        assert any("만료할 수 없습니다" in n for n in notes)
+
+    def test_unknown_session_notice(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._handle_retire_command("ghost")
+        assert any("찾을 수 없습니다" in n for n in notes)
+
+    def test_already_retired_notice(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = SessionMetadata.new(name="gone", title="t")
+        session.retire("manual")
+        SessionStore(Path(wrapper.project_path)).save_session(session)
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._handle_retire_command("gone")
+        assert any("이미 만료" in n for n in notes)
+
+
+class TestHandleReviveCommand:
+    """R4-C5: manual /revive <name>.
+
+    R4-C5: 수동 /revive <name>.
+    """
+
+    def _notes(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> list[str]:
+        wrapper.pty_fd = -1
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        return notes
+
+    def test_revives_and_persists(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = SessionStore(Path(wrapper.project_path))
+        session = SessionMetadata.new(name="backend", title="t")
+        session.retire("manual")
+        store.save_session(session)
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._handle_revive_command("backend")
+        reloaded = store.load_session_by_name("backend")
+        assert reloaded is not None
+        assert reloaded.status.value == "active"
+        assert reloaded.retired is None
+        assert any("복구했습니다" in n for n in notes)
+
+    def test_unknown_session_notice(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._handle_revive_command("ghost")
+        assert any("찾을 수 없습니다" in n for n in notes)
+
+    def test_not_retired_notice(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        SessionStore(Path(wrapper.project_path)).save_session(
+            SessionMetadata.new(name="alive", title="t")
+        )
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._handle_revive_command("alive")
+        assert any("만료 상태가 아닙니다" in n for n in notes)
 
 
 class TestMaybeTerminateForRespawn:

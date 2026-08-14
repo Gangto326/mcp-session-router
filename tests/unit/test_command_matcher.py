@@ -7,6 +7,8 @@ from session_manager.wrapper.command_matcher import (
     match_back_command,
     match_handoff_command,
     match_intercept_command,
+    match_retire_command,
+    match_revive_command,
 )
 
 
@@ -239,3 +241,50 @@ class TestMatchHandoffCommand:
     def test_none_and_empty(self):
         assert match_handoff_command(None) is False
         assert match_handoff_command("   ") is False
+
+
+class TestMatchRetireCommand:
+    """/retire <name> matching (R4-C5) — wrapper-native, one required arg.
+    /retire <name> 매칭 (R4-C5) — 래퍼 자체 명령, 인자 1개 필수.
+    """
+
+    def test_with_name(self):
+        assert match_retire_command("/retire frontend") == "frontend"
+
+    def test_extra_whitespace(self):
+        assert match_retire_command("/retire   backend-api  ") == "backend-api"
+
+    def test_without_argument_not_matched(self):
+        assert match_retire_command("/retire") is None
+        assert match_retire_command("/retire   ") is None
+
+    def test_multi_word_argument_not_matched(self):
+        assert match_retire_command("/retire a b") is None
+
+    def test_prefix_not_matched(self):
+        assert match_retire_command("/retirement plan") is None
+
+    def test_placeholder_hint_stripped(self):
+        assert match_retire_command("/retire foo [session name]") == "foo"
+
+    def test_none_and_empty(self):
+        assert match_retire_command(None) is None
+        assert match_retire_command("   ") is None
+
+
+class TestMatchReviveCommand:
+    """/revive <name> matching (R4-C5) — same contract as /retire.
+    /revive <name> 매칭 (R4-C5) — /retire 와 같은 계약.
+    """
+
+    def test_with_name(self):
+        assert match_revive_command("/revive frontend") == "frontend"
+
+    def test_without_argument_not_matched(self):
+        assert match_revive_command("/revive") is None
+
+    def test_multi_word_argument_not_matched(self):
+        assert match_revive_command("/revive a b") is None
+
+    def test_prefix_not_matched(self):
+        assert match_revive_command("/revived x") is None

@@ -112,6 +112,30 @@ class TestCheckSession:
         result = check_session(_make_ctx(app))
         assert len(result["sessions"]) == 2
 
+    def test_retired_sessions_are_excluded(self, app: AppContext) -> None:
+        # R4-C5: a retired session leaves the routing candidate set — the
+        # in-session LLM must not be able to propose it.
+        # R4-C5: retired 세션은 라우팅 후보에서 빠진다 — 세션 안의 LLM 이
+        # 그 세션을 제안할 수 없어야 한다.
+        app.session_store.save_session(SessionMetadata.new(name="alive", title="A"))
+        gone = SessionMetadata.new(name="gone", title="G")
+        gone.retire("manual")
+        app.session_store.save_session(gone)
+        result = check_session(_make_ctx(app))
+        names = [s["name"] for s in result["sessions"]]
+        assert names == ["alive"]
+
+    def test_archived_sessions_still_listed(self, app: AppContext) -> None:
+        # Only RETIRED is filtered; ARCHIVED (session_end) keeps its
+        # existing visibility.
+        # 필터 대상은 RETIRED 뿐 — ARCHIVED (session_end) 의 기존 노출은
+        # 유지된다.
+        archived = SessionMetadata.new(name="done", title="D")
+        archived.status = SessionStatus.ARCHIVED
+        app.session_store.save_session(archived)
+        result = check_session(_make_ctx(app))
+        assert [s["name"] for s in result["sessions"]] == ["done"]
+
 
 # -------------------------------------------------------------- session_register
 

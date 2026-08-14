@@ -8,6 +8,7 @@ import uuid
 
 from session_manager.models import (
     PrecedentRecord,
+    RetiredRecord,
     SessionMetadata,
     SessionStatus,
     TransitionRecord,
@@ -203,6 +204,71 @@ class TestSessionMetadataMixing:
         assert restored.mixing_evidence == []
 
 
+class TestSessionMetadataRetirement:
+    """R4-C5 retirement: status, record roundtrip, retire/revive.
+
+    R4-C5 세션 만료 — 상태·기록 라운드트립·retire/revive.
+    """
+
+    def test_new_defaults(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        assert session.status is SessionStatus.ACTIVE
+        assert session.retired is None
+
+    def test_retire_sets_status_and_record(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        session.retire("manual")
+        assert session.status is SessionStatus.RETIRED
+        assert session.retired is not None
+        assert session.retired.reason == "manual"
+        assert session.retired.successor is None
+        assert session.retired.at.endswith("+00:00")
+
+    def test_retire_with_successor(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        session.retire("rolled_over", successor="frontend-2")
+        assert session.retired is not None
+        assert session.retired.successor == "frontend-2"
+
+    def test_retire_with_unknown_reason_falls_back_to_manual(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        session.retire("cosmic-rays")
+        assert session.retired is not None
+        assert session.retired.reason == "manual"
+
+    def test_revive_restores_active_and_clears_record(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        session.retire("manual")
+        session.revive()
+        assert session.status is SessionStatus.ACTIVE
+        assert session.retired is None
+
+    def test_roundtrip_preserves_retirement(self) -> None:
+        original = SessionMetadata.new(name="frontend", title="차트")
+        original.retire("polluted", successor="frontend-clean")
+        restored = _roundtrip(original)
+        assert restored == original
+        assert restored.status is SessionStatus.RETIRED
+
+    def test_active_session_serialises_null_retired(self) -> None:
+        data = SessionMetadata.new(name="frontend", title="차트").to_dict()
+        assert data["retired"] is None
+
+    def test_legacy_file_without_retired_loads_with_default(self) -> None:
+        # A session JSON written before R4-C5 has no retired key.
+        # R4-C5 이전에 작성된 세션 JSON 에는 retired 키가 없다.
+        legacy = SessionMetadata.new(name="old", title="옛 세션").to_dict()
+        del legacy["retired"]
+        restored = SessionMetadata.from_dict(legacy)
+        assert restored.retired is None
+
+    def test_retired_record_from_dict_defends_bad_types(self) -> None:
+        record = RetiredRecord.from_dict({"successor": 42})
+        assert record.reason == "manual"
+        assert record.successor is None
+        assert record.at == ""
+
+
 class TestSessionMetadataTouch:
     def test_touch_updates_last_accessed(self) -> None:
         session = SessionMetadata.new(name="auth-fix", title="인증 수정")
@@ -218,6 +284,7 @@ class TestSessionStatus:
         assert SessionStatus.ACTIVE.value == "active"
         assert SessionStatus.ARCHIVED.value == "archived"
         assert SessionStatus.EXPIRED.value == "expired"
+        assert SessionStatus.RETIRED.value == "retired"
 
     def test_status_str_comparison(self) -> None:
         assert SessionStatus.ACTIVE == "active"

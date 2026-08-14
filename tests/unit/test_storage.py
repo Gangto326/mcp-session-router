@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from session_manager.models import Config, SessionMetadata, StaticField
+from session_manager.models import Config, SessionMetadata, SessionStatus, StaticField
 from session_manager.storage import (
     ConfigStore,
     FieldStore,
@@ -112,6 +112,94 @@ class TestSessionStore:
         store = SessionStore(project_root)
         store.init_project()
         assert (project_root / ".session-manager" / "sessions").is_dir()
+
+
+class TestResolveActiveSuccessor:
+    """R4-C5 successor chain resolution + path compression.
+
+    R4-C5 후계 사슬 해석 + 경로 압축.
+    """
+
+    def _save(
+        self,
+        store: SessionStore,
+        name: str,
+        *,
+        retired_to: str | None = None,
+        retired: bool = False,
+    ) -> SessionMetadata:
+        session = SessionMetadata.new(name=name, title=name)
+        if retired or retired_to is not None:
+            session.retire("manual", successor=retired_to)
+        store.save_session(session)
+        return session
+
+    def test_active_session_resolves_to_itself(self, project_root: Path) -> None:
+        store = SessionStore(project_root)
+        self._save(store, "a")
+        assert store.resolve_active_successor("a") == "a"
+
+    def test_single_hop(self, project_root: Path) -> None:
+        store = SessionStore(project_root)
+        self._save(store, "a", retired_to="b")
+        self._save(store, "b")
+        assert store.resolve_active_successor("a") == "b"
+
+    def test_multi_hop_chain(self, project_root: Path) -> None:
+        store = SessionStore(project_root)
+        self._save(store, "a", retired_to="b")
+        self._save(store, "b", retired_to="c")
+        self._save(store, "c")
+        assert store.resolve_active_successor("a") == "c"
+
+    def test_multi_hop_compresses_traversed_nodes(self, project_root: Path) -> None:
+        store = SessionStore(project_root)
+        self._save(store, "a", retired_to="b")
+        self._save(store, "b", retired_to="c")
+        self._save(store, "c")
+        store.resolve_active_successor("a")
+        # Both traversed retired nodes now point straight at the end.
+        # 경유한 retired 노드 둘 다 이제 끝을 직접 가리킨다.
+        for name in ("a", "b"):
+            reloaded = store.load_session_by_name(name)
+            assert reloaded is not None
+            assert reloaded.status is SessionStatus.RETIRED  # still retired
+            assert reloaded.retired is not None
+            assert reloaded.retired.successor == "c"
+
+    def test_cycle_returns_none(self, project_root: Path) -> None:
+        store = SessionStore(project_root)
+        self._save(store, "a", retired_to="b")
+        self._save(store, "b", retired_to="a")
+        assert store.resolve_active_successor("a") is None
+
+    def test_no_heir_returns_none(self, project_root: Path) -> None:
+        store = SessionStore(project_root)
+        self._save(store, "a", retired=True)
+        assert store.resolve_active_successor("a") is None
+
+    def test_missing_session_returns_none(self, project_root: Path) -> None:
+        store = SessionStore(project_root)
+        assert store.resolve_active_successor("ghost") is None
+
+    def test_chain_to_missing_session_returns_none(self, project_root: Path) -> None:
+        store = SessionStore(project_root)
+        self._save(store, "a", retired_to="gone")
+        assert store.resolve_active_successor("a") is None
+
+    def test_dead_end_does_not_compress(self, project_root: Path) -> None:
+        # A failed resolution must leave the chain untouched — /revive of
+        # the missing link should heal the original topology.
+        # 해석 실패는 사슬을 건드리지 않아야 한다 — 끊긴 고리를 /revive
+        # 하면 원래 위상이 그대로 살아나야 한다.
+        store = SessionStore(project_root)
+        self._save(store, "a", retired_to="b")
+        self._save(store, "b", retired_to="gone")
+        assert store.resolve_active_successor("a") is None
+        reloaded = store.load_session_by_name("a")
+        assert reloaded is not None
+        assert reloaded.retired is not None
+        assert reloaded.retired.successor == "b"
 
 
 class TestFieldStore:
