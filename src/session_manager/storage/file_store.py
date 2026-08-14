@@ -145,6 +145,75 @@ class SessionStore:
             return None
         return self.mutate_session(session.session_id, mutator)
 
+    def resolve_active_successor(self, name: str) -> str | None:
+        """Follow a retired session's successor chain to its living end.
+
+        retired 세션의 successor 사슬을 살아 있는 끝까지 따라간다 (R4-C5).
+
+        A → B → C is followed to the first ACTIVE session; visited names
+        guard against cycles. On success the traversed retired nodes are
+        compressed — their successor is rewritten to the final name
+        (F15-locked mutate) so the next lookup is one hop. Returns None
+        when the chain dead-ends (no successor, missing session, cycle)
+        — the caller aborts the switch with a notice.
+
+        A → B → C 를 첫 ACTIVE 세션까지 따라간다. 방문 집합이 순환을
+        막는다. 성공 시 경유한 retired 노드들의 successor 를 최종 이름
+        으로 압축해 (F15 잠금 mutate) 다음 조회를 1홉으로 만든다. 사슬이
+        막히면 (successor 없음·세션 소실·순환) None — 호출자는 안내 후
+        전환을 중단한다.
+        """
+        from session_manager.models.session import SessionStatus
+
+        visited: list[str] = []
+        current = name
+        while True:
+            if current in visited:
+                debug_log.log(
+                    "SUCCESSOR_RESOLVE",
+                    "WRAPPER",
+                    {"start": name, "result": "cycle", "visited": visited},
+                )
+                return None
+            visited.append(current)
+            session = self.load_session_by_name(current)
+            if session is None:
+                debug_log.log(
+                    "SUCCESSOR_RESOLVE",
+                    "WRAPPER",
+                    {"start": name, "result": "missing", "at": current},
+                )
+                return None
+            if session.status != SessionStatus.RETIRED:
+                final = current
+                break
+            successor = session.retired.successor if session.retired else None
+            if not successor:
+                debug_log.log(
+                    "SUCCESSOR_RESOLVE",
+                    "WRAPPER",
+                    {"start": name, "result": "no_heir", "at": current},
+                )
+                return None
+            current = successor
+        # Path compression — every traversed retired node points to the
+        # living end afterwards.
+        # 경로 압축 — 경유한 retired 노드가 이후 살아 있는 끝을 직접
+        # 가리킨다.
+        for node in visited[:-1]:
+            self.mutate_session_by_name(
+                node,
+                lambda s: setattr(s.retired, "successor", final)
+                if s.retired is not None
+                else None,
+            )
+        debug_log.log(
+            "SUCCESSOR_RESOLVE",
+            "WRAPPER",
+            {"start": name, "result": final, "hops": len(visited) - 1},
+        )
+        return final
+
     def delete_session(self, session_id: str) -> None:
         path = self._sessions_dir / f"{session_id}.json"
         existed = path.exists()

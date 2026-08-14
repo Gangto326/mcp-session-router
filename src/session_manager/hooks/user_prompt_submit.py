@@ -119,16 +119,19 @@ def _count_active_sessions(root: Path) -> int:
     """
     Count sessions whose status is active.
 
-    The ``status`` field does not exist yet (a later phase adds it) —
-    absence counts as active, which keeps this forward- and
-    backward-compatible. Corrupt session files are skipped so one bad
-    file cannot distort the count.
+    Absence of the ``status`` field counts as active (backward compat
+    with pre-status session files). Any other value — archived, expired,
+    and retired (R4-C5) — counts as inactive, so a project whose extra
+    sessions are all retired correctly skips routing. Corrupt session
+    files are skipped so one bad file cannot distort the count.
 
     status가 active인 세션 수를 센다.
 
-    ``status`` 필드는 아직 없다 (후속 Phase에서 추가) — 부재는 active로
-    간주해 상·하위 호환을 유지한다. 손상된 세션 파일은 건너뛰어 파일
-    하나가 집계를 왜곡하지 못하게 한다.
+    ``status`` 필드 부재는 active 로 간주한다 (status 도입 전 세션 파일과
+    의 하위 호환). 그 외 값 — archived·expired·retired (R4-C5) — 은 전부
+    비활성으로 세므로, 나머지 세션이 모두 만료된 프로젝트는 라우팅을
+    올바르게 건너뛴다. 손상된 세션 파일은 건너뛰어 파일 하나가 집계를
+    왜곡하지 못하게 한다.
     """
     sessions_dir = root / _SESSIONS_DIRNAME
     if not sessions_dir.is_dir():

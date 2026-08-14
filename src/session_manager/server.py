@@ -444,6 +444,11 @@ def check_session(ctx: Context) -> dict:
                 "claude_conversation_ids": list(s.claude_conversation_ids),
             }
             for s in sessions
+            # R4-C5: retired sessions leave the routing candidate set —
+            # the wrapper redirects any stray switch to their successor.
+            # R4-C5: retired 세션은 라우팅 후보에서 빠진다 — 흘러든
+            # 전환은 래퍼가 후계로 재지향한다.
+            if s.status != SessionStatus.RETIRED
         ],
     }
     return _log_tool_return("check_session", event_id, app, result)

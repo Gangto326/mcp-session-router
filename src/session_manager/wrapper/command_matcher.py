@@ -64,6 +64,18 @@ _BACK_COMMAND_RE = re.compile(r"^/back\s*$")
 # 계약 (가로채고 forward 하지 않으며 인자 불허).
 _HANDOFF_COMMAND_RE = re.compile(r"^/handoff\s*$")
 
+# /retire <name> / /revive <name> (R4-C5): wrapper-native session
+# retirement toggle — same intercept contract as /back, but these are the
+# first wrapper commands that REQUIRE exactly one argument (the session
+# name). \S+ (no whitespace) matches the session-name charset; a missing
+# or multi-word argument falls through to the TUI as unmatched text.
+# /retire <name> / /revive <name> (R4-C5): 래퍼 자체 세션 만료 토글 —
+# /back 과 같은 가로채기 계약이되, 인자 1개 (세션 이름) 를 **필수**로
+# 받는 첫 래퍼 명령이다. \S+ (공백 불허) 가 세션 이름 문자 집합과 일치;
+# 인자 누락·여러 단어는 매칭 실패로 TUI 에 그대로 흘려보낸다.
+_RETIRE_COMMAND_RE = re.compile(r"^/retire\s+(\S+)\s*$")
+_REVIVE_COMMAND_RE = re.compile(r"^/revive\s+(\S+)\s*$")
+
 # Heuristic: strip Ink-style placeholder hints like
 # ``[conversation id or search term]`` that may follow the user's input.
 # False-positive risk if a user genuinely types ``[...]`` as the argument —
@@ -177,3 +189,42 @@ def match_handoff_command(prompt_text: str | None) -> bool:
             {"matched": True, "command": "handoff", "prompt": prompt_text},
         )
     return matched
+
+
+def _match_one_arg_command(
+    prompt_text: str | None, pattern: re.Pattern[str], command: str
+) -> str | None:
+    """Shared matcher for wrapper commands taking one argument (R4-C5).
+
+    인자 1개짜리 래퍼 명령의 공용 매처 (R4-C5). 매칭되면 인자 (세션
+    이름) 를, 아니면 None 을 반환한다.
+    """
+    if not prompt_text or not prompt_text.strip():
+        return None
+    cleaned = _PLACEHOLDER_RE.sub("", prompt_text)
+    match = pattern.match(cleaned)
+    if match is None:
+        return None
+    arg = match.group(1)
+    debug_log.log(
+        "CMD_MATCH",
+        "USER",
+        {"matched": True, "command": command, "args": arg, "prompt": prompt_text},
+    )
+    return arg
+
+
+def match_retire_command(prompt_text: str | None) -> str | None:
+    """Return the session name if ``prompt_text`` is ``/retire <name>``.
+
+    ``prompt_text`` 가 ``/retire <name>`` 이면 세션 이름을 반환한다.
+    """
+    return _match_one_arg_command(prompt_text, _RETIRE_COMMAND_RE, "retire")
+
+
+def match_revive_command(prompt_text: str | None) -> str | None:
+    """Return the session name if ``prompt_text`` is ``/revive <name>``.
+
+    ``prompt_text`` 가 ``/revive <name>`` 이면 세션 이름을 반환한다.
+    """
+    return _match_one_arg_command(prompt_text, _REVIVE_COMMAND_RE, "revive")

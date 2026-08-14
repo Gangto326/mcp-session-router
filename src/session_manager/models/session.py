@@ -19,6 +19,50 @@ class SessionStatus(StrEnum):
     ACTIVE = "active"
     ARCHIVED = "archived"
     EXPIRED = "expired"
+    # R4-C5: excluded from routing candidates (check_session, judge
+    # input). Entered only by explicit /retire or the C7 split path —
+    # never by time or inactivity (§5.2: a dormant session must stay
+    # routable). Reversed by /revive.
+    # R4-C5: 라우팅 후보 (check_session·판정 입력) 에서 제외되는 상태.
+    # 명시적 /retire 또는 C7 분리 경로로만 진입 — 시간·미접근으로는
+    # 절대 진입하지 않는다 (§5.2: 휴면 세션은 라우팅 가능해야 함).
+    # /revive 로 복구.
+    RETIRED = "retired"
+
+
+# Valid reasons for retirement (§1.4). "rolled_over" is reserved for the
+# C7 split path — the C4 rollover model keeps the SAME session, so a
+# rollover itself never retires one (approved design call, Plan §0.5).
+# 만료 사유 어휘 (§1.4). "rolled_over" 는 C7 분리 경로 예약 — C4 롤오버
+# 모델은 같은 세션을 유지하므로 롤오버 자체는 세션을 만료시키지 않는다
+# (승인된 설계 판단, Plan §0.5).
+RETIRE_REASONS = ("rolled_over", "polluted", "abandoned", "manual")
+
+
+@dataclass
+class RetiredRecord:
+    """Why and where-to of a retired session. / 만료 사유와 후계."""
+
+    reason: str
+    successor: str | None
+    at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "successor": self.successor,
+            "at": self.at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RetiredRecord:
+        return cls(
+            reason=str(data.get("reason", "manual")),
+            successor=data.get("successor")
+            if isinstance(data.get("successor"), str)
+            else None,
+            at=str(data.get("at", "")),
+        )
 
 
 @dataclass
@@ -183,6 +227,13 @@ class SessionMetadata:
     # rooted=true 정착 확인의 근거 인용 누적 목록. 원값 곁에 판정자에게
     # 표기된다.
     mixing_evidence: list[str] = field(default_factory=list)
+    # Retirement record (R4-C5): present iff status == RETIRED. The
+    # successor (a session NAME) is where a switch aimed at this session
+    # gets redirected; None means "no heir — abort the switch".
+    # 만료 기록 (R4-C5): status == RETIRED 일 때만 존재. successor (세션
+    # **이름**) 는 이 세션으로 향한 전환의 재지향 목적지 — None 이면
+    # "후계 없음, 전환 중단".
+    retired: RetiredRecord | None = None
 
     @classmethod
     def new(cls, name: str, title: str, summary: str | None = None) -> SessionMetadata:
@@ -213,6 +264,7 @@ class SessionMetadata:
             "summary_dialogue_chars": self.summary_dialogue_chars,
             "summary_dialogue_conversation_id": self.summary_dialogue_conversation_id,
             "precedents": [p.to_dict() for p in self.precedents],
+            "retired": self.retired.to_dict() if self.retired else None,
             "mixing_score": self.mixing_score,
             "mixing_evidence": list(self.mixing_evidence),
         }
@@ -254,10 +306,39 @@ class SessionMetadata:
             # R3-C2 혼합도 필드의 하위 호환 기본값.
             mixing_score=data.get("mixing_score", 0),
             mixing_evidence=list(data.get("mixing_evidence", [])),
+            # Backward-compat default for the R4-C5 retirement record.
+            # R4-C5 만료 기록의 하위 호환 기본값.
+            retired=RetiredRecord.from_dict(data["retired"])
+            if isinstance(data.get("retired"), dict)
+            else None,
         )
 
     def touch(self) -> None:
         self.last_accessed = _utc_now_iso()
+
+    def retire(self, reason: str, successor: str | None = None) -> None:
+        """Retire this session (R4-C5) — explicit /retire or C7 only.
+
+        세션을 만료시킨다 (R4-C5) — 명시적 /retire 또는 C7 경로 전용.
+        """
+        self.status = SessionStatus.RETIRED
+        self.retired = RetiredRecord(
+            reason=reason if reason in RETIRE_REASONS else "manual",
+            successor=successor,
+            at=_utc_now_iso(),
+        )
+        debug_log.log(
+            "SESSION_RETIRE",
+            "WRAPPER",
+            {"reason": self.retired.reason, "successor": successor},
+            session=self.name,
+        )
+
+    def revive(self) -> None:
+        """Undo a retirement — the session routes again. / 만료 복구."""
+        self.status = SessionStatus.ACTIVE
+        self.retired = None
+        debug_log.log("SESSION_REVIVE", "WRAPPER", {}, session=self.name)
 
     def link_conversation(self, conv_id: str) -> None:
         """Associate a Claude Code conversation id with this session (idempotent).
