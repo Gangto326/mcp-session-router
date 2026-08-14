@@ -298,6 +298,100 @@ class TestSessionSwitch:
         assert [p.rejected for p in stored.precedents] == ["infra"]
 
 
+class TestSessionSwitchRetiredPreResolution:
+    """Retirement pre-resolution in session_switch (R4-C6 prep).
+
+    session_switch 의 만료 선해석 (R4-C6 선행 수정).
+
+    A retired target is resolved to its living successor before any
+    bookkeeping, so the transition record, calibration label, wrapper
+    signal and links all name the real destination. Without this the
+    wrapper redirected alone and the links landed on the retired
+    session (observed in the C5 e2e).
+
+    만료된 target 은 어떤 부기보다 먼저 후계로 해석된다 — 전환 기록·
+    보정 라벨·래퍼 신호·링크가 전부 실제 목적지를 가리키도록. 이 단계가
+    없으면 래퍼만 재지향해 링크가 만료 세션에 남는다 (C5 e2e 실관측).
+    """
+
+    def test_retired_target_resolves_to_successor(self, app: AppContext) -> None:
+        app.session_store.save_session(
+            SessionMetadata.new(name="src", title="Source")
+        )
+        app.state.set_current_session("src")
+        app.session_store.save_session(SessionMetadata.new(name="heir", title="H"))
+        gone = SessionMetadata.new(name="gone", title="G")
+        gone.retire("manual", successor="heir")
+        app.session_store.save_session(gone)
+
+        result = session_switch(
+            target="gone",
+            summary="moving",
+            user_prompt="go",
+            ctx=_make_ctx(app),
+        )
+
+        assert result["switched_to"] == "heir"
+        assert app.state.get_current_session() == "heir"
+        assert _signals(app, "switch")[0]["target"] == "heir"
+        src = app.session_store.load_session_by_name("src")
+        assert src is not None
+        assert src.transitions[0].to_session == "heir"
+        events = decision_log.load_events(app.project_path)
+        assert [e["target"] for e in events if e["type"] == "label"] == ["heir"]
+
+    def test_retired_chain_resolves_to_living_end(self, app: AppContext) -> None:
+        app.state.set_current_session(None)
+        first = SessionMetadata.new(name="first", title="1")
+        first.retire("manual", successor="second")
+        app.session_store.save_session(first)
+        second = SessionMetadata.new(name="second", title="2")
+        second.retire("manual", successor="third")
+        app.session_store.save_session(second)
+        app.session_store.save_session(SessionMetadata.new(name="third", title="3"))
+
+        result = session_switch(
+            target="first",
+            summary="",
+            user_prompt="go",
+            ctx=_make_ctx(app),
+        )
+
+        assert result["switched_to"] == "third"
+        assert _signals(app, "switch")[0]["target"] == "third"
+
+    def test_dead_end_refuses_without_bookkeeping(self, app: AppContext) -> None:
+        # The wrapper would abort the swap anyway, but by then the
+        # outgoing summary, label and links would already be written —
+        # so the tool must refuse before touching any state.
+        # 래퍼도 교체를 중단하겠지만 그때는 요약·라벨·링크가 이미 기록된
+        # 뒤다 — 도구가 상태를 건드리기 전에 거절해야 한다.
+        app.session_store.save_session(
+            SessionMetadata.new(name="src", title="Source")
+        )
+        app.state.set_current_session("src")
+        gone = SessionMetadata.new(name="gone", title="G")
+        gone.retire("manual")
+        app.session_store.save_session(gone)
+
+        result = session_switch(
+            target="gone",
+            summary="should not be written",
+            user_prompt="go",
+            ctx=_make_ctx(app),
+        )
+
+        assert result["ok"] is False
+        assert result["error"] == "target_retired_no_successor"
+        assert app.state.get_current_session() == "src"
+        assert _signals(app, "switch") == []
+        src = app.session_store.load_session_by_name("src")
+        assert src is not None
+        assert src.summary is None
+        assert src.transitions == []
+        assert decision_log.load_events(app.project_path) == []
+
+
 # --------------------------------------------------------------- session_create
 
 
