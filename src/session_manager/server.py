@@ -529,6 +529,45 @@ def session_switch(
     )
     current_name = app.state.get_current_session()
 
+    # Retirement pre-resolution (R4-C6 prep): resolve a retired target to
+    # its living successor HERE, before any bookkeeping, so the transition
+    # record, calibration label, wrapper signal and conversation links all
+    # name the real destination. Without this the wrapper redirected alone
+    # and the links below landed on the retired session (observed in the
+    # C5 e2e). The wrapper's own re-check right before the swap stays as
+    # the race backstop.
+    # 만료 선해석 (R4-C6 선행 수정): 만료된 target 을 어떤 부기보다 먼저
+    # 살아 있는 후계로 해석한다 — 전환 기록·보정 라벨·래퍼 신호·대화
+    # 링크가 전부 실제 목적지를 가리키도록. 이 단계가 없으면 래퍼만
+    # 재지향해 아래 링크들이 만료 세션에 남는다 (C5 e2e 실관측). 래퍼의
+    # 전환 직전 재확인은 race 백스톱으로 유지된다.
+    try:
+        target_session = app.session_store.load_session_by_name(target)
+    except Exception:
+        target_session = None
+    if target_session is not None and target_session.status == SessionStatus.RETIRED:
+        try:
+            successor = app.session_store.resolve_active_successor(target)
+        except Exception:
+            successor = None
+        if successor is None:
+            # Dead-ended chain: refuse before touching any state — the
+            # wrapper would abort the swap anyway, but by then the
+            # outgoing summary, label and links would already be written.
+            # 사슬이 막히면 상태를 건드리기 전에 거절한다 — 래퍼도 교체를
+            # 중단하겠지만, 그때는 이미 요약·라벨·링크가 기록된 뒤다.
+            return _log_tool_return(
+                "session_switch",
+                event_id,
+                app,
+                {
+                    "ok": False,
+                    "error": "target_retired_no_successor",
+                    "target": target,
+                },
+            )
+        target = successor
+
     # Compute active conversation once — used for both outgoing-session
     # link and target-session link below.
     # 활성 conversation 을 한 번만 계산해 outgoing/target 세션 양쪽에 연결한다.
