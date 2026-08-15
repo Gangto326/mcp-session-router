@@ -62,6 +62,62 @@ class TestStaleClear:
         assert handoff_store.clear_stale_pending(tmp_path) is False
 
 
+def _notice_path(project: Path) -> Path:
+    return project / ".session-manager" / "handoffs" / "notice-pending.json"
+
+
+class TestNotice:
+    """R4-C6 B: the one-shot notice file (wrapper → next ordinary prompt).
+
+    R4-C6 B: 1회용 notice 파일 (래퍼 → 다음 일반 프롬프트).
+    """
+
+    def test_roundtrip(self, tmp_path: Path) -> None:
+        handoff_store.write_notice(
+            tmp_path,
+            {
+                "type": "stale_conversation",
+                "session": "alpha",
+                "conv_id": "c-old",
+                "latest_conv": "c-new",
+            },
+        )
+        data = handoff_store.take_notice(tmp_path)
+        assert data is not None
+        assert data["type"] == "stale_conversation"
+        assert data["session"] == "alpha"
+        assert data["latest_conv"] == "c-new"
+        assert data["at"].endswith("+00:00")
+        assert not _notice_path(tmp_path).exists()
+        assert handoff_store.take_notice(tmp_path) is None
+
+    def test_take_without_file(self, tmp_path: Path) -> None:
+        assert handoff_store.take_notice(tmp_path) is None
+
+    def test_corrupt_file_consumed_and_none(self, tmp_path: Path) -> None:
+        path = _notice_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text("{깨진", encoding="utf-8")
+        assert handoff_store.take_notice(tmp_path) is None
+        assert not path.exists()
+
+    def test_clear_stale_notice(self, tmp_path: Path) -> None:
+        handoff_store.write_notice(tmp_path, {"type": "stale_conversation"})
+        assert handoff_store.clear_stale_notice(tmp_path) is True
+        assert handoff_store.take_notice(tmp_path) is None
+        assert handoff_store.clear_stale_notice(tmp_path) is False
+
+    def test_notice_and_pending_are_independent(self, tmp_path: Path) -> None:
+        # The transition pending and the notice must not consume each
+        # other — they ride different prompts (trigger vs ordinary).
+        # 전환 pending 과 notice 는 서로를 소비하면 안 된다 — 각각 다른
+        # 프롬프트 (트리거 vs 일반) 에 실린다.
+        handoff_store.write_pending(tmp_path, "t", {}, "p")
+        handoff_store.write_notice(tmp_path, {"type": "stale_conversation"})
+        assert handoff_store.take_pending(tmp_path) is not None
+        assert handoff_store.take_notice(tmp_path) is not None
+
+
 class TestTrigger:
     def test_trigger_is_fixed_and_content_free(self) -> None:
         # argv is ps-visible: the trigger must never carry user content.

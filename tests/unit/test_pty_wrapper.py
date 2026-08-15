@@ -1839,6 +1839,269 @@ class TestEntryRolloverCheck:
         assert notes == []
 
 
+class TestStaleConvEntry:
+    """R4-C6 B: stale-conversation entry detection at turn end.
+
+    R4-C6 B: 턴 종료 시 만료 대화 진입 감지.
+
+    Judgement, not a guarantee: every ambiguous shape must resolve to
+    silence — a missed warning is acceptable, a false one is not.
+
+    보장이 아닌 판단 — 모호한 형태는 전부 침묵이어야 한다. 경고 누락은
+    허용되고 오경고는 안 된다.
+    """
+
+    def _seed(
+        self, root: Path, sessions: dict[str, list[str]]
+    ) -> None:
+        store = SessionStore(root)
+        for name, convs in sessions.items():
+            meta = SessionMetadata.new(name=name, title=name)
+            meta.claude_conversation_ids = list(convs)
+            store.save_session(meta)
+
+    def _notes(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> list[str]:
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        return notes
+
+    def test_sole_nonlatest_warns_once(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = Path(wrapper.project_path)
+        self._seed(root, {"alpha": ["c-old", "c-new"]})
+        wrapper._current_session_name = "alpha"
+        notes = self._notes(wrapper, monkeypatch)
+
+        wrapper._check_stale_conv_entry("c-old")
+
+        assert len(notes) == 1
+        assert wrapper._stale_notice_conv == "c-old"
+        notice = handoff_store.take_notice(root)
+        assert notice is not None
+        assert notice["type"] == "stale_conversation"
+        assert notice["session"] == "alpha"
+        assert notice["conv_id"] == "c-old"
+        assert notice["latest_conv"] == "c-new"
+        # Debounced: the same conversation never warns twice.
+        # 재경고 억제 — 같은 conversation 은 두 번 경고하지 않는다.
+        wrapper._check_stale_conv_entry("c-old")
+        assert len(notes) == 1
+        assert handoff_store.take_notice(root) is None
+
+    def test_latest_conversation_is_silent(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = Path(wrapper.project_path)
+        self._seed(root, {"alpha": ["c-old", "c-new"]})
+        wrapper._current_session_name = "alpha"
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._check_stale_conv_entry("c-new")
+        assert notes == []
+        assert handoff_store.take_notice(root) is None
+
+    def test_multi_owned_conversation_is_silent(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A conversation linked to two sessions (R2 bridge-link legacy)
+        # is ambiguous — never warn on it.
+        # 두 세션에 링크된 conversation (R2 다리 링크 레거시) 은 모호 —
+        # 절대 경고하지 않는다.
+        root = Path(wrapper.project_path)
+        self._seed(
+            root,
+            {"alpha": ["c-real", "c-stray", "c-new"], "beta": ["c-stray"]},
+        )
+        wrapper._current_session_name = "alpha"
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._check_stale_conv_entry("c-stray")
+        assert notes == []
+        assert handoff_store.take_notice(root) is None
+
+    def test_stray_tail_does_not_forge_latest(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Legacy shape from e2e run 006e7dfe: the stray sits at ids[-1].
+        # The session's REAL latest (last sole-owned id) must stay
+        # silent — a naive ids[-1] comparison would false-warn here.
+        # e2e run 006e7dfe 의 레거시 형태 — 떠돌이가 ids[-1] 에 있다.
+        # 세션의 진짜 최신 (마지막 단독 소유 id) 은 침묵해야 한다 —
+        # 소박한 ids[-1] 비교는 여기서 오경고를 낸다.
+        root = Path(wrapper.project_path)
+        self._seed(
+            root, {"alpha": ["c-real", "c-stray"], "beta": ["c-stray"]}
+        )
+        wrapper._current_session_name = "alpha"
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._check_stale_conv_entry("c-real")
+        assert notes == []
+        assert handoff_store.take_notice(root) is None
+
+    def test_rollover_in_flight_skips(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = Path(wrapper.project_path)
+        self._seed(root, {"alpha": ["c-old", "c-new"]})
+        wrapper._current_session_name = "alpha"
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._rollover_ready = {"session": "alpha"}
+        wrapper._check_stale_conv_entry("c-old")
+        assert notes == []
+        assert handoff_store.take_notice(root) is None
+
+    def test_no_current_session_skips(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = Path(wrapper.project_path)
+        self._seed(root, {"alpha": ["c-old", "c-new"]})
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._check_stale_conv_entry("c-old")
+        assert notes == []
+        assert handoff_store.take_notice(root) is None
+
+    def test_unlinked_conversation_skips(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A conversation outside the lineage (fresh boot, /clear) is not
+        # a rolled-over predecessor.
+        # 계보 밖 conversation (새 부팅·/clear) 은 롤오버 선대가 아니다.
+        root = Path(wrapper.project_path)
+        self._seed(root, {"alpha": ["c-old", "c-new"]})
+        wrapper._current_session_name = "alpha"
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._check_stale_conv_entry("c-unknown")
+        assert notes == []
+        assert handoff_store.take_notice(root) is None
+
+    def test_fallback_battery_detects_stale_entry(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A /resume load produces its first turn-end as a busy edge with
+        # NO Stop signal (measured) — the fallback battery must detect
+        # too, via the mtime conversation id.
+        # /resume 로드의 첫 턴 종료는 Stop 신호 없는 바쁨 에지다 (실측) —
+        # 폴백 일괄도 mtime conversation id 로 감지해야 한다.
+        from session_manager.wrapper import pty_wrapper as pw
+
+        root = Path(wrapper.project_path)
+        self._seed(root, {"alpha": ["c-old", "c-new"]})
+        wrapper._current_session_name = "alpha"
+        notes = self._notes(wrapper, monkeypatch)
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: "c-old"
+        )
+        wrapper._on_turn_end("busy_edge")
+        assert len(notes) == 1
+        assert handoff_store.take_notice(root) is not None
+
+    def test_pending_notice_defers_rollover_marking(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # While the move-or-stay question is unanswered, the context
+        # check must not claim the conversation for a rollover (measured
+        # fork: warning tick re-rolled-over the full predecessor).
+        # 이동/계속 질문이 답을 기다리는 동안 컨텍스트 검사가 그
+        # conversation 을 롤오버로 가로채면 안 된다 (실측된 분기 — 경고
+        # 틱이 꽉 찬 선대를 재롤오버).
+        from session_manager.wrapper import context_monitor as cm
+        from session_manager.wrapper import pty_wrapper as pw
+
+        root = Path(wrapper.project_path)
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: "conv-1"
+        )
+        usage = cm.ContextUsage(
+            used_tokens=130_000,
+            window_tokens=200_000,
+            trigger_tokens=120_000,
+            exceeded=True,
+            numerator_source="transcript",
+            denominator_source="mapping",
+        )
+        monkeypatch.setattr(
+            pw.context_monitor, "check_context_usage", lambda *a: usage
+        )
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: 39_000
+        )
+        wrapper._stale_notice_conv = "conv-1"
+        handoff_store.write_notice(
+            root, {"type": "stale_conversation", "conv_id": "conv-1"}
+        )
+
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id is None
+
+        # Notice consumed (question delivered) but no Stop yet — the
+        # fallback edges fire MID-turn (measured: the rollover respawn
+        # killed the dialog), so the deferral must hold.
+        # notice 소비 (질문 전달) 후에도 Stop 전이면 유예 유지 — 폴백
+        # 에지는 턴 도중 발화한다 (실측: 롤오버 respawn 이 다이얼로그를
+        # 죽였다).
+        assert handoff_store.take_notice(root) is not None
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id is None
+
+        # The Stop signal = the question turn truly ended (the user
+        # answered the AskUserQuestion tool) — deferral releases and the
+        # same signal's battery marks normally.
+        # Stop 신호 = 질문 턴 종결 (사용자가 AskUserQuestion 도구에 답함)
+        # — 유예가 풀리고 같은 신호의 검사 일괄이 정상 마킹한다.
+        wrapper._handle_turn_end_signal({"conversation_id": "conv-1"})
+        assert wrapper._stale_notice_conv is None
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+
+    def test_submit_after_consumption_releases_deferral(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A hard-limit conversation cannot run the question turn at all
+        # (measured: "Context limit reached", no Stop ever fires) — the
+        # user's NEXT submit must break the deadlock. The first submit
+        # (notice still pending at \r time) must not.
+        # 하드 한계 대화는 질문 턴 자체를 못 돌린다 (실측 — "Context
+        # limit reached", Stop 무발화). 사용자의 **다음** 제출이 교착을
+        # 풀어야 한다. 첫 제출 (\r 시점에 notice 미소비) 은 풀면 안 된다.
+        root = Path(wrapper.project_path)
+        wrapper._stale_notice_conv = "conv-1"
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
+        monkeypatch.setattr("os.write", lambda fd, data: len(data))
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+
+        handoff_store.write_notice(
+            root, {"type": "stale_conversation", "conv_id": "conv-1"}
+        )
+        wrapper._handle_stdin_readable()
+        assert wrapper._stale_notice_conv == "conv-1"
+
+        assert handoff_store.take_notice(root) is not None
+        wrapper._handle_stdin_readable()
+        assert wrapper._stale_notice_conv is None
+
+    def test_stop_with_unconsumed_notice_keeps_deferral(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A turn that was already in flight can end before the user
+        # submits the prompt that consumes the notice — the question has
+        # not even been delivered, so the deferral must survive.
+        # 이미 진행 중이던 턴은 notice 를 소비할 프롬프트 제출 전에 끝날
+        # 수 있다 — 질문이 전달조차 안 됐으므로 유예는 살아야 한다.
+        from session_manager.wrapper import pty_wrapper as pw
+
+        root = Path(wrapper.project_path)
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: "conv-1"
+        )
+        wrapper._stale_notice_conv = "conv-1"
+        handoff_store.write_notice(
+            root, {"type": "stale_conversation", "conv_id": "conv-1"}
+        )
+        wrapper._handle_turn_end_signal({"conversation_id": "conv-1"})
+        assert wrapper._stale_notice_conv == "conv-1"
+
+
 class TestAdvanceRollover:
     """R4-C3: the handoff-turn state machine.
 

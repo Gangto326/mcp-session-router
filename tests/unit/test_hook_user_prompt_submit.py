@@ -754,3 +754,90 @@ class TestPendingHandoffDelivery:
         assert hook.run(_payload(project)) == 0
         capsys.readouterr()
         assert handoff_store.take_pending(project) is not None
+
+
+class TestNoticeDelivery:
+    """R4-C6 B: wrapper notice → instruction on the next ordinary prompt.
+
+    R4-C6 B: 래퍼 notice → 다음 일반 프롬프트에 지시 주입.
+    """
+
+    def _write_notice(self, project: Path, conv: str = "conv-1") -> None:
+        handoff_store.write_notice(
+            project,
+            {
+                "type": "stale_conversation",
+                "session": "alpha",
+                "conv_id": conv,
+                "latest_conv": "c-new",
+            },
+        )
+
+    def test_delivers_instruction_on_ordinary_prompt(
+        self, project: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        self._write_notice(project)
+        assert hook.run(_payload(project)) == 0
+        out = json.loads(capsys.readouterr().out)
+        context = out["hookSpecificOutput"]["additionalContext"]
+        assert "alpha" in context
+        assert "AskUserQuestion" in context
+        assert "session_switch" in context
+        assert handoff_store.take_notice(project) is None
+
+    def test_delivery_skips_routing(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # One missed routing pass is harmless (same principle as the
+        # judge warmup window) — the notice turn must not double-inject.
+        # 판정 1회 미발동은 무해 (웜업 창과 같은 원칙) — notice 턴이
+        # 이중 주입되면 안 된다.
+        sessions = project / ".session-manager" / "sessions"
+        _write_session(sessions, "frontend")
+        _write_session(sessions, "backend")
+        self._write_notice(project)
+        called: list = []
+        monkeypatch.setattr(hook, "_route", called.append)
+        assert hook.run(_payload(project)) == 0
+        assert called == []
+        capsys.readouterr()
+
+    def test_moved_conversation_drops_notice(
+        self, project: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        # The prompt runs in a different conversation than the one the
+        # notice was written for — the warning is obsolete.
+        # notice 가 쓰인 것과 다른 conversation 의 프롬프트 — 경고는
+        # 낡았다.
+        self._write_notice(project, conv="conv-old")
+        assert hook.run(_payload(project)) == 0
+        assert capsys.readouterr().out == ""
+        assert handoff_store.take_notice(project) is None
+
+    def test_unknown_type_consumed_silently(
+        self, project: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        # A producer newer than this hook must not inject half-understood
+        # text into the conversation.
+        # 이 hook 보다 새로운 생산자의 notice 를 어설프게 주입하면 안 된다.
+        handoff_store.write_notice(project, {"type": "future-kind"})
+        assert hook.run(_payload(project)) == 0
+        assert capsys.readouterr().out == ""
+        assert handoff_store.take_notice(project) is None
+
+    def test_trigger_prompt_prefers_handoff_and_keeps_notice(
+        self, project: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        # A transition trigger consumes the pending handoff only; the
+        # notice waits for the next ordinary prompt.
+        # 전환 트리거는 pending handoff 만 소비한다 — notice 는 다음 일반
+        # 프롬프트를 기다린다.
+        handoff_store.write_pending(project, "backend", {}, "p")
+        self._write_notice(project)
+        payload = _payload(project, prompt=handoff_store.TRIGGER_PROMPT)
+        assert hook.run(payload) == 0
+        capsys.readouterr()
+        assert handoff_store.take_notice(project) is not None
