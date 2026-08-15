@@ -413,6 +413,19 @@ class SessionManagerWrapper:
         # 마킹 시점의 컨텍스트 퍼센트 (상태 줄 문구용).
         self._rollover_pending_pct: int | None = None
 
+        # Conversation just arrived at via a transition respawn (R4-C6 A):
+        # armed at spawn when the transition resumed an existing
+        # conversation, disarmed at the first conclusive context reading.
+        # If that reading marks the rollover, the mark gets the entry
+        # notice — the user should know the session they just landed in
+        # is about to roll over.
+        # 전환 respawn 으로 방금 도착한 conversation (R4-C6 A) — 기존
+        # conversation 을 resume 한 전환의 spawn 시점에 무장하고, 첫 확정
+        # 컨텍스트 판독에서 해제한다. 그 판독이 롤오버를 마킹하면 진입
+        # 안내를 붙인다 — 방금 도착한 세션이 곧 롤오버됨을 사용자가
+        # 알아야 한다.
+        self._entry_check_conv_id: str | None = None
+
         # context.json observation state (second turn-end signal): file
         # signature (mtime_ns, size) gates the cheap stat-per-tick path;
         # the (conversation_id, used_tokens) key fires _on_turn_end only
@@ -682,6 +695,26 @@ class SessionManagerWrapper:
                 self._record_last_transition(
                     pending.from_name, pending.target, pending.user_prompt
                 )
+            # Entry-fullness check (R4-C6 A): a switch or /back that
+            # resumed an existing conversation may have landed in one
+            # that is already over the trigger — arm the one-shot entry
+            # check so the first marking after arrival carries the entry
+            # notice. Resume keeps the conversation id (R3-respawn PoC;
+            # the R4-C3 handoff turn matches its Stop signal by that
+            # same id in production). NEW spawns (resume_conv None) and
+            # rollover legs are excluded above.
+            # 진입 점유 검사 (R4-C6 A) — 기존 conversation 을 resume 한
+            # 전환·/back 은 이미 트리거를 넘은 대화에 도착했을 수 있다.
+            # 도착 후 첫 마킹에 진입 안내가 붙도록 1회용 검사를 무장한다.
+            # resume 은 conversation id 를 유지한다 (R3-respawn PoC —
+            # R4-C3 handoff 턴이 같은 id 의 Stop 신호 매칭으로 실동작).
+            # NEW spawn (resume_conv 없음) 과 롤오버 단계는 위에서 제외.
+            if (
+                not pending.is_rollover_request
+                and not pending.is_rollover_swap
+                and pending.resume_conv is not None
+            ):
+                self._entry_check_conv_id = pending.resume_conv
         self._pending_respawn = None
 
     def _should_respawn(self) -> bool:
@@ -1597,6 +1630,17 @@ class SessionManagerWrapper:
         R4-C3/C4. 마킹은 conversation 단위다: conversation 이 바뀌면
         (전환·/clear·롤오버 자신) 해제되고, 미마킹 → 마킹 전이는 정확히
         1회만 기록한다.
+
+        Entry check (R4-C6 A): when the armed arrival conversation gets
+        its first conclusive reading here, a marking carries the entry
+        notice; any conclusive non-marking outcome just disarms. An
+        inconclusive reading (no usage data, unknown birth) keeps the
+        arming so a deferred marking still announces the arrival.
+
+        진입 검사 (R4-C6 A) — 무장된 도착 conversation 의 첫 확정 판독이
+        여기서 이뤄지면, 마킹에는 진입 안내가 붙고 마킹 없는 확정 결과는
+        무장만 해제한다. 미확정 판독 (usage 없음·태생 미상) 은 무장을
+        유지해 연기된 마킹도 도착을 안내한다.
         """
         project = Path(self.project_path)
         conv_id = get_active_conversation_id(project)
@@ -1604,6 +1648,15 @@ class SessionManagerWrapper:
             return
         if conv_id != self._rollover_pending_conv_id:
             self._rollover_pending_conv_id = None
+        if (
+            self._entry_check_conv_id is not None
+            and conv_id != self._entry_check_conv_id
+        ):
+            # The conversation moved on (another switch, /clear) before
+            # a conclusive reading — the arrival is stale.
+            # 확정 판독 전에 conversation 이 바뀌었다 (다른 전환·/clear)
+            # — 도착 무장이 낡았다.
+            self._entry_check_conv_id = None
         jsonl_path = (
             Path.home()
             / ".claude"
@@ -1612,9 +1665,15 @@ class SessionManagerWrapper:
             / f"{conv_id}.jsonl"
         )
         usage = context_monitor.check_context_usage(project, conv_id, jsonl_path)
-        if usage is None or not usage.exceeded:
+        if usage is None:
+            return
+        if not usage.exceeded:
+            # Conclusive: the arrived conversation is not full.
+            # 확정 — 도착한 conversation 은 안 찼다.
+            self._entry_check_conv_id = None
             return
         if self._rollover_pending_conv_id == conv_id:
+            self._entry_check_conv_id = None
             return
         # Loop guard: a rollover cannot shrink a conversation below its
         # birth footprint. If that already meets the trigger, a successor
@@ -1628,6 +1687,7 @@ class SessionManagerWrapper:
         # 1회 실행에 롤오버 4번). 억제하고 로그만 남긴다 — 이 로그가 R5
         # 의 임계 오설정 계측 원천이다.
         if self._rollover_suppressed_conv_id == conv_id:
+            self._entry_check_conv_id = None
             return
         birth = context_monitor.read_first_usage(jsonl_path)
         if birth is None:
@@ -1644,6 +1704,13 @@ class SessionManagerWrapper:
             # 롤오버돼 /handoff 1회에 대화 3개.)
             return
         if birth >= usage.trigger_tokens:
+            # Conclusive for the entry check too: a rollover cannot help
+            # this conversation, so no entry notice — log only (approved
+            # C6-A design; the suppression log is R5's source).
+            # 진입 검사에도 확정 — 이 conversation 은 롤오버로 개선 불가
+            # 이므로 진입 안내 없음, 로그만 (승인된 C6-A 설계. 억제
+            # 로그는 R5 계측 원천).
+            self._entry_check_conv_id = None
             self._rollover_suppressed_conv_id = conv_id
             debug_log.log(
                 "ROLLOVER_SUPPRESSED",
@@ -1657,10 +1724,21 @@ class SessionManagerWrapper:
                 session=self._current_session_name,
             )
             return
+        entry_arrival = self._entry_check_conv_id == conv_id
+        self._entry_check_conv_id = None
         self._rollover_pending_conv_id = conv_id
         if usage.window_tokens:
             self._rollover_pending_pct = round(
                 usage.used_tokens * 100 / usage.window_tokens
+            )
+        if entry_arrival:
+            # Spec wording (Plan §5 R4-C6) — the user just landed here
+            # via a transition and the session is already full.
+            # 스펙 원문 (Plan §5 R4-C6) — 방금 전환으로 도착했는데
+            # 세션이 이미 차 있다.
+            self._notify_user(
+                "⚠ 그 세션은 컨텍스트가 거의 찼습니다 — "
+                "Handoff로 이어서 새 대화로 재개합니다"
             )
         debug_log.log(
             "ROLLOVER_PENDING",
@@ -1671,6 +1749,7 @@ class SessionManagerWrapper:
                 "trigger_tokens": usage.trigger_tokens,
                 "numerator_source": usage.numerator_source,
                 "denominator_source": usage.denominator_source,
+                "entry_arrival": entry_arrival,
             },
             conv_id=conv_id,
             session=self._current_session_name,
