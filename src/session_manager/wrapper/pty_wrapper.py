@@ -426,6 +426,28 @@ class SessionManagerWrapper:
         # 알아야 한다.
         self._entry_check_conv_id: str | None = None
 
+        # Conversations already warned about being a rolled-over
+        # predecessor (R4-C6 B) — one warning per conversation per
+        # wrapper lifetime; a chosen "그대로 진행" must not be nagged
+        # every turn.
+        # 롤오버된 선대 대화라고 이미 경고한 conversation 들 (R4-C6 B) —
+        # 래퍼 수명당 대화별 1회. "그대로 진행" 을 택한 사용자를 매 턴
+        # 잔소리하면 안 된다.
+        self._stale_conv_warned: set[str] = set()
+
+        # Conversation whose move-or-stay question is still in flight
+        # (R4-C6 B): rollover marking is deferred for it until the hook
+        # consumes the notice — measured race: a full predecessor
+        # re-entered via /resume was re-rolled-over by the SAME turn-end
+        # tick that should have warned, forking the lineage (two
+        # successors, the new one blind to the old one's progress).
+        # 이동/계속 질문이 아직 답을 기다리는 conversation (R4-C6 B) —
+        # hook 이 notice 를 소비할 때까지 롤오버 마킹을 유예한다. 실측된
+        # race: /resume 으로 재진입한 꽉 찬 선대가 경고해야 할 바로 그
+        # 턴 종료 틱에서 재롤오버되어 계보가 분기했다 (후계 둘, 새 후계는
+        # 기존 후계의 진행을 모름).
+        self._stale_notice_conv: str | None = None
+
         # context.json observation state (second turn-end signal): file
         # signature (mtime_ns, size) gates the cheap stat-per-tick path;
         # the (conversation_id, used_tokens) key fires _on_turn_end only
@@ -483,6 +505,11 @@ class SessionManagerWrapper:
         # 전환의 잔재 (크래시) — 무관한 미래 프롬프트가 낡은 handoff 를
         # 소비하지 못하게 처분한다.
         handoff_store.clear_stale_pending(Path(self.project_path))
+        # Same disposal for a leftover notice — self-correcting: the
+        # stale-conversation detector rewrites it if still true (R4-C6 B).
+        # 잔류 notice 도 같은 처분 — 조건이 여전히 참이면 만료 대화
+        # 감지기가 다시 써 넣으므로 자기 교정적이다 (R4-C6 B).
+        handoff_store.clear_stale_notice(Path(self.project_path))
 
         try:
             self._spawn_child()
@@ -1043,6 +1070,22 @@ class SessionManagerWrapper:
             conv_id=conv_id,
         )
 
+        # Move-or-stay deferral release (R4-C6 B): a Stop with the notice
+        # already consumed means the question turn truly ended — the user
+        # has answered. Moved → a transition is in flight and the marking
+        # below self-corrects on the conversation change; stayed → the
+        # battery below marks the rollover normally. Only THIS signal may
+        # release the deferral (fallback edges fire mid-turn — measured).
+        # 이동/계속 유예 해제 (R4-C6 B) — notice 가 이미 소비된 상태의
+        # Stop 은 질문 턴이 진짜 끝났다는 뜻 = 사용자가 답했다. 이동이면
+        # 전환이 진행 중이고 아래 마킹은 conversation 변경으로 자기
+        # 교정된다. 계속이면 아래 일괄이 정상 마킹한다. 유예 해제는 이
+        # 신호만 할 수 있다 (폴백 에지는 턴 도중 발화 — 실측).
+        if self._stale_notice_conv is not None and not handoff_store.notice_pending(
+            Path(self.project_path)
+        ):
+            self._stale_notice_conv = None
+
         request_state = self._rollover_request_state
         if (
             request_state is not None
@@ -1064,6 +1107,7 @@ class SessionManagerWrapper:
             if conv_id != swap_state["predecessor_conv"]:
                 self._finalize_rollover(conv_id)
             return
+        self._check_stale_conv_entry(conv_id)
         self._check_summary_refresh()
         self._check_context_usage()
         self._advance_rollover()
@@ -1084,9 +1128,113 @@ class SessionManagerWrapper:
         검사는 멱등이라 한 턴에 이중 발동해도 무해하다.
         """
         debug_log.log("TURN_END", "WRAPPER", {"source": source})
+        # Stale-entry detection must precede the context check on THIS
+        # path too: a manual /resume into a conversation produces its
+        # first turn-end as a busy edge (loading, no Stop signal), and a
+        # full predecessor would otherwise be re-rolled-over in the same
+        # tick that should have warned (measured — see
+        # _check_stale_conv_entry). The mtime conversation id is
+        # acceptable here: the sole-ownership guard resolves any
+        # misidentification to silence.
+        # 이 경로에서도 만료 진입 감지가 컨텍스트 검사보다 먼저여야 한다
+        # — 수동 /resume 진입의 첫 턴 종료는 바쁨 에지다 (로드만, Stop
+        # 신호 없음). 아니면 꽉 찬 선대가 경고해야 할 바로 그 틱에서
+        # 재롤오버된다 (실측 — _check_stale_conv_entry 참조). mtime
+        # conversation id 로 충분하다 — 오인은 단독 소유 가드가 침묵으로
+        # 해석한다.
+        conv_id = get_active_conversation_id(Path(self.project_path))
+        if conv_id is not None:
+            self._check_stale_conv_entry(conv_id)
         self._check_summary_refresh()
         self._check_context_usage()
         self._advance_rollover()
+
+    def _check_stale_conv_entry(self, conv_id: str) -> None:
+        """Warn once when the turn ran in a rolled-over predecessor (R4-C6 B).
+
+        롤오버된 선대 대화에서 턴이 돌았으면 1회 경고한다 (R4-C6 B).
+
+        Reached from every turn-end path: the Stop signal passes its
+        authoritative conversation id, the fallback battery passes the
+        mtime-derived one (a /resume load produces no Stop — measured).
+        Judgement, not a guarantee: a missed warning is acceptable, a
+        false one is not, so every ambiguous shape resolves to silence.
+
+        모든 턴 종료 경로에서 도달한다 — Stop 신호는 신뢰할 수 있는
+        conversation id 를, 폴백 일괄은 mtime 유래 id 를 넘긴다
+        (/resume 로드는 Stop 을 만들지 않는다 — 실측). 보장이 아닌
+        판단의 영역이다 — 경고 누락은 허용되지만 오경고는 안 되므로,
+        모호한 형태는 전부 침묵으로 해석한다.
+
+        Ambiguity guard: a conversation linked to MORE than one session
+        (an R2-era bridge-link legacy — the producer was removed, see
+        session_switch) is skipped, and "latest" is the last SOLE-owned
+        id. Verified against the observed legacy shape (e2e run 006e7dfe:
+        stray as ids[-1] would otherwise false-warn on the session's real
+        latest conversation). Suppression-only use — resume selection
+        must NOT use this rule (it would drop a session's real latest,
+        penguin-verify 2026-08-15).
+
+        모호성 가드 — 둘 이상의 세션에 링크된 conversation (R2 다리 링크
+        레거시 — 생산자는 제거됨, session_switch 참조) 은 건너뛰고,
+        "최신" 은 마지막 **단독 소유** id 로 잡는다. 실관측 레거시 형태
+        (e2e run 006e7dfe — 떠돌이가 ids[-1] 이면 진짜 최신 대화에
+        오경고) 로 검산됨. 경고 억제 전용 규칙이다 — resume 선택에 쓰면
+        세션의 진짜 최신 대화를 버리게 되므로 금지 (penguin-verify
+        2026-08-15).
+        """
+        if (
+            self._rollover_request_state is not None
+            or self._rollover_swap_state is not None
+            or self._rollover_ready is not None
+            or self._pending_respawn is not None
+        ):
+            return
+        if conv_id in self._stale_conv_warned:
+            return
+        session_name = self._current_session_name
+        if session_name is None:
+            return
+        try:
+            sessions = SessionStore(Path(self.project_path)).list_sessions()
+        except Exception:
+            return
+        current = next((s for s in sessions if s.name == session_name), None)
+        if current is None:
+            return
+        owner_counts: dict[str, int] = {}
+        for session in sessions:
+            for cid in session.claude_conversation_ids:
+                owner_counts[cid] = owner_counts.get(cid, 0) + 1
+        sole_ids = [
+            cid
+            for cid in current.claude_conversation_ids
+            if owner_counts.get(cid, 0) == 1
+        ]
+        if conv_id not in sole_ids or conv_id == sole_ids[-1]:
+            return
+        self._stale_conv_warned.add(conv_id)
+        self._stale_notice_conv = conv_id
+        handoff_store.write_notice(
+            Path(self.project_path),
+            {
+                "type": "stale_conversation",
+                "session": session_name,
+                "conv_id": conv_id,
+                "latest_conv": sole_ids[-1],
+            },
+        )
+        self._notify_user(
+            "⚠ 롤오버된 이전 대화에 있습니다 — 다음 입력 때 최신 대화로 "
+            "이동할지 묻습니다"
+        )
+        debug_log.log(
+            "STALE_CONV_ENTRY",
+            "WRAPPER",
+            {"latest_conv": sole_ids[-1]},
+            conv_id=conv_id,
+            session=session_name,
+        )
 
     def _reset_child_detection_state(self) -> None:
         """
@@ -1186,6 +1334,24 @@ class SessionManagerWrapper:
             # hook 신호). 빈 입력란의 \r 은 시작점만 옮길 뿐이라 계측
             # 전용 값에는 무해하다.
             self._last_submit_monotonic = time.monotonic()
+
+            # Move-or-stay deferral, second release path (R4-C6 B): a
+            # submit AFTER the notice was consumed means the question
+            # attempt is behind us — normally the Stop released already,
+            # but a conversation at its hard context limit cannot run
+            # the question turn at all (measured: "Context limit
+            # reached", no Stop ever fires) and would defer the rollover
+            # forever. The user's next keystroke breaks that deadlock.
+            # 이동/계속 유예의 제2 해제 경로 (R4-C6 B) — notice 소비
+            # **후** 의 제출은 질문 시도가 이미 지나갔다는 뜻이다.
+            # 보통은 Stop 이 먼저 해제하지만, 하드 컨텍스트 한계의
+            # 대화는 질문 턴 자체가 돌지 못해 (실측: "Context limit
+            # reached", Stop 무발화) 롤오버가 영원히 유예된다. 사용자의
+            # 다음 제출이 그 교착을 푼다.
+            if self._stale_notice_conv is not None and not (
+                handoff_store.notice_pending(Path(self.project_path))
+            ):
+                self._stale_notice_conv = None
 
         # Forward keystrokes to the PTY so Ink can render them in real time.
         # Ink가 실시간으로 렌더링할 수 있도록 키 입력을 PTY로 즉시 전달.
@@ -1646,6 +1812,23 @@ class SessionManagerWrapper:
         conv_id = get_active_conversation_id(project)
         if conv_id is None:
             return
+        # Move-or-stay deferral (R4-C6 B): while the stale-entry question
+        # for THIS conversation awaits its ANSWER, marking a rollover
+        # would fork the lineage before the user could choose to move.
+        # Cleared only on a Stop signal (_handle_turn_end_signal):
+        # AskUserQuestion is a tool, so the question turn cannot end
+        # before the user answers — whereas the fallback edges fire
+        # MID-turn (measured: context_update 6s after the warning marked
+        # the predecessor and the rollover respawn killed the dialog).
+        # 이동/계속 유예 (R4-C6 B) — 이 conversation 의 만료 진입 질문이
+        # **답변**을 기다리는 동안 롤오버를 마킹하면 사용자가 이동을
+        # 택하기 전에 계보가 분기한다. 해제는 Stop 신호에서만
+        # (_handle_turn_end_signal) — AskUserQuestion 은 도구라 질문 턴은
+        # 답변 전에 끝날 수 없다. 반면 폴백 에지는 턴 **도중**에 발화한다
+        # (실측 — 경고 6초 뒤 context_update 가 선대를 마킹해 롤오버
+        # respawn 이 다이얼로그를 죽였다).
+        if self._stale_notice_conv == conv_id:
+            return
         if conv_id != self._rollover_pending_conv_id:
             self._rollover_pending_conv_id = None
         if (
@@ -2052,11 +2235,15 @@ class SessionManagerWrapper:
         except Exception as exc:
             # Linking is retried on the next tick only if the state is
             # kept; a persistent storage failure must not loop forever —
-            # log and finish (the MCP's own conversation tracking links
-            # the successor on its next tool call as a backstop).
-            # link 실패를 영구 재시도하면 안 된다 — 로그 후 마무리 (MCP 의
-            # 자체 conversation 추적이 다음 도구 호출에서 후계를 link 하는
-            # 백스톱이 있다).
+            # log and finish. Backstop: the successor gets linked at the
+            # session's next departure (session_switch/create/end all
+            # link the active conversation to the CURRENT session) —
+            # there is no per-tool-call tracking (verified 2026-08-15).
+            # link 실패를 영구 재시도하면 안 된다 — 로그 후 마무리.
+            # 백스톱: 이 세션의 다음 이탈 시점에 후계가 link 된다
+            # (session_switch/create/end 가 활성 conversation 을 현재
+            # 세션에 link) — 도구 호출마다의 범용 추적은 존재하지 않는다
+            # (2026-08-15 검증).
             debug_log.log(
                 "ROLLOVER_COMPLETE",
                 "WRAPPER",

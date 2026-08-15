@@ -125,6 +125,108 @@ def take_pending(project_path: Path) -> dict[str, Any] | None:
     return data
 
 
+_NOTICE_FILENAME = "notice-pending.json"
+
+
+def _notice_path(project_path: Path) -> Path:
+    return (
+        Path(project_path)
+        / _SESSION_MANAGER_DIRNAME
+        / _HANDOFFS_DIRNAME
+        / _NOTICE_FILENAME
+    )
+
+
+def write_notice(project_path: Path, notice: dict[str, Any]) -> None:
+    """Persist a one-shot notice for the hook to inject on the NEXT
+    ordinary prompt (R4-C6 B).
+
+    hook 이 **다음 일반 프롬프트**에서 주입할 1회용 안내를 영속화한다
+    (R4-C6 B). 전환 pending 과 달리 트리거 프롬프트가 아니라 아무 일반
+    제출에서나 소비된다 — 래퍼가 사후에 발견한 사실 (만료 대화 진입 등)
+    을 세션 안 LLM 에게 전하는 통로다.
+    """
+    path = _notice_path(project_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(
+            {**notice, "at": datetime.now(UTC).isoformat()},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+    debug_log.log(
+        "HANDOFF_NOTICE",
+        "WRAPPER",
+        {"op": "write", "type": notice.get("type")},
+        session=notice.get("session"),
+    )
+
+
+def take_notice(project_path: Path) -> dict[str, Any] | None:
+    """Consume the pending notice: read it and remove the file.
+
+    pending notice 를 소비한다 — 읽고 파일을 제거. 없거나 손상이면 None
+    (손상 파일도 제거해 다음 안내를 막지 않는다).
+    """
+    path = _notice_path(project_path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    path.unlink(missing_ok=True)
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        debug_log.log(
+            "HANDOFF_NOTICE", "SYSTEM", {"op": "take", "result": "corrupt"}
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    debug_log.log(
+        "HANDOFF_NOTICE",
+        "SYSTEM",
+        {"op": "take", "type": data.get("type")},
+        session=data.get("session"),
+    )
+    return data
+
+
+def notice_pending(project_path: Path) -> bool:
+    """Whether an unconsumed notice file exists (cheap stat).
+
+    미소비 notice 파일 존재 여부 (저렴한 stat). 래퍼가 "이동/계속 질문이
+    아직 답을 기다리는 중"의 근사로 쓴다 — hook 소비가 파일을 지운다.
+    """
+    return _notice_path(project_path).is_file()
+
+
+def clear_stale_notice(project_path: Path) -> bool:
+    """Drop a leftover notice file at wrapper boot.
+
+    래퍼 부팅 시 잔류 notice 파일을 정리한다.
+
+    Safe AND self-correcting: if the condition that produced the notice
+    still holds (the user is still in the stale conversation), the
+    detector re-fires on the next turn end and rewrites it; if it no
+    longer holds, the stale warning must not greet an unrelated prompt.
+
+    안전하고 자기 교정적이다 — 안내를 만든 조건이 여전히 참이면 (사용자
+    가 아직 그 대화에 있음) 다음 턴 종료에서 감지기가 다시 써 넣고,
+    거짓이 됐으면 낡은 경고가 무관한 프롬프트를 맞아서는 안 된다.
+    """
+    path = _notice_path(project_path)
+    if not path.is_file():
+        return False
+    path.unlink(missing_ok=True)
+    debug_log.log("HANDOFF_NOTICE", "WRAPPER", {"op": "clear_stale"})
+    return True
+
+
 def clear_stale_pending(project_path: Path) -> bool:
     """Drop a leftover pending file at wrapper boot.
 

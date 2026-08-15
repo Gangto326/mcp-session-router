@@ -147,6 +147,93 @@ def _count_active_sessions(root: Path) -> int:
     return count
 
 
+_STALE_CONV_TEMPLATE = (
+    "[session-manager 라우터] 현재 대화는 세션 {session}의 롤오버된 이전 "
+    "대화다 — 이 세션의 최신 대화가 따로 있다. 사용자의 이번 프롬프트에 "
+    "답하기 전에 AskUserQuestion으로 [최신 대화로 이동 / 이 대화에서 계속]"
+    "을 물어라. 이동 선택 시 session_switch(target='{session}', "
+    "summary=<이 대화의 요지 한 줄>, user_prompt=<사용자의 이번 프롬프트 "
+    "원문>)를 호출하라. 계속 선택 시 아무 도구도 호출하지 말고 프롬프트에 "
+    "답하라."
+)
+
+
+def _deliver_pending_notice(payload: dict[str, Any]) -> bool:
+    """
+    Wrapper-notice stage (R4-C6 B): consume a pending notice file — a
+    fact the wrapper discovered after the fact (stale-conversation
+    entry) — and inject its instruction on this ORDINARY prompt. Returns
+    True when handled; the caller then skips routing for this turn (one
+    missed routing pass is harmless, same as the judge warmup window).
+
+    래퍼 안내 단계 (R4-C6 B) — 래퍼가 사후에 발견한 사실 (만료 대화
+    진입) 을 담은 notice 파일을 소비해, **일반 프롬프트**에 지시를
+    주입한다. 처리했으면 True — 호출자는 이번 턴의 라우팅을 건너뛴다
+    (판정 1회 미발동은 무해 — 웜업 창과 같은 원칙).
+    """
+    cwd = payload.get(FIELD_CWD)
+    if not isinstance(cwd, str) or not cwd:
+        return False
+    notice = handoff_store.take_notice(Path(cwd))
+    if notice is None:
+        return False
+    if notice.get("type") != "stale_conversation":
+        # Unknown notice type (future producer newer than this hook) —
+        # consume silently rather than inject a half-understood text.
+        # 미지의 notice 유형 (이 hook 보다 새로운 생산자) — 어설픈 주입
+        # 대신 조용히 소비한다.
+        debug_log.log(
+            "HOOK_NOTICE",
+            "SYSTEM",
+            {"result": "unknown_type", "type": notice.get("type")},
+            conv_id=payload.get(FIELD_SESSION_ID),
+        )
+        return False
+    session = notice.get("session")
+    if not isinstance(session, str) or not session:
+        return False
+    # The notice was written at the previous turn's end for the stale
+    # conversation; if the user has ALREADY moved (this prompt runs in a
+    # different conversation), the warning is obsolete — drop it.
+    # notice 는 직전 턴 종료 시점에 그 낡은 대화에 대해 쓰였다 — 사용자가
+    # 이미 옮겼다면 (이 프롬프트가 다른 conversation 에서 돌고 있다면)
+    # 경고는 낡았다 — 버린다.
+    conv_id = payload.get(FIELD_SESSION_ID)
+    noticed_conv = notice.get("conv_id")
+    if (
+        isinstance(conv_id, str)
+        and isinstance(noticed_conv, str)
+        and conv_id != noticed_conv
+    ):
+        debug_log.log(
+            "HOOK_NOTICE",
+            "SYSTEM",
+            {"result": "conversation_moved"},
+            conv_id=conv_id,
+        )
+        return False
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": _STALE_CONV_TEMPLATE.format(
+                        session=session
+                    ),
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+    debug_log.log(
+        "HOOK_NOTICE",
+        "SYSTEM",
+        {"result": "delivered", "session": session},
+        conv_id=conv_id,
+    )
+    return True
+
+
 def _deliver_pending_handoff(payload: dict[str, Any]) -> bool:
     """
     Transition-trigger stage: when this submission is the respawn's
@@ -560,6 +647,8 @@ def run(stdin_text: str) -> int:
 
     try:
         if _deliver_pending_handoff(payload):
+            return 0
+        if _deliver_pending_notice(payload):
             return 0
         rule = _prefilter(payload)
         if rule is not None:
