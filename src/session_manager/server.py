@@ -627,16 +627,17 @@ def session_switch(
     # 경로로 동기화되도록 여기서도 통보한다.
     _set_current_session(app, target)
 
-    # Link the same active conversation to the target session as well so
-    # routing matches it on the next turn even before the wrapper's
-    # /resume injection actually changes Claude Code's conversation.
-    # target 세션에도 동일 conversation 연결 — wrapper 의 /resume 주입이
-    # Claude Code conversation 을 실제로 바꾸기 전이라도 다음 턴에 라우팅이
-    # 매칭하도록.
-    if active_conv_id is not None:
-        app.session_store.mutate_session_by_name(
-            target, lambda s: s.link_conversation(active_conv_id)
-        )
+    # The departing conversation is deliberately NOT linked to the target.
+    # The R2-era injection flow bridged its long switch-to-conversation
+    # gap with that link; the R3-FIX1 respawn flow resumes a conversation
+    # that is already in the target's lineage, so the link only polluted
+    # every lineage consumer (wrong resume pick, judge current-session
+    # ambiguity, false stale-conversation warnings — e2e run 006e7dfe).
+    # 떠나는 conversation 을 target 에 링크하지 않는다 (의도적). R2 주입
+    # 흐름은 전환~대화 변경 사이의 긴 틈을 그 링크로 메웠지만, R3-FIX1
+    # respawn 흐름은 target 계보에 이미 있는 conversation 을 재개하므로
+    # 링크는 계보 소비처 전부를 오염시키기만 했다 (잘못된 resume 선택·
+    # 판정기 현재 세션 모호·만료 대화 오경고 — e2e run 006e7dfe 실측).
 
     return _log_tool_return(
         "session_switch", event_id, app, {"switched_to": target}
