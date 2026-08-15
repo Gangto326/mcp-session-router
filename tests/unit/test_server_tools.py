@@ -298,6 +298,48 @@ class TestSessionSwitch:
         assert [p.rejected for p in stored.precedents] == ["infra"]
 
 
+class TestSessionSwitchNoTargetLink:
+    """The departing conversation must NOT enter the target lineage.
+
+    떠나는 conversation 이 target 계보에 들어가면 안 된다.
+
+    The R2-era bridge link polluted every lineage consumer (wrong resume
+    pick, judge current-session ambiguity, false stale-conversation
+    warnings — e2e run 006e7dfe); the R3-FIX1 respawn flow resumes a
+    conversation already in the target's lineage, so no bridge is needed.
+
+    R2 시절의 다리 링크가 계보 소비처 전부를 오염시켰다 (잘못된 resume
+    선택·판정기 현재 세션 모호·만료 대화 오경고 — e2e run 006e7dfe).
+    R3-FIX1 respawn 흐름은 target 계보에 이미 있는 conversation 을
+    재개하므로 다리가 필요 없다.
+    """
+
+    def test_departing_conversation_links_outgoing_only(
+        self, app: AppContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            server_module, "get_active_conversation_id", lambda _p: "conv-dep"
+        )
+        app.session_store.save_session(
+            SessionMetadata.new(name="src", title="S")
+        )
+        app.state.set_current_session("src")
+        dst = SessionMetadata.new(name="dst", title="D")
+        dst.claude_conversation_ids = ["conv-dst"]
+        app.session_store.save_session(dst)
+
+        session_switch(
+            target="dst", summary="s", user_prompt="p", ctx=_make_ctx(app)
+        )
+
+        src = app.session_store.load_session_by_name("src")
+        assert src is not None
+        assert "conv-dep" in src.claude_conversation_ids
+        dst_after = app.session_store.load_session_by_name("dst")
+        assert dst_after is not None
+        assert dst_after.claude_conversation_ids == ["conv-dst"]
+
+
 class TestSessionSwitchRetiredPreResolution:
     """Retirement pre-resolution in session_switch (R4-C6 prep).
 
