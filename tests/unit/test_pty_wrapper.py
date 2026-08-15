@@ -1601,6 +1601,244 @@ class TestCheckContextUsage:
         assert wrapper._rollover_pending_conv_id == "conv-1"
 
 
+class TestEntryRolloverCheck:
+    """R4-C6 A: entry-fullness check — rollover on arrival at a full session.
+
+    R4-C6 A: 진입 점유 검사 — 꽉 찬 세션 도착 시 롤오버.
+
+    The existing turn-end battery already fires the rollover machinery
+    after a transition respawn; what these tests pin is the one-shot
+    arming at spawn and the entry notice on the first conclusive marking.
+
+    기존 턴 종료 검사 일괄이 전환 respawn 뒤에도 롤오버 기계를 돌린다 —
+    여기서 고정하는 것은 spawn 시점의 1회용 무장과, 첫 확정 마킹에 붙는
+    진입 안내다.
+    """
+
+    def _arm_usage(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        conv_id: str | None,
+        exceeded: bool,
+    ) -> None:
+        from session_manager.wrapper import context_monitor as cm
+        from session_manager.wrapper import pty_wrapper as pw
+
+        monkeypatch.setattr(
+            pw, "get_active_conversation_id", lambda _p: conv_id
+        )
+        usage = cm.ContextUsage(
+            used_tokens=130_000,
+            window_tokens=200_000,
+            trigger_tokens=120_000,
+            exceeded=exceeded,
+            numerator_source="transcript",
+            denominator_source="mapping",
+        )
+        monkeypatch.setattr(
+            pw.context_monitor, "check_context_usage", lambda *a: usage
+        )
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: 39_000
+        )
+
+    def _spawn(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_child = MagicMock()
+        fake_child.fileno.return_value = 1
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.pexpect.spawn",
+            lambda *a, **k: fake_child,
+        )
+        wrapper._spawn_child()
+
+    def test_spawn_arms_for_resumed_transition(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapper._pending_respawn = _PendingRespawn(
+            target="t", resume_conv="conv-r", from_name="s", user_prompt="p"
+        )
+        self._spawn(wrapper, monkeypatch)
+        assert wrapper._entry_check_conv_id == "conv-r"
+
+    def test_spawn_arms_for_back_transition(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # /back also lands in an existing conversation — same exposure.
+        # /back 도 기존 conversation 에 도착한다 — 같은 노출.
+        wrapper._pending_respawn = _PendingRespawn(
+            target="t", resume_conv="conv-r", is_back=True
+        )
+        self._spawn(wrapper, monkeypatch)
+        assert wrapper._entry_check_conv_id == "conv-r"
+
+    def test_spawn_does_not_arm_for_new_session(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # NEW boots a fresh conversation — nothing to be full on arrival.
+        # NEW 는 새 conversation 부팅 — 도착 시 찼을 것이 없다.
+        wrapper._pending_respawn = _PendingRespawn(target="t", resume_conv=None)
+        self._spawn(wrapper, monkeypatch)
+        assert wrapper._entry_check_conv_id is None
+
+    def test_spawn_does_not_arm_for_rollover_legs(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The rollover's own respawns must not re-trigger the entry
+        # check — that is the loop the C4 guard exists to prevent.
+        # 롤오버 자신의 respawn 은 진입 검사를 재발동하면 안 된다 — C4
+        # 가드가 막으려는 바로 그 루프다.
+        wrapper._pending_respawn = _PendingRespawn(
+            target="t", resume_conv="conv-r", is_rollover_request=True
+        )
+        self._spawn(wrapper, monkeypatch)
+        assert wrapper._entry_check_conv_id is None
+        wrapper._pending_respawn = _PendingRespawn(
+            target="t", resume_conv=None, is_rollover_swap=True
+        )
+        self._spawn(wrapper, monkeypatch)
+        assert wrapper._entry_check_conv_id is None
+
+    def test_entry_marking_emits_notice_once(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        self._arm_usage(wrapper, monkeypatch, "conv-1", exceeded=True)
+        wrapper._entry_check_conv_id = "conv-1"
+
+        wrapper._check_context_usage()
+
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+        assert wrapper._entry_check_conv_id is None
+        assert len(notes) == 1
+        assert "컨텍스트가 거의 찼습니다" in notes[0]
+        # The idempotent re-check must not repeat the notice.
+        # 멱등 재검사가 안내를 반복하면 안 된다.
+        wrapper._check_context_usage()
+        assert len(notes) == 1
+
+    def test_normal_marking_has_no_notice(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        self._arm_usage(wrapper, monkeypatch, "conv-1", exceeded=True)
+
+        wrapper._check_context_usage()
+
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+        assert notes == []
+
+    def test_not_full_at_entry_disarms(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Conclusive "not full" consumes the arming — growth later in
+        # the visit is a normal marking, not an arrival.
+        # 확정 "안 참" 이 무장을 소비한다 — 체류 중 나중의 성장은 도착이
+        # 아니라 일반 마킹이다.
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        self._arm_usage(wrapper, monkeypatch, "conv-1", exceeded=False)
+        wrapper._entry_check_conv_id = "conv-1"
+        wrapper._check_context_usage()
+        assert wrapper._entry_check_conv_id is None
+
+        self._arm_usage(wrapper, monkeypatch, "conv-1", exceeded=True)
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+        assert notes == []
+
+    def test_no_usage_data_keeps_arming(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Inconclusive reading → the deferred marking still announces.
+        # 미확정 판독 → 연기된 마킹도 도착을 안내한다.
+        from session_manager.wrapper import pty_wrapper as pw
+
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        self._arm_usage(wrapper, monkeypatch, "conv-1", exceeded=True)
+        monkeypatch.setattr(
+            pw.context_monitor, "check_context_usage", lambda *a: None
+        )
+        wrapper._entry_check_conv_id = "conv-1"
+        wrapper._check_context_usage()
+        assert wrapper._entry_check_conv_id == "conv-1"
+
+        self._arm_usage(wrapper, monkeypatch, "conv-1", exceeded=True)
+        wrapper._check_context_usage()
+        assert len(notes) == 1
+
+    def test_unknown_birth_keeps_arming(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The flush-race deferral (C4) must not eat the entry notice.
+        # flush 레이스 연기 (C4) 가 진입 안내를 먹으면 안 된다.
+        from session_manager.wrapper import pty_wrapper as pw
+
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        self._arm_usage(wrapper, monkeypatch, "conv-1", exceeded=True)
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: None
+        )
+        wrapper._entry_check_conv_id = "conv-1"
+        wrapper._check_context_usage()
+        assert wrapper._entry_check_conv_id == "conv-1"
+        assert wrapper._rollover_pending_conv_id is None
+
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: 39_000
+        )
+        wrapper._check_context_usage()
+        assert wrapper._rollover_pending_conv_id == "conv-1"
+        assert len(notes) == 1
+
+    def test_birth_guard_suppresses_without_notice(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Arrival at a conversation born full: rollover cannot help, so
+        # the C4 guard wins — no notice, no marking, no re-fire loop.
+        # 태생부터 찬 conversation 도착 — 롤오버로 개선 불가라 C4 가드가
+        # 이긴다. 안내·마킹·재발동 루프 없음.
+        from session_manager.wrapper import pty_wrapper as pw
+
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        self._arm_usage(wrapper, monkeypatch, "conv-1", exceeded=True)
+        monkeypatch.setattr(
+            pw.context_monitor, "read_first_usage", lambda _p: 130_000
+        )
+        wrapper._entry_check_conv_id = "conv-1"
+
+        wrapper._check_context_usage()
+
+        assert wrapper._rollover_suppressed_conv_id == "conv-1"
+        assert wrapper._entry_check_conv_id is None
+        assert notes == []
+
+    def test_stale_arming_for_other_conversation_disarms(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The conversation moved on before a conclusive reading — the
+        # marking that follows is normal, not an arrival.
+        # 확정 판독 전에 conversation 이 바뀌었다 — 이후 마킹은 도착이
+        # 아니라 일반 마킹이다.
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        self._arm_usage(wrapper, monkeypatch, "conv-2", exceeded=True)
+        wrapper._entry_check_conv_id = "conv-old"
+
+        wrapper._check_context_usage()
+
+        assert wrapper._entry_check_conv_id is None
+        assert wrapper._rollover_pending_conv_id == "conv-2"
+        assert notes == []
+
+
 class TestAdvanceRollover:
     """R4-C3: the handoff-turn state machine.
 
