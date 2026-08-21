@@ -26,15 +26,27 @@ from __future__ import annotations
 
 import datetime
 import re
+import unicodedata
 from collections.abc import Iterable
 from pathlib import Path
 
 from session_manager import debug_log
 
 # Claude Code's project-directory naming rule: every non-alphanumeric
-# character of the absolute cwd is replaced by '-'.
-# Claude Code 프로젝트 디렉토리 명명 규칙 — 절대 cwd의 비-알파넘 문자를
-# 모두 '-'로 치환.
+# character of the absolute cwd is replaced by '-', counted on the
+# NFC-normalised string. Measured (Claude Code 2.1.238, 2026-08-21,
+# 2/2 samples incl. a folder stored on disk as NFD): Claude Code writes
+# NFC even when the filesystem returns NFD — macOS APFS preserves the
+# form a folder was created with, and Finder-created Korean names are
+# NFD, so one decomposed syllable would otherwise count as two or three
+# dashes and the directory would never be found.
+# Claude Code 프로젝트 디렉토리 명명 규칙 — 절대 cwd 를 NFC 로 정규화한
+# 문자열의 비-알파넘 문자를 모두 '-' 로 치환. 실측 (Claude Code 2.1.238,
+# 2026-08-21, 디스크에 NFD 로 저장된 폴더 포함 표본 2/2): 파일시스템이
+# NFD 를 돌려줘도 Claude Code 는 NFC 로 쓴다 — macOS APFS 는 폴더가
+# 만들어진 형식을 보존하고 Finder 로 만든 한글 이름은 NFD 라, 정규화
+# 없이는 분해된 음절 하나가 대시 두세 개로 세어져 디렉토리를 영영 찾지
+# 못한다.
 _NON_ALNUM_RE = re.compile(r"[^a-zA-Z0-9]")
 
 
@@ -43,7 +55,8 @@ def encode_cwd(cwd: Path) -> str:
 
     cwd 경로를 Claude Code 프로젝트 디렉토리 명명 규칙으로 인코딩.
     """
-    return _NON_ALNUM_RE.sub("-", str(cwd.resolve()))
+    normalised = unicodedata.normalize("NFC", str(cwd.resolve()))
+    return _NON_ALNUM_RE.sub("-", normalised)
 
 
 def get_conversation_activity(
