@@ -112,29 +112,28 @@ class TestCheckSession:
         result = check_session(_make_ctx(app))
         assert len(result["sessions"]) == 2
 
-    def test_retired_sessions_are_excluded(self, app: AppContext) -> None:
-        # R4-C5: a retired session leaves the routing candidate set — the
-        # in-session LLM must not be able to propose it.
-        # R4-C5: retired 세션은 라우팅 후보에서 빠진다 — 세션 안의 LLM 이
-        # 그 세션을 제안할 수 없어야 한다.
+    def test_archived_sessions_are_excluded(self, app: AppContext) -> None:
+        # An ended (session_end) session leaves the candidate list — the
+        # same rule the judge applies, so the list never contradicts it.
+        # 끝난 (session_end) 세션은 후보 목록에서 빠진다 — 판정기와 같은
+        # 규칙이라 목록이 판정과 모순되지 않는다.
         app.session_store.save_session(SessionMetadata.new(name="alive", title="A"))
-        gone = SessionMetadata.new(name="gone", title="G")
-        gone.retire("manual")
-        app.session_store.save_session(gone)
+        done = SessionMetadata.new(name="done", title="D")
+        done.status = SessionStatus.ARCHIVED
+        app.session_store.save_session(done)
         result = check_session(_make_ctx(app))
-        names = [s["name"] for s in result["sessions"]]
-        assert names == ["alive"]
+        assert [s["name"] for s in result["sessions"]] == ["alive"]
 
-    def test_archived_sessions_still_listed(self, app: AppContext) -> None:
-        # Only RETIRED is filtered; ARCHIVED (session_end) keeps its
-        # existing visibility.
-        # 필터 대상은 RETIRED 뿐 — ARCHIVED (session_end) 의 기존 노출은
-        # 유지된다.
-        archived = SessionMetadata.new(name="done", title="D")
-        archived.status = SessionStatus.ARCHIVED
-        app.session_store.save_session(archived)
+    def test_legacy_retired_file_is_excluded(self, app: AppContext) -> None:
+        # Files from the removed R4-C5 model load as ARCHIVED.
+        # 제거된 R4-C5 모델의 파일은 ARCHIVED 로 읽힌다.
+        app.session_store.save_session(SessionMetadata.new(name="alive", title="A"))
+        legacy = SessionMetadata.new(name="gone", title="G").to_dict()
+        legacy["status"] = "retired"
+        path = app.session_store._sessions_dir / f"{legacy['session_id']}.json"
+        path.write_text(json.dumps(legacy), encoding="utf-8")
         result = check_session(_make_ctx(app))
-        assert [s["name"] for s in result["sessions"]] == ["done"]
+        assert [s["name"] for s in result["sessions"]] == ["alive"]
 
 
 # -------------------------------------------------------------- session_register
@@ -338,100 +337,6 @@ class TestSessionSwitchNoTargetLink:
         dst_after = app.session_store.load_session_by_name("dst")
         assert dst_after is not None
         assert dst_after.claude_conversation_ids == ["conv-dst"]
-
-
-class TestSessionSwitchRetiredPreResolution:
-    """Retirement pre-resolution in session_switch (R4-C6 prep).
-
-    session_switch 의 만료 선해석 (R4-C6 선행 수정).
-
-    A retired target is resolved to its living successor before any
-    bookkeeping, so the transition record, calibration label, wrapper
-    signal and links all name the real destination. Without this the
-    wrapper redirected alone and the links landed on the retired
-    session (observed in the C5 e2e).
-
-    만료된 target 은 어떤 부기보다 먼저 후계로 해석된다 — 전환 기록·
-    보정 라벨·래퍼 신호·링크가 전부 실제 목적지를 가리키도록. 이 단계가
-    없으면 래퍼만 재지향해 링크가 만료 세션에 남는다 (C5 e2e 실관측).
-    """
-
-    def test_retired_target_resolves_to_successor(self, app: AppContext) -> None:
-        app.session_store.save_session(
-            SessionMetadata.new(name="src", title="Source")
-        )
-        app.state.set_current_session("src")
-        app.session_store.save_session(SessionMetadata.new(name="heir", title="H"))
-        gone = SessionMetadata.new(name="gone", title="G")
-        gone.retire("manual", successor="heir")
-        app.session_store.save_session(gone)
-
-        result = session_switch(
-            target="gone",
-            summary="moving",
-            user_prompt="go",
-            ctx=_make_ctx(app),
-        )
-
-        assert result["switched_to"] == "heir"
-        assert app.state.get_current_session() == "heir"
-        assert _signals(app, "switch")[0]["target"] == "heir"
-        src = app.session_store.load_session_by_name("src")
-        assert src is not None
-        assert src.transitions[0].to_session == "heir"
-        events = decision_log.load_events(app.project_path)
-        assert [e["target"] for e in events if e["type"] == "label"] == ["heir"]
-
-    def test_retired_chain_resolves_to_living_end(self, app: AppContext) -> None:
-        app.state.set_current_session(None)
-        first = SessionMetadata.new(name="first", title="1")
-        first.retire("manual", successor="second")
-        app.session_store.save_session(first)
-        second = SessionMetadata.new(name="second", title="2")
-        second.retire("manual", successor="third")
-        app.session_store.save_session(second)
-        app.session_store.save_session(SessionMetadata.new(name="third", title="3"))
-
-        result = session_switch(
-            target="first",
-            summary="",
-            user_prompt="go",
-            ctx=_make_ctx(app),
-        )
-
-        assert result["switched_to"] == "third"
-        assert _signals(app, "switch")[0]["target"] == "third"
-
-    def test_dead_end_refuses_without_bookkeeping(self, app: AppContext) -> None:
-        # The wrapper would abort the swap anyway, but by then the
-        # outgoing summary, label and links would already be written —
-        # so the tool must refuse before touching any state.
-        # 래퍼도 교체를 중단하겠지만 그때는 요약·라벨·링크가 이미 기록된
-        # 뒤다 — 도구가 상태를 건드리기 전에 거절해야 한다.
-        app.session_store.save_session(
-            SessionMetadata.new(name="src", title="Source")
-        )
-        app.state.set_current_session("src")
-        gone = SessionMetadata.new(name="gone", title="G")
-        gone.retire("manual")
-        app.session_store.save_session(gone)
-
-        result = session_switch(
-            target="gone",
-            summary="should not be written",
-            user_prompt="go",
-            ctx=_make_ctx(app),
-        )
-
-        assert result["ok"] is False
-        assert result["error"] == "target_retired_no_successor"
-        assert app.state.get_current_session() == "src"
-        assert _signals(app, "switch") == []
-        src = app.session_store.load_session_by_name("src")
-        assert src is not None
-        assert src.summary is None
-        assert src.transitions == []
-        assert decision_log.load_events(app.project_path) == []
 
 
 # --------------------------------------------------------------- session_create

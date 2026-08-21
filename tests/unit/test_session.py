@@ -6,14 +6,15 @@ import json
 import time
 import uuid
 
+import pytest
+
 from session_manager.models import (
-    RETIRE_REASONS,
     PrecedentRecord,
-    RetiredRecord,
     SessionMetadata,
     SessionStatus,
     TransitionRecord,
 )
+from session_manager.models.session import parse_status
 
 
 def _roundtrip(obj: SessionMetadata) -> SessionMetadata:
@@ -205,93 +206,6 @@ class TestSessionMetadataMixing:
         assert restored.mixing_evidence == []
 
 
-class TestSessionMetadataRetirement:
-    """R4-C5 retirement: status, record roundtrip, retire/revive.
-
-    R4-C5 세션 만료 — 상태·기록 라운드트립·retire/revive.
-    """
-
-    def test_new_defaults(self) -> None:
-        session = SessionMetadata.new(name="frontend", title="차트")
-        assert session.status is SessionStatus.ACTIVE
-        assert session.retired is None
-
-    def test_retire_sets_status_and_record(self) -> None:
-        session = SessionMetadata.new(name="frontend", title="차트")
-        session.retire("manual")
-        assert session.status is SessionStatus.RETIRED
-        assert session.retired is not None
-        assert session.retired.reason == "manual"
-        assert session.retired.successor is None
-        assert session.retired.at.endswith("+00:00")
-
-    def test_retire_with_successor(self) -> None:
-        session = SessionMetadata.new(name="frontend", title="차트")
-        session.retire("polluted", successor="frontend-2")
-        assert session.retired is not None
-        assert session.retired.reason == "polluted"
-        assert session.retired.successor == "frontend-2"
-
-    def test_retire_with_unknown_reason_falls_back_to_manual(self) -> None:
-        session = SessionMetadata.new(name="frontend", title="차트")
-        session.retire("cosmic-rays")
-        assert session.retired is not None
-        assert session.retired.reason == "manual"
-
-    def test_retired_reason_vocabulary(self) -> None:
-        # "rolled_over" is gone — a rollover keeps the same session, so
-        # nothing could ever record it.
-        # "rolled_over" 는 제거됐다 — 롤오버는 같은 세션을 유지하므로
-        # 기록할 주체가 없었다.
-        assert RETIRE_REASONS == ("polluted", "abandoned", "manual")
-
-    def test_legacy_rolled_over_file_loads_as_written(self) -> None:
-        # Backward compat: the vocabulary gates writes (retire), not
-        # reads — a file written before the removal keeps its value.
-        # 하위 호환 — 어휘는 쓰기 (retire) 만 통제하고 읽기는 통제하지
-        # 않는다. 제거 이전에 쓰인 파일은 값을 그대로 유지한다.
-        session = SessionMetadata.new(name="old", title="옛 세션")
-        session.retire("manual", successor="old-2")
-        data = session.to_dict()
-        data["retired"]["reason"] = "rolled_over"
-        restored = SessionMetadata.from_dict(data)
-        assert restored.retired is not None
-        assert restored.retired.reason == "rolled_over"
-        assert restored.status is SessionStatus.RETIRED
-
-    def test_revive_restores_active_and_clears_record(self) -> None:
-        session = SessionMetadata.new(name="frontend", title="차트")
-        session.retire("manual")
-        session.revive()
-        assert session.status is SessionStatus.ACTIVE
-        assert session.retired is None
-
-    def test_roundtrip_preserves_retirement(self) -> None:
-        original = SessionMetadata.new(name="frontend", title="차트")
-        original.retire("polluted", successor="frontend-clean")
-        restored = _roundtrip(original)
-        assert restored == original
-        assert restored.status is SessionStatus.RETIRED
-
-    def test_active_session_serialises_null_retired(self) -> None:
-        data = SessionMetadata.new(name="frontend", title="차트").to_dict()
-        assert data["retired"] is None
-
-    def test_legacy_file_without_retired_loads_with_default(self) -> None:
-        # A session JSON written before R4-C5 has no retired key.
-        # R4-C5 이전에 작성된 세션 JSON 에는 retired 키가 없다.
-        legacy = SessionMetadata.new(name="old", title="옛 세션").to_dict()
-        del legacy["retired"]
-        restored = SessionMetadata.from_dict(legacy)
-        assert restored.retired is None
-
-    def test_retired_record_from_dict_defends_bad_types(self) -> None:
-        record = RetiredRecord.from_dict({"successor": 42})
-        assert record.reason == "manual"
-        assert record.successor is None
-        assert record.at == ""
-
-
 class TestSessionMetadataTouch:
     def test_touch_updates_last_accessed(self) -> None:
         session = SessionMetadata.new(name="auth-fix", title="인증 수정")
@@ -304,16 +218,50 @@ class TestSessionMetadataTouch:
 
 class TestSessionStatus:
     def test_status_values(self) -> None:
-        assert SessionStatus.ACTIVE.value == "active"
-        assert SessionStatus.ARCHIVED.value == "archived"
-        assert SessionStatus.EXPIRED.value == "expired"
-        assert SessionStatus.RETIRED.value == "retired"
+        assert [s.value for s in SessionStatus] == ["active", "archived"]
 
     def test_status_str_comparison(self) -> None:
         assert SessionStatus.ACTIVE == "active"
 
-    def test_status_from_string_restores_enum(self) -> None:
-        assert SessionStatus("expired") is SessionStatus.EXPIRED
+    def test_parse_status_maps_legacy_ended_values(self) -> None:
+        # Files written by the retired R4-C5 model keep loading.
+        # 폐기된 R4-C5 모델이 쓴 파일도 계속 로드된다.
+        assert parse_status("retired") is SessionStatus.ARCHIVED
+        assert parse_status("expired") is SessionStatus.ARCHIVED
+        assert parse_status("archived") is SessionStatus.ARCHIVED
+        assert parse_status("active") is SessionStatus.ACTIVE
+
+    def test_parse_status_rejects_unknown(self) -> None:
+        with pytest.raises(ValueError):
+            parse_status("cosmic")
+
+
+class TestSessionMetadataEnded:
+    """Single ended state (ARCHIVED) and automatic reactivation.
+
+    단일 끝남 상태 (ARCHIVED) 와 자동 복귀.
+    """
+
+    def test_reactivate_archived_returns_true(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        session.status = SessionStatus.ARCHIVED
+        assert session.reactivate() is True
+        assert session.status is SessionStatus.ACTIVE
+
+    def test_reactivate_active_is_noop(self) -> None:
+        session = SessionMetadata.new(name="frontend", title="차트")
+        assert session.reactivate() is False
+        assert session.status is SessionStatus.ACTIVE
+
+    def test_legacy_retired_file_loads_as_archived(self) -> None:
+        data = SessionMetadata.new(name="old", title="옛 세션").to_dict()
+        data["status"] = "retired"
+        data["retired"] = {"reason": "manual", "successor": "x", "at": "t"}
+        restored = SessionMetadata.from_dict(data)
+        assert restored.status is SessionStatus.ARCHIVED
+
+    def test_to_dict_has_no_retired_key(self) -> None:
+        assert "retired" not in SessionMetadata.new(name="a", title="A").to_dict()
 
 
 class TestTransitionRecord:
