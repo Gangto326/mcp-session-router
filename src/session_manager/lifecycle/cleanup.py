@@ -63,13 +63,13 @@ def cleanup_expired_sessions(
     transcript mtime 이 실제 사용 신호다. *project_path* 가 없으면 기존
     메타데이터 전용 동작으로 degrade 한다.
 
-    The predicate is intentionally status-agnostic (R4-C5): retired
-    sessions age out under the same TTL as active ones — retirement
-    removes a session from routing, not from storage.
+    The predicate is intentionally status-agnostic: archived sessions
+    age out under the same TTL as active ones — ending a session removes
+    it from routing, not from storage.
 
-    술어는 의도적으로 status 무관이다 (R4-C5) — retired 세션도 active 와
-    같은 TTL 로 삭제된다. 만료는 라우팅에서 빼는 것이지 저장소에서 빼는
-    것이 아니다.
+    술어는 의도적으로 status 무관이다 — archived 세션도 active 와 같은
+    TTL 로 삭제된다. 끝냄은 라우팅에서 빼는 것이지 저장소에서 빼는 것이
+    아니다.
 
     삭제된 세션 이름 목록을 반환한다.
     """

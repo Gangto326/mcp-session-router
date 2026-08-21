@@ -204,9 +204,9 @@ def _count_active_sessions(project_path: Path) -> int | None:
 
     활성 세션 수를 센다. sessions 디렉토리가 없으면 None (세그먼트 생략).
     Missing ``status`` counts as active (pre-status files); any other
-    value (archived/expired/retired) is inactive; corrupt files skip.
+    value (archived, legacy retired/expired) is inactive; corrupt files skip.
     ``status`` 부재는 active (status 도입 전 파일), 그 외 값 (archived
-    /expired/retired) 은 비활성, 손상 파일은 skip.
+    옛 retired/expired) 는 비활성, 손상 파일은 skip.
     """
     sessions_dir = project_path / _SESSION_MANAGER_DIRNAME / _SESSIONS_DIRNAME
     if not sessions_dir.is_dir():

@@ -72,8 +72,6 @@ from session_manager.wrapper.command_matcher import (
     match_back_command,
     match_handoff_command,
     match_intercept_command,
-    match_retire_command,
-    match_revive_command,
     match_sessions_command,
 )
 from session_manager.wrapper.judge_host import JudgeHost
@@ -1320,14 +1318,6 @@ class SessionManagerWrapper:
                 # 래퍼 자체 수동 롤오버 (R4-C4) — 동일 계약.
                 self._handle_handoff_command()
                 return
-            elif (retire_name := match_retire_command(prompt_text)) is not None:
-                # Wrapper-native session retirement (R4-C5) — same contract.
-                # 래퍼 자체 세션 만료 (R4-C5) — 동일 계약.
-                self._handle_retire_command(retire_name)
-                return
-            elif (revive_name := match_revive_command(prompt_text)) is not None:
-                self._handle_revive_command(revive_name)
-                return
             elif match_sessions_command(prompt_text):
                 # Wrapper-native instant listing (R5-C2) — same contract.
                 # 래퍼 자체 즉시 목록 (R5-C2) — 동일 계약.
@@ -2395,82 +2385,6 @@ class SessionManagerWrapper:
         )
         self._advance_rollover()
 
-    # ------------------------------------------------------- /retire · /revive
-    # 세션 만료·복구 명령 (R4-C5) ------------------------------------------------
-
-    def _handle_retire_command(self, name: str) -> None:
-        """Retire a session by name: it leaves the routing candidate set.
-
-        이름으로 세션을 만료시킨다 — 라우팅 후보에서 제외된다 (R4-C5).
-
-        The current session is refused: retiring the session you are in
-        would leave the wrapper pointing at a non-candidate. Manual
-        /retire records no successor — a switch aimed at the retired
-        session is simply aborted with a notice. (No path writes
-        successor chains today; the redirect machinery stays as a
-        forward-compatible backstop for data that carries one.)
-
-        현재 세션은 거절한다 — 있는 세션을 만료시키면 래퍼가 비후보를
-        가리키게 된다. 수동 /retire 는 successor 를 기록하지 않는다 —
-        만료 세션으로 향한 전환은 안내 후 중단될 뿐이다. (successor
-        사슬을 기록하는 경로는 현재 없다 — 재지향 기계는 successor 가
-        기록된 데이터를 위한 전방 호환 백스톱으로 남는다.)
-        """
-        try:
-            os.write(self.pty_fd, ERASE_INPUT_LINE)
-        except OSError:
-            pass
-        if name == self._current_session_name:
-            self._notify_user(f"현재 사용 중인 {name} 세션은 만료할 수 없습니다")
-            debug_log.log(
-                "SESSION_RETIRE",
-                "USER",
-                {"result": "refused_current", "target": name},
-                session=self._current_session_name,
-            )
-            return
-        store = SessionStore(Path(self.project_path))
-        try:
-            session = store.load_session_by_name(name)
-        except Exception:
-            session = None
-        if session is None:
-            self._notify_user(f"{name} 세션을 찾을 수 없습니다")
-            return
-        if session.status == SessionStatus.RETIRED:
-            self._notify_user(f"{name} 세션은 이미 만료 상태입니다")
-            return
-        try:
-            store.mutate_session_by_name(name, lambda s: s.retire("manual"))
-        except Exception as exc:
-            self._notify_user(f"{name} 세션 만료에 실패했습니다: {exc}")
-            return
-        self._notify_user(f"✝ {name} 세션을 만료했습니다 — 복구는 /revive {name}")
-
-    def _handle_revive_command(self, name: str) -> None:
-        """Undo a retirement: the session routes again. / 만료 복구 (R4-C5)."""
-        try:
-            os.write(self.pty_fd, ERASE_INPUT_LINE)
-        except OSError:
-            pass
-        store = SessionStore(Path(self.project_path))
-        try:
-            session = store.load_session_by_name(name)
-        except Exception:
-            session = None
-        if session is None:
-            self._notify_user(f"{name} 세션을 찾을 수 없습니다")
-            return
-        if session.status != SessionStatus.RETIRED:
-            self._notify_user(f"{name} 세션은 만료 상태가 아닙니다")
-            return
-        try:
-            store.mutate_session_by_name(name, lambda s: s.revive())
-        except Exception as exc:
-            self._notify_user(f"{name} 세션 복구에 실패했습니다: {exc}")
-            return
-        self._notify_user(f"↻ {name} 세션을 복구했습니다 — 다시 라우팅 후보입니다")
-
     def _enqueue_stale_summaries(self) -> None:
         """Boot-time recovery: queue sessions whose summary refresh was lost.
 
@@ -2746,17 +2660,17 @@ class SessionManagerWrapper:
             name = message.get("name")
             if name is None or isinstance(name, str):
                 # While a transition is registered, the wrapper mirror is
-                # authoritative: the MCP's pointer may predate a
-                # retirement redirect (session_switch signals its
+                # authoritative: the MCP's pointer may lag behind the
+                # registered target (session_switch signals its
                 # original target right after the switch signal — R4-C5
-                # e2e caught the mirror being clobbered back to the
-                # retired session). The post-respawn handshake re-syncs
+                # e2e caught the mirror being clobbered back to a stale
+                # session). The post-respawn handshake re-syncs
                 # the fresh MCP from this mirror, so dropping the stale
                 # update heals both sides.
                 # 전환이 등록된 동안은 래퍼 미러가 권위다 — MCP 포인터는
-                # 만료 재지향 이전 값일 수 있다 (session_switch 는 switch
-                # 신호 직후 자신의 원래 target 을 통보한다 — R4-C5 e2e 가
-                # 미러가 만료 세션으로 되돌려지는 것을 잡았다). respawn
+                # 등록된 target 보다 뒤처질 수 있다 (session_switch 는
+                # switch 신호 직후 자신의 원래 target 을 통보한다 — R4-C5
+                # e2e 가 미러가 낡은 세션으로 되돌려지는 것을 잡았다). respawn
                 # 후 핸드셰이크가 새 MCP 를 이 미러로 재동기화하므로,
                 # stale 통보를 버리면 양쪽이 치유된다.
                 if (
@@ -2823,23 +2737,16 @@ class SessionManagerWrapper:
                 session=target,
             )
             return
-        # Last-moment retirement re-check (R4-C5): the judgment that
-        # picked this target ran earlier — the session may have been
-        # retired in between. Redirect to its living successor, or abort
-        # when the chain dead-ends. Rollover request/swap (same ACTIVE
-        # session) and NEW (not in the store yet → load is None) pass
-        # through naturally.
-        # 전환 직전 만료 재확인 (R4-C5): 이 target 을 고른 판정은 이전
-        # 시점의 것 — 그 사이 세션이 만료됐을 수 있다. 살아 있는 후계로
-        # 재지향하고, 사슬이 막히면 중단한다. 롤오버 request/swap (같은
-        # ACTIVE 세션) 과 NEW (스토어에 아직 없음 → 로드 None) 는 자연
-        # 통과한다.
-        redirected = self._redirect_retired_target(target)
-        if redirected is None:
-            return
-        if redirected != target:
-            target = redirected
-            resume_conv = self._resolve_resume_conv(target)
+        # Every transition path converges here, so this is the one place
+        # an ARCHIVED target comes back to life: using an ended session
+        # again IS un-ending it. NEW targets (not in the store yet) and
+        # store errors pass through — reactivation is a convenience, not
+        # a gate.
+        # 모든 전환 경로가 여기로 수렴하므로 ARCHIVED 대상이 되살아나는
+        # 곳도 여기 하나다 — 끝낸 세션을 다시 쓰는 것이 곧 끝남 해제다.
+        # NEW 대상 (스토어에 아직 없음) 과 스토어 오류는 통과 — 복귀는
+        # 편의이지 관문이 아니다.
+        self._reactivate_target(target)
         from_name = handoff.get("from")
         # Queue a background summary for the departing session while its
         # conversation is still the active one, and move the wrapper-side
@@ -2883,56 +2790,30 @@ class SessionManagerWrapper:
             session=target,
         )
 
-    def _redirect_retired_target(self, target: str) -> str | None:
-        """Resolve *target* past retirement: itself, a successor, or None.
+    def _reactivate_target(self, target: str) -> None:
+        """Return an ARCHIVED *target* to ACTIVE (best-effort).
 
-        *target* 의 만료 여부를 해석한다 — 그대로 (미만료), 후계 이름
-        (재지향), 또는 None (후계 없음 → 호출자가 전환 중단) (R4-C5).
-
-        Store errors resolve to "not retired": this is a race defence,
-        and a read failure must not block an ordinary switch.
-
-        스토어 오류는 "미만료" 로 처리한다 — 이 검사는 race 방어이므로
-        읽기 실패가 일반 전환을 막아서는 안 된다.
+        ARCHIVED 인 *target* 을 ACTIVE 로 되돌린다 (best-effort).
         """
-        store = SessionStore(Path(self.project_path))
         try:
-            session = store.load_session_by_name(target)
-        except Exception:
-            session = None
-        if session is None or session.status != SessionStatus.RETIRED:
-            return target
-        try:
-            successor = store.resolve_active_successor(target)
-        except Exception:
-            successor = None
-        if successor is None:
-            self._notify_user(
-                f"{target} 세션은 만료됐고 후계 세션이 없어 전환을 중단합니다"
-                f" — 복구는 /revive {target}"
+            changed = SessionStore(Path(self.project_path)).mutate_session_by_name(
+                target, lambda s: s.reactivate()
             )
+        except Exception as exc:
             debug_log.log(
                 "TRANSITION",
                 "WRAPPER",
-                {"op": "register", "result": "retired_no_heir", "target": target},
+                {"op": "reactivate", "result": "error", "error": str(exc)},
                 session=target,
             )
-            return None
-        self._notify_user(
-            f"{target} 세션은 만료됨 — 후계 {successor} 세션으로 전환합니다"
-        )
-        debug_log.log(
-            "TRANSITION",
-            "WRAPPER",
-            {
-                "op": "register",
-                "result": "retired_redirected",
-                "target": target,
-                "successor": successor,
-            },
-            session=target,
-        )
-        return successor
+            return
+        if changed is not None and changed.status == SessionStatus.ACTIVE:
+            debug_log.log(
+                "TRANSITION",
+                "WRAPPER",
+                {"op": "reactivate", "target": target},
+                session=target,
+            )
 
     def _resolve_resume_conv(self, target: str) -> str | None:
         """Resolve *target*'s latest conversation id with a live transcript.

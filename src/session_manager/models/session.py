@@ -16,56 +16,47 @@ def _utc_now_iso() -> str:
 
 
 class SessionStatus(StrEnum):
+    """Session lifecycle: the single "ended" state is ARCHIVED.
+
+    세션 수명 주기 — "끝남" 상태는 ARCHIVED 하나다.
+
+    ACTIVE sessions are routing candidates everywhere (check_session,
+    judge input, boot-time current inference, statusline count).
+    ARCHIVED is entered when the LLM calls ``session_end`` on the user's
+    explicit wish; it is hidden from every candidate list and comes back
+    to ACTIVE automatically the moment a transition targets it
+    (``reactivate``). Never entered by time or inactivity — a dormant
+    session must stay routable. Legacy values ``retired``/``expired``
+    (R4-C5 model, consolidated 2026-08-21) load as ARCHIVED.
+
+    ACTIVE 세션은 모든 곳 (check_session·판정 입력·부팅 시 현재 추론·
+    statusline 집계) 에서 라우팅 후보다. ARCHIVED 는 사용자가 명시적으로
+    끝내겠다고 해 LLM 이 ``session_end`` 를 부를 때 진입하며, 모든 후보
+    목록에서 숨겨지고 전환 대상이 되는 순간 자동으로 ACTIVE 로 돌아온다
+    (``reactivate``). 시간·미접근으로는 절대 진입하지 않는다 — 휴면
+    세션은 라우팅 가능해야 한다. 옛 값 ``retired``/``expired`` (R4-C5
+    모델, 2026-08-21 통합) 는 ARCHIVED 로 읽는다.
+    """
+
     ACTIVE = "active"
     ARCHIVED = "archived"
-    EXPIRED = "expired"
-    # R4-C5: excluded from routing candidates (check_session, judge
-    # input). Entered only by explicit /retire — never by time or
-    # inactivity (§5.2: a dormant session must stay routable).
-    # Reversed by /revive.
-    # R4-C5: 라우팅 후보 (check_session·판정 입력) 에서 제외되는 상태.
-    # 명시적 /retire 로만 진입 — 시간·미접근으로는 절대 진입하지
-    # 않는다 (§5.2: 휴면 세션은 라우팅 가능해야 함). /revive 로 복구.
-    RETIRED = "retired"
 
 
-# Valid reasons for retirement (§1.4). "rolled_over" is gone (approved
-# 2026-08-16): the rollover model keeps the SAME session, so no path
-# ever retires a session for rolling over — nothing could have used it.
-# The vocabulary gates WRITES only (``retire()``); ``from_dict`` loads
-# any stored reason string as-is, so old files stay intact.
-# 만료 사유 어휘 (§1.4). "rolled_over" 는 제거됐다 (2026-08-16 승인) —
-# 롤오버 모델은 같은 세션을 유지하므로 롤오버로 세션을 만료시키는 경로
-# 자체가 없다. 이 어휘는 **쓰기** (``retire()``) 만 통제한다 —
-# ``from_dict`` 는 저장된 사유 문자열을 그대로 읽으므로 옛 파일은
-# 손대지 않는다.
-RETIRE_REASONS = ("polluted", "abandoned", "manual")
+# Status strings written by the retired R4-C5 model; read as ARCHIVED so
+# old session files keep loading. Nothing writes them any more.
+# 폐기된 R4-C5 모델이 기록하던 상태 문자열 — 옛 세션 파일이 계속
+# 로드되도록 ARCHIVED 로 읽는다. 더 이상 기록하는 곳은 없다.
+_LEGACY_ENDED_STATUSES = frozenset({"retired", "expired"})
 
 
-@dataclass
-class RetiredRecord:
-    """Why and where-to of a retired session. / 만료 사유와 후계."""
+def parse_status(value: object) -> SessionStatus:
+    """Parse a stored status string, mapping legacy ended values.
 
-    reason: str
-    successor: str | None
-    at: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "reason": self.reason,
-            "successor": self.successor,
-            "at": self.at,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> RetiredRecord:
-        return cls(
-            reason=str(data.get("reason", "manual")),
-            successor=data.get("successor")
-            if isinstance(data.get("successor"), str)
-            else None,
-            at=str(data.get("at", "")),
-        )
+    저장된 상태 문자열을 해석한다 — 옛 끝남 값은 ARCHIVED 로 사상.
+    """
+    if value in _LEGACY_ENDED_STATUSES:
+        return SessionStatus.ARCHIVED
+    return SessionStatus(value if isinstance(value, str) else SessionStatus.ACTIVE.value)
 
 
 @dataclass
@@ -230,13 +221,6 @@ class SessionMetadata:
     # rooted=true 정착 확인의 근거 인용 누적 목록. 원값 곁에 판정자에게
     # 표기된다.
     mixing_evidence: list[str] = field(default_factory=list)
-    # Retirement record (R4-C5): present iff status == RETIRED. The
-    # successor (a session NAME) is where a switch aimed at this session
-    # gets redirected; None means "no heir — abort the switch".
-    # 만료 기록 (R4-C5): status == RETIRED 일 때만 존재. successor (세션
-    # **이름**) 는 이 세션으로 향한 전환의 재지향 목적지 — None 이면
-    # "후계 없음, 전환 중단".
-    retired: RetiredRecord | None = None
 
     @classmethod
     def new(cls, name: str, title: str, summary: str | None = None) -> SessionMetadata:
@@ -267,7 +251,6 @@ class SessionMetadata:
             "summary_dialogue_chars": self.summary_dialogue_chars,
             "summary_dialogue_conversation_id": self.summary_dialogue_conversation_id,
             "precedents": [p.to_dict() for p in self.precedents],
-            "retired": self.retired.to_dict() if self.retired else None,
             "mixing_score": self.mixing_score,
             "mixing_evidence": list(self.mixing_evidence),
         }
@@ -284,7 +267,7 @@ class SessionMetadata:
             transitions=[
                 TransitionRecord.from_dict(t) for t in data.get("transitions", [])
             ],
-            status=SessionStatus(data.get("status", SessionStatus.ACTIVE.value)),
+            status=parse_status(data.get("status", SessionStatus.ACTIVE.value)),
             # Default to empty list for legacy session files written before
             # this field existed.
             # 이 필드 도입 전에 작성된 세션 파일과의 호환을 위해 기본값 빈 리스트.
@@ -309,39 +292,26 @@ class SessionMetadata:
             # R3-C2 혼합도 필드의 하위 호환 기본값.
             mixing_score=data.get("mixing_score", 0),
             mixing_evidence=list(data.get("mixing_evidence", [])),
-            # Backward-compat default for the R4-C5 retirement record.
-            # R4-C5 만료 기록의 하위 호환 기본값.
-            retired=RetiredRecord.from_dict(data["retired"])
-            if isinstance(data.get("retired"), dict)
-            else None,
         )
 
     def touch(self) -> None:
         self.last_accessed = _utc_now_iso()
 
-    def retire(self, reason: str, successor: str | None = None) -> None:
-        """Retire this session (R4-C5) — explicit /retire only.
+    def reactivate(self) -> bool:
+        """Bring an ARCHIVED session back to ACTIVE; True if it changed.
 
-        세션을 만료시킨다 (R4-C5) — 명시적 /retire 전용.
+        ARCHIVED 세션을 ACTIVE 로 되돌린다. 바뀌었으면 True.
+        Called when a transition targets the session — using an ended
+        session again is what "not ended any more" means, so no separate
+        command is needed.
+        전환이 이 세션을 대상으로 할 때 호출된다 — 끝낸 세션을 다시
+        쓰는 것이 곧 "더는 끝난 게 아님" 이므로 별도 명령이 필요 없다.
         """
-        self.status = SessionStatus.RETIRED
-        self.retired = RetiredRecord(
-            reason=reason if reason in RETIRE_REASONS else "manual",
-            successor=successor,
-            at=_utc_now_iso(),
-        )
-        debug_log.log(
-            "SESSION_RETIRE",
-            "WRAPPER",
-            {"reason": self.retired.reason, "successor": successor},
-            session=self.name,
-        )
-
-    def revive(self) -> None:
-        """Undo a retirement — the session routes again. / 만료 복구."""
+        if self.status == SessionStatus.ACTIVE:
+            return False
         self.status = SessionStatus.ACTIVE
-        self.retired = None
-        debug_log.log("SESSION_REVIVE", "WRAPPER", {}, session=self.name)
+        debug_log.log("SESSION_REACTIVATE", "WRAPPER", {}, session=self.name)
+        return True
 
     def link_conversation(self, conv_id: str) -> None:
         """Associate a Claude Code conversation id with this session (idempotent).

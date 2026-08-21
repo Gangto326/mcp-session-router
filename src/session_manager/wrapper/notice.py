@@ -76,11 +76,12 @@ def _fit(text: str, width: int | None) -> str:
     return text[: width - 1] + "…"
 
 
-# Row markers. ``●`` = the session the wrapper is in, ``⏸`` = retired,
-# blank = other active session.
-# 행 표식. ``●`` = 래퍼가 있는 세션, ``⏸`` = 만료, 공백 = 그 외 활성 세션.
+# Row markers. ``●`` = the session the wrapper is in, ``○`` = ended
+# (archived), blank = other active session.
+# 행 표식. ``●`` = 래퍼가 있는 세션, ``○`` = 끝남 (archived), 공백 = 그 외
+# 활성 세션.
 _MARK_CURRENT = "●"
-_MARK_RETIRED = "⏸"
+_MARK_ENDED = "○"
 _MARK_OTHER = " "
 
 
@@ -93,35 +94,35 @@ def format_session_list(
 
     ``/sessions`` 목록을 그린다 — 머리줄 + 세션당 한 행.
 
-    Active sessions first (most recently accessed on top), retired ones
-    after with their retirement date; each row shows the first sentence
-    of the summary. ``width`` (terminal columns) clips rows; None leaves
-    them whole.
+    Active sessions first (most recently accessed on top), ended
+    (archived) ones after with their last-accessed date; each row shows
+    the first sentence of the summary. ``width`` (terminal columns)
+    clips rows; None leaves them whole.
 
-    활성 세션 먼저 (최근 접근순), 만료 세션은 만료 날짜와 함께 뒤에;
-    행마다 요약 첫 문장. ``width`` (터미널 칸 수) 로 행을 자르고 None
-    이면 그대로 둔다.
+    활성 세션 먼저 (최근 접근순), 끝난 (archived) 세션은 마지막 접근
+    날짜와 함께 뒤에; 행마다 요약 첫 문장. ``width`` (터미널 칸 수) 로
+    행을 자르고 None 이면 그대로 둔다.
     """
     active = sorted(
-        (s for s in sessions if s.status != SessionStatus.RETIRED),
+        (s for s in sessions if s.status == SessionStatus.ACTIVE),
         key=lambda s: s.last_accessed,
         reverse=True,
     )
-    retired = sorted(
-        (s for s in sessions if s.status == SessionStatus.RETIRED),
-        key=lambda s: s.retired.at if s.retired else "",
+    ended = sorted(
+        (s for s in sessions if s.status != SessionStatus.ACTIVE),
+        key=lambda s: s.last_accessed,
         reverse=True,
     )
-    if not active and not retired:
+    if not active and not ended:
         return ["세션이 없습니다"]
 
     where = f" (현재: {current})" if current else ""
     header = f"세션 {len(active)}개{where}"
-    if retired:
-        header += f", 만료 {len(retired)}개"
+    if ended:
+        header += f", 끝남 {len(ended)}개"
     lines = [header]
 
-    name_width = max(len(s.name) for s in active + retired)
+    name_width = max(len(s.name) for s in active + ended)
     for s in active:
         mark = _MARK_CURRENT if s.name == current else _MARK_OTHER
         gist = first_sentence(s.summary)
@@ -129,10 +130,10 @@ def format_session_list(
         if gist:
             row += f"  — {gist}"
         lines.append(_fit(row, width))
-    for s in retired:
-        when = s.retired.at[:10] if s.retired else ""
+    for s in ended:
+        when = s.last_accessed[:10]
         gist = first_sentence(s.summary)
-        row = f"  {_MARK_RETIRED} {s.name.ljust(name_width)}  — 만료 {when}".rstrip()
+        row = f"  {_MARK_ENDED} {s.name.ljust(name_width)}  — 끝남 {when}".rstrip()
         if gist:
             row += f" · {gist}"
         lines.append(_fit(row, width))
