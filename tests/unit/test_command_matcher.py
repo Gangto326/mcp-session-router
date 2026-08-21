@@ -9,6 +9,7 @@ from session_manager.wrapper.command_matcher import (
     match_intercept_command,
     match_retire_command,
     match_revive_command,
+    match_sessions_command,
 )
 
 
@@ -288,3 +289,25 @@ class TestMatchReviveCommand:
 
     def test_prefix_not_matched(self):
         assert match_revive_command("/revived x") is None
+
+
+class TestSessionsCommand:
+    """R5-C2: wrapper-native /sessions (no arguments)."""
+
+    def test_bare(self):
+        assert match_sessions_command("/sessions") is True
+
+    def test_trailing_whitespace_and_placeholder(self):
+        assert match_sessions_command("/sessions   ") is True
+        assert match_sessions_command("/sessions [hint]") is True
+
+    def test_argument_falls_through(self):
+        assert match_sessions_command("/sessions all") is False
+
+    def test_prefix_and_case(self):
+        assert match_sessions_command("/session") is False
+        assert match_sessions_command("/Sessions") is False
+
+    def test_none_and_empty(self):
+        assert match_sessions_command(None) is False
+        assert match_sessions_command("   ") is False

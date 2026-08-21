@@ -3370,3 +3370,90 @@ class TestCurrentSessionMirrorPersistence:
         assert wrapper_state.load_current_session(Path(wrapper.project_path)) == (
             "backend"
         )
+
+
+class TestNoticeGrammar:
+    """R5-C2: router interventions go through the shared glyph vocabulary.
+
+    R5-C2: 라우터 개입은 공통 기호 어휘를 거친다.
+    """
+
+    def _notes(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> list[str]:
+        wrapper.pty_fd = -1
+        notes: list[str] = []
+        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
+        return notes
+
+    def test_back_glyph(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._last_transition = {"from": "a", "to": "b", "user_prompt": "p"}
+        monkeypatch.setattr(wrapper, "_resolve_resume_conv", lambda _n: "conv-a")
+        wrapper._handle_back_command()
+        assert notes[-1] == "⤺ a 세션으로 되돌립니다 (직전: b)"
+
+    def test_info_lines_have_no_glyph(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        notes = self._notes(wrapper, monkeypatch)
+        wrapper._handle_back_command()
+        assert notes == ["되돌릴 전환이 없습니다"]
+
+
+class TestHandleSessionsCommand:
+    """R5-C2: /sessions prints the listing instantly via the block writer.
+
+    R5-C2: /sessions 가 블록 출력으로 목록을 즉시 찍는다.
+    """
+
+    def test_lists_with_current_marker(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = SessionStore(Path(wrapper.project_path))
+        a = SessionMetadata.new(name="backend", title="t")
+        a.summary = "로그인 조사. 계속."
+        store.save_session(a)
+        store.save_session(SessionMetadata.new(name="frontend", title="t"))
+        wrapper.pty_fd = -1
+        wrapper._current_session_name = "backend"
+        blocks: list[list[str]] = []
+        monkeypatch.setattr(wrapper, "_notify_block", blocks.append)
+        wrapper._handle_sessions_command()
+        assert len(blocks) == 1
+        lines = blocks[0]
+        assert lines[0] == "세션 2개 (현재: backend)"
+        assert any(line.startswith("  ● backend") and "로그인 조사." in line for line in lines)
+        assert any(line.startswith("    frontend") for line in lines)
+
+    def test_no_sessions(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapper.pty_fd = -1
+        blocks: list[list[str]] = []
+        monkeypatch.setattr(wrapper, "_notify_block", blocks.append)
+        wrapper._handle_sessions_command()
+        assert blocks == [["세션이 없습니다"]]
+
+    def test_submit_dispatches_and_does_not_forward(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The \r for /sessions must never reach Claude Code.
+        # /sessions 의 \r 은 Claude Code 에 닿으면 안 된다.
+        wrapper.virtual_screen.feed("❯ /sessions".encode())
+        called: list[str] = []
+        monkeypatch.setattr(
+            wrapper, "_handle_sessions_command", lambda: called.append("x")
+        )
+        writes: list[bytes] = []
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
+        monkeypatch.setattr(
+            "os.write", lambda fd, data: writes.append(data) or len(data)
+        )
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+        wrapper._handle_stdin_readable()
+        assert called == ["x"]
+        assert b"\r" not in writes
