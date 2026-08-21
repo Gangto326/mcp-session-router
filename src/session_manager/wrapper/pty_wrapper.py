@@ -2318,13 +2318,15 @@ class SessionManagerWrapper:
         The current session is refused: retiring the session you are in
         would leave the wrapper pointing at a non-candidate. Manual
         /retire records no successor — a switch aimed at the retired
-        session is simply aborted with a notice (redirect happens only
-        for successor chains written by the C7 split path).
+        session is simply aborted with a notice. (No path writes
+        successor chains today; the redirect machinery stays as a
+        forward-compatible backstop for data that carries one.)
 
         현재 세션은 거절한다 — 있는 세션을 만료시키면 래퍼가 비후보를
         가리키게 된다. 수동 /retire 는 successor 를 기록하지 않는다 —
-        만료 세션으로 향한 전환은 안내 후 중단될 뿐이다 (재지향은 C7
-        분리 경로가 기록한 successor 사슬에서만 일어난다).
+        만료 세션으로 향한 전환은 안내 후 중단될 뿐이다. (successor
+        사슬을 기록하는 경로는 현재 없다 — 재지향 기계는 successor 가
+        기록된 데이터를 위한 전방 호환 백스톱으로 남는다.)
         """
         try:
             os.write(self.pty_fd, ERASE_INPUT_LINE)

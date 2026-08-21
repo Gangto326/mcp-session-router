@@ -7,6 +7,7 @@ import time
 import uuid
 
 from session_manager.models import (
+    RETIRE_REASONS,
     PrecedentRecord,
     RetiredRecord,
     SessionMetadata,
@@ -226,8 +227,9 @@ class TestSessionMetadataRetirement:
 
     def test_retire_with_successor(self) -> None:
         session = SessionMetadata.new(name="frontend", title="차트")
-        session.retire("rolled_over", successor="frontend-2")
+        session.retire("polluted", successor="frontend-2")
         assert session.retired is not None
+        assert session.retired.reason == "polluted"
         assert session.retired.successor == "frontend-2"
 
     def test_retire_with_unknown_reason_falls_back_to_manual(self) -> None:
@@ -235,6 +237,27 @@ class TestSessionMetadataRetirement:
         session.retire("cosmic-rays")
         assert session.retired is not None
         assert session.retired.reason == "manual"
+
+    def test_retired_reason_vocabulary(self) -> None:
+        # "rolled_over" is gone — a rollover keeps the same session, so
+        # nothing could ever record it.
+        # "rolled_over" 는 제거됐다 — 롤오버는 같은 세션을 유지하므로
+        # 기록할 주체가 없었다.
+        assert RETIRE_REASONS == ("polluted", "abandoned", "manual")
+
+    def test_legacy_rolled_over_file_loads_as_written(self) -> None:
+        # Backward compat: the vocabulary gates writes (retire), not
+        # reads — a file written before the removal keeps its value.
+        # 하위 호환 — 어휘는 쓰기 (retire) 만 통제하고 읽기는 통제하지
+        # 않는다. 제거 이전에 쓰인 파일은 값을 그대로 유지한다.
+        session = SessionMetadata.new(name="old", title="옛 세션")
+        session.retire("manual", successor="old-2")
+        data = session.to_dict()
+        data["retired"]["reason"] = "rolled_over"
+        restored = SessionMetadata.from_dict(data)
+        assert restored.retired is not None
+        assert restored.retired.reason == "rolled_over"
+        assert restored.status is SessionStatus.RETIRED
 
     def test_revive_restores_active_and_clears_record(self) -> None:
         session = SessionMetadata.new(name="frontend", title="차트")

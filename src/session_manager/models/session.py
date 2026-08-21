@@ -20,23 +20,26 @@ class SessionStatus(StrEnum):
     ARCHIVED = "archived"
     EXPIRED = "expired"
     # R4-C5: excluded from routing candidates (check_session, judge
-    # input). Entered only by explicit /retire or the C7 split path —
-    # never by time or inactivity (§5.2: a dormant session must stay
-    # routable). Reversed by /revive.
+    # input). Entered only by explicit /retire — never by time or
+    # inactivity (§5.2: a dormant session must stay routable).
+    # Reversed by /revive.
     # R4-C5: 라우팅 후보 (check_session·판정 입력) 에서 제외되는 상태.
-    # 명시적 /retire 또는 C7 분리 경로로만 진입 — 시간·미접근으로는
-    # 절대 진입하지 않는다 (§5.2: 휴면 세션은 라우팅 가능해야 함).
-    # /revive 로 복구.
+    # 명시적 /retire 로만 진입 — 시간·미접근으로는 절대 진입하지
+    # 않는다 (§5.2: 휴면 세션은 라우팅 가능해야 함). /revive 로 복구.
     RETIRED = "retired"
 
 
-# Valid reasons for retirement (§1.4). "rolled_over" is reserved for the
-# C7 split path — the C4 rollover model keeps the SAME session, so a
-# rollover itself never retires one (approved design call, Plan §0.5).
-# 만료 사유 어휘 (§1.4). "rolled_over" 는 C7 분리 경로 예약 — C4 롤오버
-# 모델은 같은 세션을 유지하므로 롤오버 자체는 세션을 만료시키지 않는다
-# (승인된 설계 판단, Plan §0.5).
-RETIRE_REASONS = ("rolled_over", "polluted", "abandoned", "manual")
+# Valid reasons for retirement (§1.4). "rolled_over" is gone (approved
+# 2026-08-16): the rollover model keeps the SAME session, so no path
+# ever retires a session for rolling over — nothing could have used it.
+# The vocabulary gates WRITES only (``retire()``); ``from_dict`` loads
+# any stored reason string as-is, so old files stay intact.
+# 만료 사유 어휘 (§1.4). "rolled_over" 는 제거됐다 (2026-08-16 승인) —
+# 롤오버 모델은 같은 세션을 유지하므로 롤오버로 세션을 만료시키는 경로
+# 자체가 없다. 이 어휘는 **쓰기** (``retire()``) 만 통제한다 —
+# ``from_dict`` 는 저장된 사유 문자열을 그대로 읽으므로 옛 파일은
+# 손대지 않는다.
+RETIRE_REASONS = ("polluted", "abandoned", "manual")
 
 
 @dataclass
@@ -317,9 +320,9 @@ class SessionMetadata:
         self.last_accessed = _utc_now_iso()
 
     def retire(self, reason: str, successor: str | None = None) -> None:
-        """Retire this session (R4-C5) — explicit /retire or C7 only.
+        """Retire this session (R4-C5) — explicit /retire only.
 
-        세션을 만료시킨다 (R4-C5) — 명시적 /retire 또는 C7 경로 전용.
+        세션을 만료시킨다 (R4-C5) — 명시적 /retire 전용.
         """
         self.status = SessionStatus.RETIRED
         self.retired = RetiredRecord(

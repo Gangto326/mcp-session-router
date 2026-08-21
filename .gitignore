@@ -33,6 +33,10 @@ htmlcov/
 .idea/
 .vscode/
 
+# Penguin plugin hook state (local-only)
+# Penguin 플러그인 hook 상태 디렉토리 (로컬 전용)
+.claude/penguin/
+
 *.md
 # Local-only docs policy: all .md ignored, EXCEPT distributed skill files.
 # 로컬 전용 문서 정책 — 모든 .md 무시, 단 배포 대상 스킬 파일은 예외.
