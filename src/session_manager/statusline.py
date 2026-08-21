@@ -1,7 +1,30 @@
-"""Statusline collector: records context-window facts Claude Code feeds it.
+"""Statusline: records context-window facts and renders the router status.
 
-statusline 수집기 — Claude Code 가 statusline 명령에 떠먹여 주는
-컨텍스트 창 사실을 받아 적는다.
+statusline — 컨텍스트 창 사실을 받아 적고 (R4-C1) 라우터 상태줄을
+그린다 (R5-C1).
+
+Display (R5-C1): the line printed to stdout becomes Claude Code's bottom
+status bar — ``⎇ {session} · {mode} · ctx {pct}% · {n} sessions``. Each
+segment is sourced where it is freshest at render time and dropped when
+unavailable: the session name from ``state.json`` (the wrapper's
+mirror — the only value the wrapper alone knows), the routing mode from
+``config.json`` (MCP ``set_routing_mode`` changes it without the wrapper
+knowing), the active-session count from ``sessions/`` (same rule as the
+UserPromptSubmit hook: missing ``status`` counts as active, corrupt
+files are skipped), and the context percentage from this invocation's
+stdin with ``context.json`` as a fallback for older Claude Code
+payloads. This module only *reads* ``state.json`` — see below for why it
+must not write there.
+
+표시 (R5-C1): stdout 에 찍는 한 줄이 Claude Code 하단 상태줄이 된다 —
+``⎇ {session} · {mode} · ctx {pct}% · {n} sessions``. 세그먼트마다
+표시 시점에 가장 신선한 곳에서 읽고, 없으면 그 조각만 뺀다: 세션
+이름은 ``state.json`` (래퍼 미러 — 래퍼만 아는 유일한 값), 라우팅
+모드는 ``config.json`` (MCP ``set_routing_mode`` 가 래퍼 모르게 바꾼다),
+활성 세션 수는 ``sessions/`` (UserPromptSubmit hook 과 같은 규칙 —
+``status`` 부재는 active, 손상 파일은 skip), 컨텍스트 퍼센트는 이번
+호출의 stdin, 구버전 payload 면 ``context.json`` 폴백. 이 모듈은
+``state.json`` 을 *읽기만* 한다 — 쓰면 안 되는 이유는 아래.
 
 Claude Code invokes the configured statusline command on every status
 change and passes a JSON object on stdin that includes — measured,
@@ -56,9 +79,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from session_manager.models.config import DEFAULT_ROUTING_MODE
+from session_manager.storage.file_store import _CONFIG_FILENAME, _SESSIONS_DIRNAME
+from session_manager.wrapper import wrapper_state
+
 _SOCKET_ENV_VAR = "SESSION_MANAGER_SOCKET"
 _SESSION_MANAGER_DIRNAME = ".session-manager"
 CONTEXT_FILENAME = "context.json"
+
+# Status-line glyphs. ``⎇`` marks the session segment (branch-like —
+# "which line of work am I on"); ``·`` separates segments.
+# 상태줄 기호. ``⎇`` 는 세션 세그먼트 표시 (브랜치 느낌 — "지금 어느
+# 작업 줄기에 있나"), ``·`` 는 세그먼트 구분자.
+SESSION_GLYPH = "⎇"
+SEGMENT_SEPARATOR = " · "
 
 # Numerator fields inside context_window.current_usage that make up the
 # context footprint (measured: their sum equals /context's display and
@@ -144,6 +178,91 @@ def read_context(project_path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _load_routing_mode(project_path: Path) -> str:
+    """Read ``routing_mode`` from config.json; absent/corrupt → default.
+
+    config.json 에서 ``routing_mode`` 를 읽는다. 부재·손상이면 기본값.
+    Same rule as the UserPromptSubmit hook, re-implemented here so the
+    statusline (spawned several times per turn) does not import the
+    hook's judge/routing modules.
+    UserPromptSubmit hook 과 같은 규칙 — statusline 은 턴마다 수차례
+    뜨므로 hook 의 judge/routing 모듈을 끌어오지 않으려고 따로 둔다.
+    """
+    path = project_path / _SESSION_MANAGER_DIRNAME / _CONFIG_FILENAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return DEFAULT_ROUTING_MODE
+    if not isinstance(data, dict):
+        return DEFAULT_ROUTING_MODE
+    mode = data.get("routing_mode")
+    return mode if isinstance(mode, str) and mode else DEFAULT_ROUTING_MODE
+
+
+def _count_active_sessions(project_path: Path) -> int | None:
+    """Count active sessions; None when the project has no sessions dir.
+
+    활성 세션 수를 센다. sessions 디렉토리가 없으면 None (세그먼트 생략).
+    Missing ``status`` counts as active (pre-status files); any other
+    value (archived/expired/retired) is inactive; corrupt files skip.
+    ``status`` 부재는 active (status 도입 전 파일), 그 외 값 (archived
+    /expired/retired) 은 비활성, 손상 파일은 skip.
+    """
+    sessions_dir = project_path / _SESSION_MANAGER_DIRNAME / _SESSIONS_DIRNAME
+    if not sessions_dir.is_dir():
+        return None
+    count = 0
+    for path in sessions_dir.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("status", "active") == "active":
+            count += 1
+    return count
+
+
+def build_status_line(
+    session: str | None,
+    mode: str | None,
+    ctx_pct: int | float | None,
+    session_count: int | None,
+) -> str | None:
+    """Compose ``⎇ {session} · {mode} · ctx {pct}% · {n} sessions``.
+
+    상태줄 한 줄을 조합한다. 없는 조각은 빼고 나머지로 만들며, 조각이
+    하나도 없으면 None (무출력).
+    """
+    segments: list[str] = []
+    if session:
+        segments.append(f"{SESSION_GLYPH} {session}")
+    if mode:
+        segments.append(mode)
+    if isinstance(ctx_pct, int | float) and not isinstance(ctx_pct, bool):
+        segments.append(f"ctx {round(ctx_pct)}%")
+    if isinstance(session_count, int) and not isinstance(session_count, bool):
+        noun = "session" if session_count == 1 else "sessions"
+        segments.append(f"{session_count} {noun}")
+    return SEGMENT_SEPARATOR.join(segments) if segments else None
+
+
+def render(project_path: Path, record: dict[str, Any] | None) -> str | None:
+    """Gather every segment's source and build the line.
+
+    세그먼트별 원천을 모아 상태줄을 만든다. ``record`` 는 이번 stdin 의
+    컨텍스트 레코드 (구버전 payload 면 None → context.json 폴백).
+    """
+    if record is None:
+        record = read_context(project_path)
+    pct = record.get("used_percentage") if record else None
+    return build_status_line(
+        session=wrapper_state.load_current_session(project_path),
+        mode=_load_routing_mode(project_path),
+        ctx_pct=pct,
+        session_count=_count_active_sessions(project_path),
+    )
+
+
 def main() -> None:
     try:
         # Outside ccode: no side effects, no output (F4 philosophy).
@@ -157,12 +276,9 @@ def main() -> None:
         record = _extract_record(payload)
         if record is not None:
             write_context(project_path, record)
-            pct = record.get("used_percentage")
-            model_id = record.get("model_id") or "?"
-            if isinstance(pct, int | float):
-                # Minimal display — the pretty format is R5-C1's job.
-                # 최소 표시 — 예쁜 형식은 R5-C1 몫.
-                print(f"{model_id} · ctx {pct}%")
+        line = render(project_path, record)
+        if line:
+            print(line)
     except Exception:
         # A broken statusline must never disturb the terminal.
         # statusline 고장이 터미널을 어지럽혀선 안 된다.

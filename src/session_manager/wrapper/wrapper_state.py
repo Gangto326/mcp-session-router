@@ -3,15 +3,19 @@
 ``.session-manager/state.json`` 에 영속화되는 래퍼 런타임 상태.
 
 Introduced by R3-C3 with a single key (``last_transition``) so ``/back``
-survives a wrapper restart; R5 extends the same file with statusline
-state. Reads are fully defensive — a missing or corrupt file is simply
+survives a wrapper restart; R5-C1 added ``current_session`` — the
+wrapper's mirror of the active session name, read by the statusline
+(``statusline.py``) which is read-only here, so the only writer remains
+the wrapper. Reads are fully defensive — a missing or corrupt file is simply
 empty state, never an error, because losing an undo record must not
 break the wrapper.
 
 R3-C3 이 단일 키(``last_transition``)로 도입 — ``/back`` 이 래퍼 재시작을
-견디게 한다. R5 가 같은 파일을 statusline 상태로 확장한다. 읽기는 전부
-방어적이다 — 파일 없음·손상은 빈 상태일 뿐 오류가 아니다. undo 기록
-유실이 래퍼를 깨뜨려서는 안 되기 때문이다.
+견디게 한다. R5-C1 이 ``current_session`` 을 추가 — 활성 세션 이름의
+래퍼 측 미러로, statusline (``statusline.py``) 이 읽기 전용으로 읽으므로
+쓰는 쪽은 여전히 래퍼 하나뿐이다. 읽기는 전부 방어적이다 — 파일
+없음·손상은 빈 상태일 뿐 오류가 아니다. undo 기록 유실이 래퍼를
+깨뜨려서는 안 되기 때문이다.
 
 Writes are atomic (tmp + replace) but not inter-process locked: the
 record is per-wrapper UX state, and the worst concurrent outcome is one
@@ -44,6 +48,14 @@ LAST_TRANSITION_KEY = "last_transition"
 # ``user_prompt`` 는 전환과 함께 이동한 프롬프트 (/back 이 재주입),
 # ``at`` 은 ISO8601.
 _REQUIRED_FIELDS = ("from", "to")
+
+# Name of the session the wrapper currently sits in (R5-C1). Written by
+# the wrapper whenever its mirror moves, removed when the mirror is None
+# (unregistered start) so a stale name from a previous run never shows.
+# 래퍼가 현재 머무는 세션 이름 (R5-C1). 미러가 움직일 때마다 래퍼가
+# 기록하고, 미러가 None (미등록 시작) 이면 키를 지워 이전 실행의 묵은
+# 이름이 표시되지 않게 한다.
+CURRENT_SESSION_KEY = "current_session"
 
 
 def utc_now_iso() -> str:
@@ -125,3 +137,28 @@ def clear_last_transition(project_path: Path) -> None:
     debug_log.log(
         "WRAPPER_STATE", "WRAPPER", {"op": "clear_last_transition"}
     )
+
+
+def save_current_session(project_path: Path, name: str | None) -> None:
+    """Mirror the wrapper's current session name for the statusline.
+
+    래퍼의 현재 세션 이름을 statusline 용으로 미러링한다. ``None`` 은
+    키 제거 (세그먼트 생략) 를 뜻한다.
+    """
+    state = _load_state(project_path)
+    if name:
+        state[CURRENT_SESSION_KEY] = name
+    elif CURRENT_SESSION_KEY in state:
+        del state[CURRENT_SESSION_KEY]
+    else:
+        return
+    _save_state(project_path, state)
+
+
+def load_current_session(project_path: Path) -> str | None:
+    """Return the mirrored current session name, or None if absent/unusable.
+
+    미러링된 현재 세션 이름을 반환. 없거나 사용 불가면 None.
+    """
+    name = _load_state(project_path).get(CURRENT_SESSION_KEY)
+    return name if isinstance(name, str) and name else None

@@ -335,7 +335,8 @@ class SessionManagerWrapper:
         # 관찰 등) 가 사용한다. SWITCH/NEW 신호에서 갱신. 미등록 신규
         # 시작이면 None 일 수 있고, 그 경우 트리거는 로그만 남기고 skip —
         # 이 빈틈은 부팅 시 복구와 R2 hook 구조가 메운다.
-        self._current_session_name: str | None = self._initial_session_name
+        self._current_session_name: str | None = None
+        self._set_current_session(self._initial_session_name)
 
         # Background summarizer worker (R1). Lives for the wrapper's whole
         # lifetime; drains the file queue that the triggers below fill.
@@ -1627,6 +1628,23 @@ class SessionManagerWrapper:
         self._last_transition = record
         wrapper_state.save_last_transition(Path(self.project_path), record)
 
+    def _set_current_session(self, name: str | None) -> None:
+        """Move the wrapper-side session mirror and persist it (R5-C1).
+
+        The persisted copy in ``state.json`` is what the statusline
+        process reads — it has no other way to learn the session name.
+        Persistence is best-effort: a failed write is logged inside
+        ``wrapper_state`` and the statusline just omits that segment.
+
+        래퍼 측 세션 미러를 옮기고 영속화한다 (R5-C1). ``state.json``
+        의 사본은 statusline 프로세스가 읽는 값이다 — 세션 이름을 알
+        다른 길이 없다. 영속화는 best-effort: 쓰기 실패는
+        ``wrapper_state`` 안에서 로그만 남고, 표시줄은 그 세그먼트를
+        생략할 뿐이다.
+        """
+        self._current_session_name = name
+        wrapper_state.save_current_session(Path(self.project_path), name)
+
     # ------------------------------------------------------- Summary triggers
     # 요약 트리거 ---------------------------------------------------------------
 
@@ -2686,7 +2704,7 @@ class SessionManagerWrapper:
                     )
                     return
                 before = self._current_session_name
-                self._current_session_name = name
+                self._set_current_session(name)
                 debug_log.log(
                     "CURRENT_SESSION",
                     "MCP_TOOL",
@@ -2767,7 +2785,7 @@ class SessionManagerWrapper:
             # 롤오버 교체는 자기 선대를 떠난다 — 요약 갱신은 finalize 가
             # 후계 기준으로 수행한다.
             self._enqueue_departed_summary(from_name)
-        self._current_session_name = target
+        self._set_current_session(target)
         handoff_clean = {k: v for k, v in handoff.items() if k != "user_prompt"}
         handoff_store.write_pending(
             Path(self.project_path), target, handoff_clean, user_prompt
