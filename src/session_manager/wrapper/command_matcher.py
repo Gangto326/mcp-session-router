@@ -76,6 +76,12 @@ _HANDOFF_COMMAND_RE = re.compile(r"^/handoff\s*$")
 _RETIRE_COMMAND_RE = re.compile(r"^/retire\s+(\S+)\s*$")
 _REVIVE_COMMAND_RE = re.compile(r"^/revive\s+(\S+)\s*$")
 
+# /sessions (R5-C2): instant session listing, no LLM round-trip — same
+# no-argument intercept contract as /back.
+# /sessions (R5-C2): LLM 왕복 없는 즉시 세션 목록 — /back 과 같은
+# 무인자 가로채기 계약.
+_SESSIONS_COMMAND_RE = re.compile(r"^/sessions\s*$")
+
 # Heuristic: strip Ink-style placeholder hints like
 # ``[conversation id or search term]`` that may follow the user's input.
 # False-positive risk if a user genuinely types ``[...]`` as the argument —
@@ -212,6 +218,24 @@ def _match_one_arg_command(
         {"matched": True, "command": command, "args": arg, "prompt": prompt_text},
     )
     return arg
+
+
+def match_sessions_command(prompt_text: str | None) -> bool:
+    """Return True if ``prompt_text`` is the wrapper-native ``/sessions``.
+
+    ``prompt_text`` 가 래퍼 자체 명령 ``/sessions`` 이면 True.
+    """
+    if not prompt_text or not prompt_text.strip():
+        return False
+    cleaned = _PLACEHOLDER_RE.sub("", prompt_text)
+    matched = _SESSIONS_COMMAND_RE.match(cleaned) is not None
+    if matched:
+        debug_log.log(
+            "CMD_MATCH",
+            "USER",
+            {"matched": True, "command": "sessions", "prompt": prompt_text},
+        )
+    return matched
 
 
 def match_retire_command(prompt_text: str | None) -> str | None:

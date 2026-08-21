@@ -74,8 +74,14 @@ from session_manager.wrapper.command_matcher import (
     match_intercept_command,
     match_retire_command,
     match_revive_command,
+    match_sessions_command,
 )
 from session_manager.wrapper.judge_host import JudgeHost
+from session_manager.wrapper.notice import (
+    NoticeKind,
+    format_notice,
+    format_session_list,
+)
 from session_manager.wrapper.socket_server import WrapperSocketServer
 from session_manager.wrapper.virtual_screen import VirtualScreen
 
@@ -1225,9 +1231,10 @@ class SessionManagerWrapper:
                 "latest_conv": sole_ids[-1],
             },
         )
-        self._notify_user(
-            "⚠ 롤오버된 이전 대화에 있습니다 — 다음 입력 때 최신 대화로 "
-            "이동할지 묻습니다"
+        self._notify(
+            NoticeKind.ROLLOVER,
+            "롤오버된 이전 대화에 있습니다 — 다음 입력 때 최신 대화로 "
+            "이동할지 묻습니다",
         )
         debug_log.log(
             "STALE_CONV_ENTRY",
@@ -1320,6 +1327,11 @@ class SessionManagerWrapper:
                 return
             elif (revive_name := match_revive_command(prompt_text)) is not None:
                 self._handle_revive_command(revive_name)
+                return
+            elif match_sessions_command(prompt_text):
+                # Wrapper-native instant listing (R5-C2) — same contract.
+                # 래퍼 자체 즉시 목록 (R5-C2) — 동일 계약.
+                self._handle_sessions_command()
                 return
             elif prompt_text and CLEAR_COMMAND_RE.match(prompt_text.strip()):
                 # /clear wipes the conversation — summarise it while it's
@@ -1479,6 +1491,58 @@ class SessionManagerWrapper:
         except OSError:
             pass
 
+    def _notify(self, kind: NoticeKind, text: str) -> None:
+        """Print one router intervention in the shared notice grammar (R5-C2).
+
+        공통 알림 문법으로 라우터 개입 한 줄을 찍는다 (R5-C2). 기호는
+        ``notice.NoticeKind`` 가 단일 출처다.
+        """
+        self._notify_user(format_notice(kind, text))
+
+    def _notify_block(self, lines: list[str]) -> None:
+        """Print a multi-line wrapper block (first line carries the prefix).
+
+        여러 줄 래퍼 블록을 찍는다 (첫 줄에만 접두사).
+        """
+        if self._stdout_fd < 0 or not lines:
+            return
+        body = "\r\n".join(lines)
+        try:
+            os.write(self._stdout_fd, f"\r\n[session-manager] {body}\r\n".encode())
+        except OSError:
+            pass
+
+    def _handle_sessions_command(self) -> None:
+        """``/sessions``: list sessions instantly, no LLM round-trip (R5-C2).
+
+        ``/sessions`` — LLM 왕복 없이 세션 목록을 즉시 찍는다 (R5-C2).
+        Rows are clipped to the terminal width when it is known.
+        터미널 폭을 알면 행을 그 폭에 맞춰 자른다.
+        """
+        try:
+            os.write(self.pty_fd, ERASE_INPUT_LINE)
+        except OSError:
+            pass
+        try:
+            sessions = SessionStore(Path(self.project_path)).list_sessions()
+        except Exception as exc:
+            self._notify_user(f"세션 목록을 읽지 못했습니다: {exc}")
+            return
+        width: int | None = None
+        try:
+            width = os.get_terminal_size(self._stdout_fd).columns
+        except (OSError, ValueError):
+            pass
+        self._notify_block(
+            format_session_list(sessions, self._current_session_name, width)
+        )
+        debug_log.log(
+            "SESSIONS_LIST",
+            "USER",
+            {"count": len(sessions)},
+            session=self._current_session_name,
+        )
+
     def _handle_back_command(self) -> None:
         """Undo the most recent wrapper-executed transition.
 
@@ -1545,7 +1609,9 @@ class SessionManagerWrapper:
             {"result": "undo", "origin": origin, "wrong": wrong},
             session=self._current_session_name,
         )
-        self._notify_user(f"⇄ {origin} 세션으로 되돌립니다 (직전: {wrong})")
+        self._notify(
+            NoticeKind.BACK, f"{origin} 세션으로 되돌립니다 (직전: {wrong})"
+        )
         self._execute_transition(
             target=origin,
             resume_conv=resume_conv,
@@ -1937,9 +2003,10 @@ class SessionManagerWrapper:
             # via a transition and the session is already full.
             # 스펙 원문 (Plan §5 R4-C6) — 방금 전환으로 도착했는데
             # 세션이 이미 차 있다.
-            self._notify_user(
-                "⚠ 그 세션은 컨텍스트가 거의 찼습니다 — "
-                "Handoff로 이어서 새 대화로 재개합니다"
+            self._notify(
+                NoticeKind.ROLLOVER,
+                "그 세션은 컨텍스트가 거의 찼습니다 — "
+                "Handoff로 이어서 새 대화로 재개합니다",
             )
         debug_log.log(
             "ROLLOVER_PENDING",
@@ -2016,10 +2083,11 @@ class SessionManagerWrapper:
         )
         if attempts == 1:
             pct = self._rollover_pending_pct
-            self._notify_user(
-                f"⚠ 컨텍스트 {pct}% — 세션을 이어갈 준비를 합니다"
+            self._notify(
+                NoticeKind.ROLLOVER,
+                f"컨텍스트 {pct}% — 세션을 이어갈 준비를 합니다"
                 if pct is not None
-                else "⚠ 컨텍스트 한계 근접 — 세션을 이어갈 준비를 합니다"
+                else "컨텍스트 한계 근접 — 세션을 이어갈 준비를 합니다",
             )
         self._rollover_request_state = {
             "session": session_name,
@@ -2103,8 +2171,9 @@ class SessionManagerWrapper:
             path = rollover.write_handoff(project, session_name, state["n"], text)
             self._rollover_request_state = None
             self._rollover_ready = {**state, "path": str(path)}
-            self._notify_user(
-                f"⚠ Handoff 준비 완료 — {path.relative_to(project)}"
+            self._notify(
+                NoticeKind.ROLLOVER,
+                f"Handoff 준비 완료 — {path.relative_to(project)}",
             )
             self._start_rollover_swap()
             return
@@ -2147,8 +2216,9 @@ class SessionManagerWrapper:
         )
         self._rollover_request_state = None
         self._rollover_ready = {**state, "path": str(path)}
-        self._notify_user(
-            f"⚠ Handoff 준비 완료 (발췌 폴백) — {path.relative_to(project)}"
+        self._notify(
+            NoticeKind.ROLLOVER,
+            f"Handoff 준비 완료 (발췌 폴백) — {path.relative_to(project)}",
         )
         self._start_rollover_swap()
 
@@ -2182,7 +2252,7 @@ class SessionManagerWrapper:
             "path": ready["path"],
             "predecessor_conv": ready["conv_id"],
         }
-        self._notify_user("⚠ 롤오버 — 새 대화로 이어갑니다")
+        self._notify(NoticeKind.ROLLOVER, "롤오버 — 새 대화로 이어갑니다")
         self._execute_transition(
             target=ready["session"],
             resume_conv=None,
@@ -2630,8 +2700,9 @@ class SessionManagerWrapper:
             # — the user must learn about it and how to undo it.
             # 무인 전환의 상태 줄 (Plan R3-C4 원문) — 사용자는 전환 사실과
             # 되돌리는 방법을 알아야 한다.
-            self._notify_user(
-                f"⇄ {target} 세션으로 전환됨 (이전: {origin}) — 되돌리려면 /back"
+            self._notify(
+                NoticeKind.SWITCH,
+                f"{target} 세션으로 전환됨 (이전: {origin}) — 되돌리려면 /back",
             )
         elif action == "turn_end":
             # Stop hook (contract-based turn end): the PRIMARY turn-end
