@@ -81,3 +81,38 @@ class TestDefensiveLoad:
     def test_record_empty_field_returns_none(self, tmp_path: Path) -> None:
         wrapper_state.save_last_transition(tmp_path, {**RECORD, "from": ""})
         assert wrapper_state.load_last_transition(tmp_path) is None
+
+
+class TestCurrentSession:
+    def test_save_then_load(self, tmp_path: Path) -> None:
+        wrapper_state.save_current_session(tmp_path, "backend")
+        assert wrapper_state.load_current_session(tmp_path) == "backend"
+
+    def test_load_without_file(self, tmp_path: Path) -> None:
+        assert wrapper_state.load_current_session(tmp_path) is None
+
+    def test_none_removes_key(self, tmp_path: Path) -> None:
+        # An unregistered start must not display the previous run's name.
+        # 미등록 시작이 이전 실행의 이름을 표시하면 안 된다.
+        wrapper_state.save_current_session(tmp_path, "backend")
+        wrapper_state.save_current_session(tmp_path, None)
+        assert wrapper_state.load_current_session(tmp_path) is None
+        data = json.loads(_state_file(tmp_path).read_text(encoding="utf-8"))
+        assert "current_session" not in data
+
+    def test_none_without_file_is_noop(self, tmp_path: Path) -> None:
+        wrapper_state.save_current_session(tmp_path, None)
+        assert not _state_file(tmp_path).exists()
+
+    def test_preserves_last_transition(self, tmp_path: Path) -> None:
+        wrapper_state.save_last_transition(tmp_path, RECORD)
+        wrapper_state.save_current_session(tmp_path, "backend")
+        assert wrapper_state.load_last_transition(tmp_path) == RECORD
+        wrapper_state.clear_last_transition(tmp_path)
+        assert wrapper_state.load_current_session(tmp_path) == "backend"
+
+    def test_non_string_value_is_none(self, tmp_path: Path) -> None:
+        path = _state_file(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"current_session": 7}), encoding="utf-8")
+        assert wrapper_state.load_current_session(tmp_path) is None

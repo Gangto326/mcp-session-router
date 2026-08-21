@@ -3326,3 +3326,47 @@ class TestManualMovePrecedentDrop:
         )
         frontend = store.load_session_by_name("frontend")
         assert len(frontend.precedents) == 2
+
+
+class TestCurrentSessionMirrorPersistence:
+    """R5-C1: every mirror move lands in state.json for the statusline.
+
+    R5-C1: 미러가 움직일 때마다 statusline 용 state.json 에 기록된다.
+    """
+
+    def test_boot_with_resume_persists_initial(self, tmp_path: Path) -> None:
+        wrapper_state.save_current_session(tmp_path, "stale")
+        w = SessionManagerWrapper(
+            socket_path=str(tmp_path / "t.sock"),
+            claude_args=["--resume", "backend"],
+            project_path=str(tmp_path),
+        )
+        assert w._current_session_name == "backend"
+        assert wrapper_state.load_current_session(tmp_path) == "backend"
+
+    def test_boot_without_args_clears_stale(self, wrapper: SessionManagerWrapper) -> None:
+        # The fixture boots with no args → mirror None → no stale name
+        # from a previous wrapper run may survive.
+        # 픽스처는 인자 없이 부팅 → 미러 None → 이전 래퍼 실행의 묵은
+        # 이름이 남아선 안 된다.
+        project = Path(wrapper.project_path)
+        wrapper_state.save_current_session(project, "stale")
+        SessionManagerWrapper(
+            socket_path=str(project / "t2.sock"),
+            claude_args=[],
+            project_path=str(project),
+        )
+        assert wrapper_state.load_current_session(project) is None
+
+    def test_mcp_current_session_persists(self, wrapper: SessionManagerWrapper) -> None:
+        wrapper._handle_mcp_signal({"action": "current_session", "name": "work"})
+        assert wrapper._current_session_name == "work"
+        assert wrapper_state.load_current_session(Path(wrapper.project_path)) == "work"
+
+    def test_transition_persists_target(self, wrapper: SessionManagerWrapper) -> None:
+        wrapper._execute_transition(
+            target="backend", resume_conv=None, handoff={}, user_prompt=""
+        )
+        assert wrapper_state.load_current_session(Path(wrapper.project_path)) == (
+            "backend"
+        )
