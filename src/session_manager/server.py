@@ -187,13 +187,33 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     if socket_path:
         try:
             client.connect()
-            current = client.request_handshake()
+            current, handshake_conv = client.request_handshake()
+            state.set_active_conversation_id(handshake_conv)
             if current is not None:
                 state.set_current_session(current)
                 logger.info("Handshake OK — current session: %s", current)
             else:
+                # Which conversation should the store resolution key on?
+                # A wrapper-named NEW conversation owns no session yet, so
+                # keying on it would skip the owner match and drop to the
+                # last_accessed scan — worse than before F18. Use the
+                # handshake id only when some session already owns it;
+                # otherwise the previous conversation (mtime) is the lead.
+                # 스토어 해석의 키를 어느 대화로 잡을까? 래퍼가 새로 이름
+                # 붙인 대화는 아직 아무 세션도 소유하지 않아, 그것으로
+                # 키를 잡으면 소유자 매칭을 건너뛰고 last_accessed 스캔으로
+                # 떨어진다 — F18 이전보다 나쁘다. 핸드셰이크 id 는 어떤
+                # 세션이 이미 소유할 때만 쓰고, 아니면 직전 대화 (mtime)
+                # 가 단서다.
+                owned = handshake_conv is not None and any(
+                    handshake_conv in s.claude_conversation_ids
+                    for s in session_store.list_sessions()
+                )
                 resolved = state.resolve_from_store(
-                    session_store, get_active_conversation_id(project_path)
+                    session_store,
+                    handshake_conv
+                    if owned
+                    else get_active_conversation_id(project_path),
                 )
                 if resolved is not None:
                     state.set_current_session(resolved)
@@ -229,6 +249,15 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         default = SessionMetadata.new(
             name=_DEFAULT_SESSION_NAME, title=_DEFAULT_SESSION_TITLE
         )
+        # Link the conversation the wrapper named for this child (F18):
+        # the transcript does not exist yet at boot, so only the wrapper
+        # can tell — the heuristic would return None here.
+        # 래퍼가 이 자식에 붙인 대화를 연결한다 (F18): 부팅 시점엔
+        # transcript 가 아직 없어 래퍼만 알 수 있다 — 휴리스틱은 여기서
+        # None 을 돌려준다.
+        boot_conv = state.get_active_conversation_id()
+        if boot_conv is not None:
+            default.link_conversation(boot_conv)
         session_store.save_session(default)
         state.set_current_session(_DEFAULT_SESSION_NAME)
         logger.info("Auto-registered default session")
@@ -287,6 +316,27 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         client.close()
 
 
+def _active_conversation_id(app: AppContext) -> str | None:
+    """The current conversation id: wrapper-reported first, guessed last (F18).
+
+    현재 대화 id — 래퍼가 알려 준 값 먼저, 추측은 마지막 (F18).
+
+    The wrapper names the conversation it spawns (``--session-id``) or
+    learns it from the Stop hook, and reports it over the socket
+    (handshake + ``active_conversation`` pushes). Only when it does not
+    know — a user-driven ``--continue``/``--resume`` before its first
+    turn ends — does the transcript-mtime heuristic run.
+    래퍼는 자신이 띄우는 대화에 이름을 붙이거나 (``--session-id``) Stop
+    hook 으로 알아내, 소켓 (핸드셰이크 + ``active_conversation`` push) 으로
+    알려 준다. 래퍼도 모를 때만 — 사용자 주도 ``--continue``/``--resume``
+    의 첫 턴 종료 전 — transcript mtime 휴리스틱이 돈다.
+    """
+    known = app.state.get_active_conversation_id()
+    if known is not None:
+        return known
+    return get_active_conversation_id(app.project_path)
+
+
 def _make_wrapper_signal_handler(
     app: AppContext,
 ) -> Callable[[dict[str, Any]], Awaitable[None]]:
@@ -309,6 +359,16 @@ def _make_wrapper_signal_handler(
     """
 
     async def handler(msg: dict[str, Any]) -> None:
+        if msg.get("action") == "active_conversation":
+            # Wrapper's conversation-id report (F18): adopt as-is, None
+            # included (the wrapper forgot it → back to the heuristic).
+            # 래퍼의 대화 id 보고 (F18): 그대로 채택, None 포함 (래퍼가
+            # 잊었다 → 휴리스틱으로 복귀).
+            conv_id = msg.get("conversation_id")
+            app.state.set_active_conversation_id(
+                conv_id if isinstance(conv_id, str) and conv_id else None
+            )
+            return
         if msg.get("action") != "session_command":
             return
         command = msg.get("command")
@@ -433,7 +493,7 @@ def check_session(ctx: Context) -> dict:
     # conversation 을 정확히 어느 세션에 매칭할지 결정할 수 있다.
     result = {
         "current": app.state.get_current_session(),
-        "active_conversation_id": get_active_conversation_id(app.project_path),
+        "active_conversation_id": _active_conversation_id(app),
         "sessions": [
             {
                 "name": s.name,
@@ -480,7 +540,7 @@ def session_register(name: str, title: str, ctx: Context, summary: str | None = 
     # to this conversation can be matched back to this session.
     # 활성 Claude Code conversation 을 연결 — 이후 사용자가 picker 로 같은
     # conversation 에 돌아왔을 때 라우팅이 정확히 이 세션으로 매칭되게 한다.
-    conv_id = get_active_conversation_id(app.project_path)
+    conv_id = _active_conversation_id(app)
     if conv_id is not None:
         session.link_conversation(conv_id)
     app.session_store.save_session(session)
@@ -535,7 +595,7 @@ def session_switch(
     # Compute active conversation once — used for both outgoing-session
     # link and target-session link below.
     # 활성 conversation 을 한 번만 계산해 outgoing/target 세션 양쪽에 연결한다.
-    active_conv_id = get_active_conversation_id(app.project_path)
+    active_conv_id = _active_conversation_id(app)
 
     # Update the outgoing session's metadata under the F15 lock — the
     # wrapper's summarizer may be saving this same session concurrently.
@@ -650,7 +710,7 @@ def session_create(
     # 하에 (요약기 동시 저장 대비).
     rename_current: str | None = None
     if current_name is not None:
-        conv_id = get_active_conversation_id(app.project_path)
+        conv_id = _active_conversation_id(app)
 
         def apply_outgoing(current: SessionMetadata) -> None:
             current.summary = handoff_summary
@@ -715,7 +775,7 @@ def session_end(summary: str, ctx: Context) -> dict:
     current_name = app.state.get_current_session()
 
     if current_name is not None:
-        conv_id = get_active_conversation_id(app.project_path)
+        conv_id = _active_conversation_id(app)
 
         def apply_end(current: SessionMetadata) -> None:
             current.summary = summary
@@ -815,7 +875,7 @@ def reject_switch(rejected_target: str, prompt_gist: str, ctx: Context) -> dict:
     # 너무 이른 갱신에는 정착 확인이 편승하지 못하게 표시), *다음* 갱신에
     # 편승할 정착 확인을 함께 적재한다. 큐는 파일 기반이라 래퍼 워커가
     # 폴링으로 둘 다 집어간다.
-    conv_id = get_active_conversation_id(app.project_path)
+    conv_id = _active_conversation_id(app)
     if conv_id is not None:
         summarizer.enqueue(
             app.project_path,

@@ -12,6 +12,29 @@ from session_manager.storage import SessionStore
 class SessionManagerState:
     def __init__(self) -> None:
         self._current_session_name: str | None = None
+        # Conversation id the wrapper reported (handshake + pushes, F18).
+        # None = the wrapper does not know it either → mtime fallback.
+        # 래퍼가 알려 준 대화 id (핸드셰이크 + push, F18). None = 래퍼도
+        # 모름 → mtime 폴백.
+        self._active_conversation_id: str | None = None
+
+    def get_active_conversation_id(self) -> str | None:
+        return self._active_conversation_id
+
+    def set_active_conversation_id(self, conv_id: str | None) -> None:
+        if conv_id == self._active_conversation_id:
+            return
+        debug_log.log(
+            "STATE_CHANGE",
+            "MCP_TOOL",
+            {
+                "field": "active_conversation_id",
+                "before": self._active_conversation_id,
+                "after": conv_id,
+            },
+            conv_id=conv_id,
+        )
+        self._active_conversation_id = conv_id
 
     def get_current_session(self) -> str | None:
         return self._current_session_name

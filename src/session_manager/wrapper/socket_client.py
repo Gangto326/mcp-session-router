@@ -71,11 +71,15 @@ class WrapperSocketClient:
     # ----------------------------------------------------------- handshake
     # 핸드셰이크 -----------------------------------------------------------------
 
-    def request_handshake(self) -> str | None:
-        """Send a handshake request and return the current session name.
+    def request_handshake(self) -> tuple[str | None, str | None]:
+        """Send a handshake request; return (current session, conversation id).
 
-        핸드셰이크 요청을 보내고 래퍼가 응답한 현재 세션 이름을 반환한다.
-        래퍼에 활성 세션이 없으면 None을 반환한다.
+        핸드셰이크 요청을 보내고 (현재 세션 이름, 대화 id) 를 반환한다.
+        The wrapper names the conversation it spawned (F18) so the server
+        never has to guess it from transcript mtimes; either value is
+        None when the wrapper does not know it.
+        래퍼는 자신이 띄운 대화의 id 를 알려 준다 (F18) — 서버가 transcript
+        mtime 으로 추측할 필요가 없도록. 래퍼가 모르는 값은 None.
         """
         debug_log.log("HANDSHAKE", "MCP_TOOL", {"phase": "request"})
         self._send({"type": "handshake_request"})
@@ -84,15 +88,19 @@ class WrapperSocketClient:
             debug_log.log(
                 "HANDSHAKE", "MCP_TOOL", {"phase": "response", "result": None}
             )
-            return None
+            return None, None
         result = response.get("current_session_name")
+        conv_id = response.get("conversation_id")
+        if not isinstance(conv_id, str) or not conv_id:
+            conv_id = None
         debug_log.log(
             "HANDSHAKE",
             "MCP_TOOL",
-            {"phase": "response", "result": result},
+            {"phase": "response", "result": result, "conversation_id": conv_id},
             session=result,
+            conv_id=conv_id,
         )
-        return result
+        return result, conv_id
 
     # -------------------------------------------------------- signal sender
     # 신호 송신 ------------------------------------------------------------------
