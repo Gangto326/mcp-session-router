@@ -33,6 +33,7 @@ import sys
 import termios
 import time
 import tty
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,7 @@ from session_manager import (
     summarizer,
 )
 from session_manager.claude_conversation import (
+    conversation_exists,
     encode_cwd,
     get_active_conversation_id,
     get_conversation_activity,
@@ -384,6 +386,19 @@ class SessionManagerWrapper:
         # Stop hook 이 전달한 활성 conversation id (계약 소스, F18 안전).
         # 지금은 미러만 — 소비처는 mtime 스캔에서 점진 전환.
         self._active_conv_from_hook: str | None = None
+        # Conversation id the wrapper itself assigned to the current
+        # child (F18): a fresh uuid passed as ``--session-id=`` for a new
+        # conversation, or the ``--resume=`` target for a wrapper-driven
+        # resume. None when the user drove the resume (``--continue``,
+        # ``--resume <x>``) — then only the hook can tell.
+        # 래퍼가 현재 자식에 스스로 지정한 대화 id (F18): 새 대화면
+        # ``--session-id=`` 로 넘긴 새 uuid, 래퍼 주도 재개면 ``--resume=``
+        # 대상. 사용자가 재개를 주도했으면 (``--continue``, ``--resume <x>``)
+        # None — 그때는 hook 만이 알려 준다.
+        self._assigned_conv_id: str | None = None
+        # Last conversation id pushed to the MCP server, to push only on
+        # change. / MCP 서버에 마지막으로 push 한 대화 id — 변경 시에만 push.
+        self._pushed_conv_id: str | None = None
 
         # monotonic time of the last user submit (\r) — turn-duration
         # measurement's start mark (end mark = the Stop-hook signal).
@@ -551,8 +566,39 @@ class SessionManagerWrapper:
                 continue
             if arg.startswith("--resume=") or arg.startswith("-r="):
                 continue
+            if arg == "--session-id":
+                skip_value = True
+                continue
+            if arg.startswith("--session-id="):
+                continue
             out.append(arg)
         return out
+
+    @staticmethod
+    def _parse_session_id_arg(args: list[str]) -> str | None:
+        """Return a user-supplied ``--session-id`` value, if any.
+
+        사용자가 넘긴 ``--session-id`` 값이 있으면 반환한다.
+        """
+        for i, arg in enumerate(args):
+            if arg == "--session-id" and i + 1 < len(args):
+                return args[i + 1]
+            if arg.startswith("--session-id="):
+                return arg[len("--session-id=") :]
+        return None
+
+    @staticmethod
+    def _has_resume_args(args: list[str]) -> bool:
+        """True if the user asked Claude Code to resume a conversation.
+
+        사용자가 Claude Code 에 대화 재개를 요청했으면 True.
+        """
+        return any(
+            a in ("--continue", "-c", "--resume", "-r")
+            or a.startswith("--resume=")
+            or a.startswith("-r=")
+            for a in args
+        )
 
     def _agent_guide_flag(self) -> list[str]:
         """AGENT_GUIDE delivery: an official CLI flag instead of typing.
@@ -634,16 +680,35 @@ class SessionManagerWrapper:
         """
         pending = self._pending_respawn
         if pending is None:
-            return (
-                list(self.claude_args)
-                + self._agent_guide_flag()
-                + self._mcp_config_flag()
-            )
+            # Plain boot. A new conversation gets a wrapper-chosen id
+            # (F18, measured: ``--session-id`` honoured in headless and
+            # TUI, docs/poc/R5-conversation-id.md); a user-driven resume
+            # keeps the user's flags and the id stays unknown until the
+            # first Stop hook reports it.
+            # 맨몸 부팅. 새 대화면 래퍼가 id 를 정한다 (F18, 실측:
+            # ``--session-id`` 가 headless·TUI 에서 동작,
+            # docs/poc/R5-conversation-id.md); 사용자 주도 재개면 사용자
+            # 플래그를 그대로 두고 id 는 첫 Stop hook 이 알려 줄 때까지
+            # 미상.
+            args = list(self.claude_args)
+            self._assigned_conv_id = self._parse_session_id_arg(args)
+            if self._assigned_conv_id is None and not self._has_resume_args(args):
+                self._assigned_conv_id = str(uuid.uuid4())
+                args.append(f"--session-id={self._assigned_conv_id}")
+            return args + self._agent_guide_flag() + self._mcp_config_flag()
         args = self._strip_resume_args(self.claude_args)
         args += self._agent_guide_flag()
         args += self._mcp_config_flag()
         if pending.resume_conv is not None:
             args.append(f"--resume={pending.resume_conv}")
+            self._assigned_conv_id = pending.resume_conv
+        else:
+            # NEW session / rollover: the wrapper names the conversation
+            # up front, so nothing has to guess it later.
+            # NEW 세션 / 롤오버: 래퍼가 대화 이름을 미리 정하므로 나중에
+            # 추측할 것이 없다.
+            self._assigned_conv_id = str(uuid.uuid4())
+            args.append(f"--session-id={self._assigned_conv_id}")
         args.append(handoff_store.TRIGGER_PROMPT)
         return args
 
@@ -690,6 +755,7 @@ class SessionManagerWrapper:
                 "pid": self.child.pid,
                 "respawn_target": pending.target if pending else None,
                 "respawn_resume_conv": pending.resume_conv if pending else None,
+                "assigned_conv_id": self._assigned_conv_id,
                 "initial_session_name": self._initial_session_name,
             },
         )
@@ -1057,6 +1123,7 @@ class SessionManagerWrapper:
         # 활성 대화 미러 (채택 3번): hook 전달 id 가 신뢰 소스. 소비처는
         # 점진 전환 (F18).
         self._active_conv_from_hook = conv_id
+        self._push_active_conversation()
 
         # Turn duration: submit (\r) → Stop signal. Measurement source
         # for R5 --stats and the C3 backstop derivation.
@@ -1147,7 +1214,7 @@ class SessionManagerWrapper:
         # 재롤오버된다 (실측 — _check_stale_conv_entry 참조). mtime
         # conversation id 로 충분하다 — 오인은 단독 소유 가드가 침묵으로
         # 해석한다.
-        conv_id = get_active_conversation_id(Path(self.project_path))
+        conv_id = self._current_conv_id()
         if conv_id is not None:
             self._check_stale_conv_entry(conv_id)
         self._check_summary_refresh()
@@ -1256,6 +1323,73 @@ class SessionManagerWrapper:
         self._was_busy = False
         self._handled_confirmations = set()
         self._auto_confirm_armed = True
+        # The previous child's hook-reported conversation is gone with it.
+        # 이전 자식이 hook 으로 알려 준 대화는 자식과 함께 사라졌다.
+        self._active_conv_from_hook = None
+        self._push_active_conversation()
+
+    def _reported_conv_id(self) -> str | None:
+        """The conversation id the wrapper positively knows, or None (F18).
+
+        래퍼가 확실히 아는 대화 id, 없으면 None (F18).
+
+        Hook-reported id for this child first (authoritative — it is what
+        Claude Code itself calls the conversation), else the id the
+        wrapper assigned at spawn. No transcript gate: for naming and
+        linking, the assigned id is valid from spawn (measured:
+        ``--session-id`` is honoured). The one consumer that needs
+        "has the successor actually appeared?" — rollover finalize —
+        checks ``conversation_exists`` itself. Measured need for no gate
+        here: the MCP server boots and registers the default session
+        before the first turn writes the transcript (2/2,
+        docs/poc/R5-conversation-id.md).
+
+        이 자식에 대해 hook 이 보고한 id (권위 — Claude Code 자신이 부르는
+        대화 이름), 없으면 spawn 시 래퍼가 지정한 id. transcript 게이트
+        없음: 이름 붙이기·연결 용도로는 지정 id 가 spawn 시점부터 유효하다
+        (실측: ``--session-id`` 존중). "후계가 실제로 나타났는가" 가 필요한
+        유일한 소비처 — 롤오버 finalize — 는 스스로 ``conversation_exists``
+        를 검사한다. 게이트를 두지 않는 실측 근거: MCP 서버는 첫 턴이
+        transcript 를 쓰기 전에 부팅해 기본 세션을 등록한다 (2/2,
+        docs/poc/R5-conversation-id.md).
+        """
+        return self._active_conv_from_hook or self._assigned_conv_id
+
+    def _current_conv_id(self) -> str | None:
+        """Known conversation id first, mtime heuristic last (F18).
+
+        아는 대화 id 먼저, mtime 휴리스틱은 마지막 (F18). 휴리스틱은
+        사용자 주도 재개 (``--continue``/``--resume``) 의 첫 턴 종료 전과
+        대화 전환 직후 (``/clear`` 등) 에만 닿는다.
+        """
+        known = self._reported_conv_id()
+        if known is not None:
+            return known
+        return get_active_conversation_id(Path(self.project_path))
+
+    def _forget_conversation(self) -> None:
+        """Drop both conversation-id sources after a hand-made switch.
+
+        손수 대화를 바꾼 뒤 두 대화 id 출처를 버린다. 다음 Stop hook 이
+        새 대화를 알려 줄 때까지 mtime 폴백으로 내려간다.
+        """
+        self._active_conv_from_hook = None
+        self._assigned_conv_id = None
+        self._push_active_conversation()
+
+    def _push_active_conversation(self) -> None:
+        """Tell the MCP server the known conversation id when it changes.
+
+        아는 대화 id 가 바뀌면 MCP 서버에 알린다 (F18). 서버는 이 값을
+        1차로 쓰고 None 이면 자체 폴백으로 내려간다.
+        """
+        conv_id = self._reported_conv_id()
+        if conv_id == self._pushed_conv_id:
+            return
+        self._pushed_conv_id = conv_id
+        self.socket_server.send(
+            {"action": "active_conversation", "conversation_id": conv_id}
+        )
 
     def _handle_stdin_readable(self) -> None:
         try:
@@ -1328,6 +1462,15 @@ class SessionManagerWrapper:
                 # still there.
                 # /clear 는 대화를 지운다 — 아직 남아 있을 때 요약한다.
                 self._enqueue_active_summary()
+                # ...and Claude Code issues a NEW session id for what
+                # follows (measured: SessionStart source=clear with a
+                # fresh id, docs/poc/R5-conversation-id.md) — the ids the
+                # wrapper held are stale from here on.
+                # ...그리고 Claude Code 는 이후 대화에 **새** session id 를
+                # 발급한다 (실측: SessionStart source=clear 에 새 id,
+                # docs/poc/R5-conversation-id.md) — 래퍼가 쥔 id 는 여기서
+                # 부터 낡았다.
+                self._forget_conversation()
 
             # Forwarded \r = a turn submit: start mark for the turn
             # duration (end mark = the Stop-hook signal). A \r on an
@@ -1393,6 +1536,16 @@ class SessionManagerWrapper:
         관찰을 놓쳐도 (가상 화면이 아직 갱신되지 않은 경우 등) 무해하다 —
         transcript 는 디스크에 남아 있고, 다음 시작 시 부팅 복구가 집어간다.
         """
+        # Leaving the conversation by hand (/resume, /exit, /new): what
+        # the wrapper knew about "the current conversation" no longer
+        # holds — forget both sources; the next Stop hook names the new
+        # one. /rename stays in the same conversation and keeps them.
+        # 손수 대화를 떠남 (/resume, /exit, /new): 래퍼가 알던 "현재
+        # 대화" 는 더 이상 유효하지 않다 — 두 출처를 잊고 다음 Stop hook
+        # 이 새 대화를 알려 주게 한다. /rename 은 같은 대화에 머무르므로
+        # 유지한다.
+        if matched.command != "rename":
+            self._forget_conversation()
         debug_log.log(
             "SESSION_COMMAND_OBSERVED",
             "USER",
@@ -1725,7 +1878,7 @@ class SessionManagerWrapper:
                 {"trigger": "departed", "skipped": "no_session_name"},
             )
             return
-        conv_id = get_active_conversation_id(Path(self.project_path))
+        conv_id = self._current_conv_id()
         if conv_id is None:
             debug_log.log(
                 "SUMMARY_TRIGGER",
@@ -1757,7 +1910,7 @@ class SessionManagerWrapper:
                 {"trigger": "active", "skipped": "unknown_current_session"},
             )
             return
-        conv_id = get_active_conversation_id(Path(self.project_path))
+        conv_id = self._current_conv_id()
         if conv_id is None:
             debug_log.log(
                 "SUMMARY_TRIGGER",
@@ -1803,7 +1956,7 @@ class SessionManagerWrapper:
         if session_name is None:
             return
         project = Path(self.project_path)
-        conv_id = get_active_conversation_id(project)
+        conv_id = self._current_conv_id()
         if conv_id is None:
             return
         if conv_id != self._dialogue_scan_conv_id:
@@ -1883,7 +2036,7 @@ class SessionManagerWrapper:
         유지해 연기된 마킹도 도착을 안내한다.
         """
         project = Path(self.project_path)
-        conv_id = get_active_conversation_id(project)
+        conv_id = self._current_conv_id()
         if conv_id is None:
             return
         # Move-or-stay deferral (R4-C6 B): while the stale-entry question
@@ -2051,7 +2204,7 @@ class SessionManagerWrapper:
         conv_id = self._rollover_pending_conv_id
         if conv_id is None:
             return
-        if conv_id != get_active_conversation_id(Path(self.project_path)):
+        if conv_id != self._current_conv_id():
             return
         session_name = self._current_session_name
         if session_name is None:
@@ -2273,8 +2426,20 @@ class SessionManagerWrapper:
         state = self._rollover_swap_state
         if state is None:
             return
-        conv_id = get_active_conversation_id(Path(self.project_path))
+        conv_id = self._current_conv_id()
         if conv_id is None or conv_id == state["predecessor_conv"]:
+            return
+        if (
+            conv_id == self._assigned_conv_id
+            and not self._active_conv_from_hook
+            and not conversation_exists(Path(self.project_path), conv_id)
+        ):
+            # The wrapper named the successor at spawn, but "appeared"
+            # means its transcript exists (§5.4-g atomicity: nothing about
+            # the predecessor changes until the successor is observed).
+            # 래퍼가 spawn 때 후계 이름을 정했지만 "나타남" 은 transcript
+            # 존재를 뜻한다 (§5.4-g 원자성: 후계가 관측되기 전엔 선대에
+            # 대해 아무것도 바꾸지 않는다).
             return
         self._finalize_rollover(conv_id)
 
@@ -2370,7 +2535,7 @@ class SessionManagerWrapper:
         ):
             self._notify_user("롤오버가 이미 진행 중입니다")
             return
-        conv_id = get_active_conversation_id(Path(self.project_path))
+        conv_id = self._current_conv_id()
         if conv_id is None or self._current_session_name is None:
             self._notify_user("롤오버할 활성 대화가 없습니다")
             return
@@ -2636,7 +2801,7 @@ class SessionManagerWrapper:
             # 합류하는 제2 트리거이며, 마킹에 대한 행동은 R4-C3/C4.
             conv_id = message.get("conversation_id")
             if not isinstance(conv_id, str) or not conv_id:
-                conv_id = get_active_conversation_id(Path(self.project_path))
+                conv_id = self._current_conv_id()
             if conv_id is None or self._rollover_pending_conv_id == conv_id:
                 return
             self._rollover_pending_conv_id = conv_id
@@ -2851,12 +3016,20 @@ class SessionManagerWrapper:
         응답한다. 신규 시작이면 CLI 인자에서 결정된 값으로 폴백.
         """
         name = self._current_session_name or self._initial_session_name
+        conv_id = self._reported_conv_id()
+        self._pushed_conv_id = conv_id
         debug_log.log(
             "HANDSHAKE",
             "WRAPPER",
-            {"phase": "wrapper_response", "current_session_name": name},
+            {
+                "phase": "wrapper_response",
+                "current_session_name": name,
+                "conversation_id": conv_id,
+            },
         )
-        self.socket_server.send({"current_session_name": name})
+        self.socket_server.send(
+            {"current_session_name": name, "conversation_id": conv_id}
+        )
 
     @staticmethod
     def _parse_initial_session_name(args: list[str]) -> str | None:

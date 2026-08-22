@@ -103,10 +103,52 @@ def get_conversation_activity(
     return datetime.datetime.fromtimestamp(newest, tz=datetime.UTC)
 
 
+def transcript_path_for(cwd: Path, conversation_id: str) -> Path:
+    """Path of the transcript Claude Code writes for *conversation_id*.
+
+    Claude Code 가 *conversation_id* 에 대해 쓰는 transcript 경로.
+    Measured: the file is named ``<session_id>.jsonl`` under the encoded
+    project directory (hook ``transcript_path`` == this, 8/8 samples,
+    docs/poc/R5-conversation-id.md).
+    실측: 인코딩된 프로젝트 디렉토리 아래 ``<session_id>.jsonl`` (hook
+    의 ``transcript_path`` 와 동일, 표본 8/8, docs/poc/R5-conversation-id.md).
+    """
+    return (
+        Path.home() / ".claude" / "projects" / encode_cwd(cwd) / f"{conversation_id}.jsonl"
+    )
+
+
+def conversation_exists(cwd: Path, conversation_id: str) -> bool:
+    """True once Claude Code has written *conversation_id*'s transcript.
+
+    Claude Code 가 *conversation_id* 의 transcript 를 쓴 뒤부터 True.
+    A single stat of a known path — no directory scan, no mtime race.
+    Used to treat a wrapper-assigned id as "observed" (a spawned child
+    whose first turn has not landed yet is not a conversation).
+    알려진 경로 하나의 stat — 디렉토리 스캔도 mtime 경쟁도 없다. 래퍼가
+    지정한 id 를 "관측됨" 으로 볼 때 쓴다 (첫 턴이 아직 기록되지 않은
+    자식은 대화가 아니다).
+    """
+    try:
+        return transcript_path_for(cwd, conversation_id).is_file()
+    except OSError:
+        return False
+
+
 def get_active_conversation_id(cwd: Path) -> str | None:
     """Return the active Claude Code conversation id for *cwd*, or None.
 
     *cwd*에 해당하는 활성 Claude Code conversation id를 반환. 없으면 None.
+
+    FALLBACK ONLY (F18): the wrapper knows the id it assigned or the id
+    the Stop hook delivered — callers go through those first and reach
+    this heuristic only when neither is known (a user-driven
+    ``--continue``/``--resume`` before its first turn ends, or a
+    ``claude`` started outside the wrapper).
+    폴백 전용 (F18): 래퍼는 자신이 지정한 id 나 Stop hook 이 전달한 id
+    를 안다 — 호출자는 그것을 먼저 쓰고, 둘 다 모를 때만 (사용자 주도
+    ``--continue``/``--resume`` 의 첫 턴 종료 전, 래퍼 밖에서 띄운
+    ``claude``) 이 휴리스틱에 온다.
 
     "Active" is defined as the conversation whose jsonl file has the most
     recent mtime — i.e. the one that just received a message. Returns
