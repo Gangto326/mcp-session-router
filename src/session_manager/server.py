@@ -220,6 +220,26 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
                 logger.info(
                     "Handshake returned null — resolved from store: %s", resolved
                 )
+            # Link the child's conversation to the session we settled on,
+            # right now (F18): both facts are in hand, and waiting for a
+            # session tool call leaves a tool-less conversation unowned
+            # forever — the next boot then cannot key on it (measured:
+            # e2e 2026-08-22, docs/poc/R5-conversation-id.md).
+            # Idempotent (link_conversation skips duplicates).
+            # 자식의 대화를 지금 정해진 세션에 바로 연결한다 (F18): 두
+            # 사실이 모두 손에 있고, 세션 도구 호출을 기다리면 도구 호출이
+            # 없는 대화는 영영 소유자 없이 남아 다음 부팅이 그 대화로
+            # 해석하지 못한다 (실측: e2e 2026-08-22,
+            # docs/poc/R5-conversation-id.md). 멱등 (link_conversation 이
+            # 중복을 건너뜀).
+            settled = state.get_current_session()
+            if settled is not None and handshake_conv is not None:
+                try:
+                    session_store.mutate_session_by_name(
+                        settled, lambda s: s.link_conversation(handshake_conv)
+                    )
+                except Exception as exc:
+                    logger.warning("Boot-time conversation link failed: %s", exc)
         except OSError:
             logger.warning(
                 "Could not connect to wrapper socket at %s — "
