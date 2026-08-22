@@ -15,6 +15,7 @@ first-run auto-registration).
 
 from __future__ import annotations
 
+import datetime
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -469,12 +470,17 @@ class TestFirstRunAutoRegistersDefault:
         """
         store = SessionStore(tmp_path)
         store.init_project()
+        # Recent timestamps — the startup cleanup deletes sessions past the
+        # TTL, which would silently remove the fixture.
+        # 최근 타임스탬프 — 부팅 정리가 TTL 지난 세션을 지우므로 픽스처가
+        # 조용히 사라질 수 있다.
+        now = datetime.datetime.now(datetime.UTC)
         owner = SessionMetadata.new(name="owner", title="O")
         owner.claude_conversation_ids = ["conv-prev"]
-        owner.last_accessed = "2026-07-01T00:00:00+00:00"
+        owner.last_accessed = (now - datetime.timedelta(days=2)).isoformat()
         store.save_session(owner)
         newer = SessionMetadata.new(name="newer", title="N")
-        newer.last_accessed = "2026-07-30T00:00:00+00:00"
+        newer.last_accessed = (now - datetime.timedelta(days=1)).isoformat()
         store.save_session(newer)
 
         mock_client_instance = MagicMock()
@@ -495,6 +501,13 @@ class TestFirstRunAutoRegistersDefault:
         ):
             async with app_lifespan(MagicMock()) as ctx:
                 assert ctx.state.get_current_session() == "owner"
+                # ...and the fresh conversation is linked to it at once, so
+                # a tool-less conversation still gets an owner.
+                # ...그리고 새 대화가 즉시 연결돼, 도구 호출이 없는 대화도
+                # 소유자를 갖는다.
+                stored = ctx.session_store.load_session_by_name("owner")
+                assert stored is not None
+                assert stored.claude_conversation_ids == ["conv-prev", "conv-fresh"]
 
     async def test_owned_handshake_conversation_wins(self, tmp_path: Path) -> None:
         """A handshake id some session already owns (wrapper-driven resume)
@@ -510,7 +523,7 @@ class TestFirstRunAutoRegistersDefault:
         store.save_session(a)
         b = SessionMetadata.new(name="b", title="B")
         b.claude_conversation_ids = ["conv-b"]
-        b.last_accessed = "2026-07-30T00:00:00+00:00"
+        b.last_accessed = datetime.datetime.now(datetime.UTC).isoformat()
         store.save_session(b)
 
         mock_client_instance = MagicMock()
@@ -531,6 +544,10 @@ class TestFirstRunAutoRegistersDefault:
         ):
             async with app_lifespan(MagicMock()) as ctx:
                 assert ctx.state.get_current_session() == "a"
+                stored = ctx.session_store.load_session_by_name("a")
+                assert stored is not None
+                # Already owned — the link is idempotent. / 이미 소유 — 멱등.
+                assert stored.claude_conversation_ids == ["conv-a"]
 
 
 # ---------------------------------------------------------------------------
@@ -664,3 +681,36 @@ class TestNewFromFirstSessionRenameNull:
         signal = _last_signal(app, "new")
         assert signal["rename_current"] is None
         assert signal["new_session_name"] == "first-real"
+
+
+class TestBootLinksWrapperSessionConversation:
+    async def test_wrapper_reported_session_gets_conversation(
+        self, tmp_path: Path
+    ) -> None:
+        """When the wrapper already names the current session (post-respawn
+        handshake), the conversation is linked to that session at boot.
+
+        래퍼가 현재 세션을 알려 주는 경우 (respawn 후 핸드셰이크) 에도
+        부팅 시 그 세션에 대화가 연결된다.
+        """
+        store = SessionStore(tmp_path)
+        store.init_project()
+        store.save_session(SessionMetadata.new(name="backend", title="B"))
+
+        mock_client_instance = MagicMock()
+        mock_client_instance.recv_loop = AsyncMock()
+        mock_client_instance.request_handshake.return_value = ("backend", "conv-x")
+
+        with (
+            patch("session_manager.server.os.getcwd", return_value=str(tmp_path)),
+            patch.dict("os.environ", {"SESSION_MANAGER_SOCKET": "/tmp/fake.sock"}),
+            patch(
+                "session_manager.server.WrapperSocketClient",
+                return_value=mock_client_instance,
+            ),
+        ):
+            async with app_lifespan(MagicMock()) as ctx:
+                assert ctx.state.get_current_session() == "backend"
+                stored = ctx.session_store.load_session_by_name("backend")
+                assert stored is not None
+                assert stored.claude_conversation_ids == ["conv-x"]
