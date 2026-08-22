@@ -2963,7 +2963,7 @@ class TestHandshake:
         sent: list[dict] = []
         w.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
         w._handle_handshake_request()
-        assert sent == [{"current_session_name": "foo"}]
+        assert sent == [{"current_session_name": "foo", "conversation_id": None}]
 
     def test_replies_with_none_on_plain_start(
         self, wrapper: SessionManagerWrapper
@@ -2971,7 +2971,7 @@ class TestHandshake:
         sent: list[dict] = []
         wrapper.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
         wrapper._handle_handshake_request()
-        assert sent == [{"current_session_name": None}]
+        assert sent == [{"current_session_name": None, "conversation_id": None}]
 
     def test_replies_with_mirror_after_transition(
         self, wrapper: SessionManagerWrapper
@@ -2986,7 +2986,7 @@ class TestHandshake:
         sent: list[dict] = []
         wrapper.socket_server.send = lambda msg: bool(sent.append(msg) or True)  # type: ignore[assignment]
         wrapper._handle_handshake_request()
-        assert sent == [{"current_session_name": "backend"}]
+        assert sent == [{"current_session_name": "backend", "conversation_id": None}]
 
 
 class TestMcpSignalRouting:
@@ -3307,3 +3307,226 @@ class TestHandleSessionsCommand:
         wrapper._handle_stdin_readable()
         assert called == ["x"]
         assert b"\r" not in writes
+
+
+class TestConversationIdOwnership:
+    """F18: the wrapper knows the conversation id instead of guessing it.
+
+    F18: 래퍼가 대화 id 를 추측하지 않고 안다.
+    """
+
+    def _uuid_arg(self, args: list[str]) -> str | None:
+        for a in args:
+            if a.startswith("--session-id="):
+                return a[len("--session-id=") :]
+        return None
+
+    def test_plain_boot_assigns_session_id(self, wrapper: SessionManagerWrapper) -> None:
+        args = wrapper._build_child_args()
+        assigned = self._uuid_arg(args)
+        assert assigned is not None
+        assert wrapper._assigned_conv_id == assigned
+        # Valid UUID (Claude Code requires one). / 유효한 UUID 여야 한다.
+        import uuid
+
+        uuid.UUID(assigned)
+
+    def test_user_resume_keeps_flags_and_assigns_nothing(self, tmp_path: Path) -> None:
+        for user_args in (["--continue"], ["-c"], ["--resume", "x"], ["--resume=x"]):
+            w = SessionManagerWrapper(
+                socket_path=str(tmp_path / "s.sock"),
+                claude_args=user_args,
+                project_path=str(tmp_path),
+            )
+            args = w._build_child_args()
+            assert self._uuid_arg(args) is None
+            assert w._assigned_conv_id is None
+            assert args[: len(user_args)] == user_args
+
+    def test_user_session_id_is_respected(self, tmp_path: Path) -> None:
+        w = SessionManagerWrapper(
+            socket_path=str(tmp_path / "s.sock"),
+            claude_args=["--session-id", "user-chosen"],
+            project_path=str(tmp_path),
+        )
+        args = w._build_child_args()
+        assert w._assigned_conv_id == "user-chosen"
+        assert args.count("--session-id") == 1
+        assert self._uuid_arg(args) is None
+
+    def test_respawn_resume_assigns_target_conv(self, wrapper: SessionManagerWrapper) -> None:
+        wrapper._pending_respawn = _PendingRespawn(
+            target="backend", resume_conv="conv-9", from_name="a", user_prompt="", is_back=False
+        )
+        args = wrapper._build_child_args()
+        assert "--resume=conv-9" in args
+        assert self._uuid_arg(args) is None
+        assert wrapper._assigned_conv_id == "conv-9"
+
+    def test_respawn_new_assigns_fresh_session_id(self, wrapper: SessionManagerWrapper) -> None:
+        wrapper._pending_respawn = _PendingRespawn(
+            target="fresh", resume_conv=None, from_name="a", user_prompt="", is_back=False
+        )
+        args = wrapper._build_child_args()
+        assigned = self._uuid_arg(args)
+        assert assigned is not None and wrapper._assigned_conv_id == assigned
+        assert args[-1] == handoff_store.TRIGGER_PROMPT
+
+    def test_respawn_strips_user_session_id(self, tmp_path: Path) -> None:
+        w = SessionManagerWrapper(
+            socket_path=str(tmp_path / "s.sock"),
+            claude_args=["--session-id", "old", "--model", "opus"],
+            project_path=str(tmp_path),
+        )
+        w._pending_respawn = _PendingRespawn(
+            target="b", resume_conv="conv-b", from_name="a", user_prompt="", is_back=False
+        )
+        args = w._build_child_args()
+        assert "old" not in args
+        assert "--resume=conv-b" in args
+        assert "--model" in args
+
+    def test_current_conv_priority(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.get_active_conversation_id",
+            lambda p: calls.append("mtime") or "guessed",
+        )
+        exists = {"assigned"}
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.conversation_exists",
+            lambda p, cid: cid in exists,
+        )
+        # Nothing known → heuristic. / 아무것도 모르면 휴리스틱.
+        assert wrapper._current_conv_id() == "guessed"
+        # Assigned → assigned wins even before its transcript exists, no
+        # guessing (the id is valid from spawn — measured).
+        # 지정됐으면 transcript 가 없어도 지정 id — 추측 없음 (spawn
+        # 시점부터 유효 — 실측).
+        wrapper._assigned_conv_id = "pending"
+        calls.clear()
+        assert wrapper._current_conv_id() == "pending"
+        assert calls == []
+        # Hook-reported id beats everything. / hook 보고 id 가 최우선.
+        wrapper._active_conv_from_hook = "from-hook"
+        assert wrapper._current_conv_id() == "from-hook"
+
+    def test_spawn_reset_forgets_hook_id(self, wrapper: SessionManagerWrapper) -> None:
+        wrapper._active_conv_from_hook = "stale"
+        wrapper._reset_child_detection_state()
+        assert wrapper._active_conv_from_hook is None
+
+    def test_hook_id_is_pushed_once_per_change(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sent: list[dict] = []
+        monkeypatch.setattr(wrapper.socket_server, "send", lambda m: sent.append(m) or True)
+        wrapper._active_conv_from_hook = "c1"
+        wrapper._push_active_conversation()
+        wrapper._push_active_conversation()
+        assert sent == [{"action": "active_conversation", "conversation_id": "c1"}]
+        wrapper._active_conv_from_hook = "c2"
+        wrapper._push_active_conversation()
+        assert sent[-1] == {"action": "active_conversation", "conversation_id": "c2"}
+
+    def test_handshake_carries_known_conversation(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sent: list[dict] = []
+        monkeypatch.setattr(wrapper.socket_server, "send", lambda m: sent.append(m) or True)
+        wrapper._active_conv_from_hook = "c1"
+        wrapper._handle_handshake_request()
+        assert sent == [{"current_session_name": None, "conversation_id": "c1"}]
+
+    def test_handshake_reports_assigned_id_before_transcript_exists(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The MCP server boots (and registers the default session) before
+        # the first turn writes the transcript — it must still get the id.
+        # MCP 서버는 첫 턴이 transcript 를 쓰기 전에 부팅 (기본 세션 등록)
+        # 한다 — 그래도 id 를 받아야 한다.
+        sent: list[dict] = []
+        monkeypatch.setattr(wrapper.socket_server, "send", lambda m: sent.append(m) or True)
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.conversation_exists", lambda p, c: False
+        )
+        wrapper._assigned_conv_id = "assigned"
+        wrapper._handle_handshake_request()
+        assert sent == [{"current_session_name": None, "conversation_id": "assigned"}]
+
+    def test_clear_forgets_both_sources(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Measured: /clear issues a NEW session id (SessionStart
+        # source=clear), so the held ids are stale from the keystroke on.
+        # 실측: /clear 는 새 session id 를 발급 (SessionStart source=clear)
+        # — 쥐고 있던 id 는 그 키 입력부터 낡았다.
+        wrapper.virtual_screen.feed("❯ /clear".encode())
+        wrapper._active_conv_from_hook = "c1"
+        wrapper._assigned_conv_id = "c1"
+        wrapper._pushed_conv_id = "c1"
+        sent: list[dict] = []
+        monkeypatch.setattr(wrapper.socket_server, "send", lambda m: sent.append(m) or True)
+        monkeypatch.setattr(wrapper, "_enqueue_active_summary", lambda: None)
+        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
+        monkeypatch.setattr("os.write", lambda fd, data: len(data))
+        wrapper._stdin_fd = 0
+        wrapper.pty_fd = 1
+        wrapper._handle_stdin_readable()
+        assert wrapper._active_conv_from_hook is None
+        assert wrapper._assigned_conv_id is None
+        assert {"action": "active_conversation", "conversation_id": None} in sent
+
+    def test_rename_keeps_both_sources(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # /rename stays in the same conversation. / /rename 은 같은 대화.
+        wrapper._current_session_name = "work"
+        wrapper._active_conv_from_hook = "c1"
+        wrapper._assigned_conv_id = "c1"
+        monkeypatch.setattr(wrapper.socket_server, "send", lambda m: True)
+        from session_manager.wrapper.command_matcher import InterceptedCommand
+
+        wrapper._observe_session_command(InterceptedCommand(command="rename", args="x"))
+        assert wrapper._active_conv_from_hook == "c1"
+        assert wrapper._assigned_conv_id == "c1"
+
+    def test_rollover_finalize_waits_for_successor_transcript(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The successor is named at spawn, but finalize must wait until its
+        # transcript exists (§5.4-g) — then run exactly once.
+        # 후계 이름은 spawn 때 정해지지만 finalize 는 transcript 가 생길
+        # 때까지 기다려야 한다 (§5.4-g) — 그 뒤 정확히 한 번.
+        wrapper._rollover_swap_state = {"predecessor_conv": "old", "session": "s"}
+        wrapper._assigned_conv_id = "succ"
+        finalized: list[str] = []
+        monkeypatch.setattr(wrapper, "_finalize_rollover", finalized.append)
+        exists = {"present": False}
+        monkeypatch.setattr(
+            "session_manager.wrapper.pty_wrapper.conversation_exists",
+            lambda p, c: exists["present"],
+        )
+        wrapper._poll_rollover_finalize()
+        assert finalized == []
+        exists["present"] = True
+        wrapper._poll_rollover_finalize()
+        assert finalized == ["succ"]
+
+    def test_manual_resume_forgets_both_sources(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapper._current_session_name = "work"
+        wrapper._active_conv_from_hook = "c1"
+        wrapper._assigned_conv_id = "c1"
+        wrapper._pushed_conv_id = "c1"  # the server currently believes c1
+        sent: list[dict] = []
+        monkeypatch.setattr(wrapper.socket_server, "send", lambda m: sent.append(m) or True)
+        from session_manager.wrapper.command_matcher import InterceptedCommand
+
+        wrapper._observe_session_command(InterceptedCommand(command="resume", args="foo"))
+        assert wrapper._active_conv_from_hook is None
+        assert wrapper._assigned_conv_id is None
+        assert {"action": "active_conversation", "conversation_id": None} in sent

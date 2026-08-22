@@ -17,7 +17,12 @@ from __future__ import annotations
 import unicodedata
 from pathlib import Path
 
-from session_manager.claude_conversation import encode_cwd, get_active_conversation_id
+from session_manager.claude_conversation import (
+    conversation_exists,
+    encode_cwd,
+    get_active_conversation_id,
+    transcript_path_for,
+)
 
 
 class TestEncodeCwd:
@@ -64,3 +69,18 @@ class TestEncodeCwd:
         conv_dir.mkdir(parents=True)
         (conv_dir / "abc-123.jsonl").write_text("{}", encoding="utf-8")
         assert get_active_conversation_id(project) == "abc-123"
+
+
+class TestTranscriptPath:
+    def test_path_and_existence(self, tmp_path: Path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+        project = tmp_path / "proj"
+        project.mkdir()
+        path = transcript_path_for(project, "abc-1")
+        assert path.name == "abc-1.jsonl"
+        assert path.parent.name == encode_cwd(project)
+        assert conversation_exists(project, "abc-1") is False
+        path.parent.mkdir(parents=True)
+        path.write_text("{}", encoding="utf-8")
+        assert conversation_exists(project, "abc-1") is True
