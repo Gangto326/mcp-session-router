@@ -23,6 +23,7 @@ from session_manager.models.session import (
 from session_manager.routing import decision_log
 from session_manager.server import (
     AppContext,
+    _active_conversation_id,
     check_session,
     get_routing_status,
     init_project,
@@ -879,3 +880,48 @@ class TestGetRoutingStatus:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"routing_mode": "off"}), encoding="utf-8")
         assert get_routing_status(ctx=_make_ctx(app))["mode"] == "off"
+
+
+# ------------------------------------------------------- active conversation (F18)
+class TestActiveConversationSource:
+    """F18: wrapper-reported id first, mtime heuristic only as fallback.
+
+    F18: 래퍼가 알려 준 id 먼저, mtime 휴리스틱은 폴백으로만.
+    """
+
+    def test_reported_id_wins_without_guessing(
+        self, app: AppContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+        monkeypatch.setattr(
+            server_module, "get_active_conversation_id",
+            lambda p: calls.append("mtime") or "guessed",
+        )
+        app.state.set_active_conversation_id("c1")
+        assert _active_conversation_id(app) == "c1"
+        assert calls == []
+
+    def test_unknown_falls_back_to_heuristic(
+        self, app: AppContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(server_module, "get_active_conversation_id", lambda p: "guessed")
+        assert _active_conversation_id(app) == "guessed"
+
+    def test_register_links_reported_conversation(
+        self, app: AppContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The bug that started F18: a fresh project whose transcript dir the
+        # heuristic cannot find must still link the conversation.
+        # F18 의 발단 — 휴리스틱이 transcript 디렉토리를 못 찾는 프로젝트도
+        # 대화를 연결해야 한다.
+        monkeypatch.setattr(server_module, "get_active_conversation_id", lambda p: None)
+        app.state.set_active_conversation_id("c-real")
+        session_register(name="backend", title="B", ctx=_make_ctx(app))
+        stored = app.session_store.load_session_by_name("backend")
+        assert stored is not None
+        assert stored.claude_conversation_ids == ["c-real"]
+
+    def test_check_session_exposes_reported_id(self, app: AppContext) -> None:
+        app.state.set_active_conversation_id("c1")
+        result = check_session(_make_ctx(app))
+        assert result["active_conversation_id"] == "c1"

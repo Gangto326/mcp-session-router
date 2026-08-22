@@ -323,7 +323,7 @@ class TestResumeViaHandshake:
 
         mock_client_instance = MagicMock()
         mock_client_instance.recv_loop = AsyncMock()
-        mock_client_instance.request_handshake.return_value = "backend"
+        mock_client_instance.request_handshake.return_value = ("backend", None)
 
         mock_server = MagicMock()
 
@@ -371,7 +371,7 @@ class TestContinueResolvesLatest:
 
         mock_client_instance = MagicMock()
         mock_client_instance.recv_loop = AsyncMock()
-        mock_client_instance.request_handshake.return_value = None
+        mock_client_instance.request_handshake.return_value = (None, None)
 
         mock_server = MagicMock()
 
@@ -405,7 +405,7 @@ class TestFirstRunAutoRegistersDefault:
         """
         mock_client_instance = MagicMock()
         mock_client_instance.recv_loop = AsyncMock()
-        mock_client_instance.request_handshake.return_value = None
+        mock_client_instance.request_handshake.return_value = (None, None)
 
         mock_server = MagicMock()
 
@@ -426,6 +426,111 @@ class TestFirstRunAutoRegistersDefault:
                 assert stored is not None
                 assert stored.title == "Default session"
                 assert stored.status == SessionStatus.ACTIVE
+
+    async def test_default_session_links_wrapper_named_conversation(
+        self, tmp_path: Path
+    ) -> None:
+        """The wrapper names the child's conversation (``--session-id``)
+        and reports it in the handshake; the default session must link it
+        even though no transcript exists yet (F18, e2e 2026-08-21).
+
+        래퍼가 자식의 대화 이름을 정해 (``--session-id``) 핸드셰이크로
+        알려 준다 — transcript 가 아직 없어도 기본 세션은 그 id 를
+        연결해야 한다 (F18, e2e 2026-08-21).
+        """
+        mock_client_instance = MagicMock()
+        mock_client_instance.recv_loop = AsyncMock()
+        mock_client_instance.request_handshake.return_value = (None, "conv-boot")
+
+        with (
+            patch("session_manager.server.os.getcwd", return_value=str(tmp_path)),
+            patch.dict("os.environ", {"SESSION_MANAGER_SOCKET": "/tmp/fake.sock"}),
+            patch(
+                "session_manager.server.WrapperSocketClient",
+                return_value=mock_client_instance,
+            ),
+        ):
+            async with app_lifespan(MagicMock()) as ctx:
+                assert ctx.state.get_active_conversation_id() == "conv-boot"
+                stored = ctx.session_store.load_session_by_name("default")
+                assert stored is not None
+                assert stored.claude_conversation_ids == ["conv-boot"]
+
+    async def test_existing_sessions_resolve_by_previous_conversation(
+        self, tmp_path: Path
+    ) -> None:
+        """A wrapper-named NEW conversation owns no session: boot must still
+        resolve current from the PREVIOUS conversation's owner (mtime lead),
+        not fall to the last_accessed scan.
+
+        래퍼가 새로 이름 붙인 대화는 소유 세션이 없다 — 부팅은 여전히
+        직전 대화의 소유 세션 (mtime 단서) 으로 해석해야 하며
+        last_accessed 스캔으로 떨어지면 안 된다.
+        """
+        store = SessionStore(tmp_path)
+        store.init_project()
+        owner = SessionMetadata.new(name="owner", title="O")
+        owner.claude_conversation_ids = ["conv-prev"]
+        owner.last_accessed = "2026-07-01T00:00:00+00:00"
+        store.save_session(owner)
+        newer = SessionMetadata.new(name="newer", title="N")
+        newer.last_accessed = "2026-07-30T00:00:00+00:00"
+        store.save_session(newer)
+
+        mock_client_instance = MagicMock()
+        mock_client_instance.recv_loop = AsyncMock()
+        mock_client_instance.request_handshake.return_value = (None, "conv-fresh")
+
+        with (
+            patch("session_manager.server.os.getcwd", return_value=str(tmp_path)),
+            patch.dict("os.environ", {"SESSION_MANAGER_SOCKET": "/tmp/fake.sock"}),
+            patch(
+                "session_manager.server.WrapperSocketClient",
+                return_value=mock_client_instance,
+            ),
+            patch(
+                "session_manager.server.get_active_conversation_id",
+                return_value="conv-prev",
+            ),
+        ):
+            async with app_lifespan(MagicMock()) as ctx:
+                assert ctx.state.get_current_session() == "owner"
+
+    async def test_owned_handshake_conversation_wins(self, tmp_path: Path) -> None:
+        """A handshake id some session already owns (wrapper-driven resume)
+        resolves to that owner directly.
+
+        어떤 세션이 이미 소유한 핸드셰이크 id (래퍼 주도 재개) 는 그
+        소유자로 바로 해석된다.
+        """
+        store = SessionStore(tmp_path)
+        store.init_project()
+        a = SessionMetadata.new(name="a", title="A")
+        a.claude_conversation_ids = ["conv-a"]
+        store.save_session(a)
+        b = SessionMetadata.new(name="b", title="B")
+        b.claude_conversation_ids = ["conv-b"]
+        b.last_accessed = "2026-07-30T00:00:00+00:00"
+        store.save_session(b)
+
+        mock_client_instance = MagicMock()
+        mock_client_instance.recv_loop = AsyncMock()
+        mock_client_instance.request_handshake.return_value = (None, "conv-a")
+
+        with (
+            patch("session_manager.server.os.getcwd", return_value=str(tmp_path)),
+            patch.dict("os.environ", {"SESSION_MANAGER_SOCKET": "/tmp/fake.sock"}),
+            patch(
+                "session_manager.server.WrapperSocketClient",
+                return_value=mock_client_instance,
+            ),
+            patch(
+                "session_manager.server.get_active_conversation_id",
+                return_value="conv-b",
+            ),
+        ):
+            async with app_lifespan(MagicMock()) as ctx:
+                assert ctx.state.get_current_session() == "a"
 
 
 # ---------------------------------------------------------------------------

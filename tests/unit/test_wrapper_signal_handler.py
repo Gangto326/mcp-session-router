@@ -85,3 +85,33 @@ class TestSessionCommandSignal:
         await handler({"action": "session_command", "command": "resume", "args": ""})
 
         app.socket_client.send_signal.assert_not_called()
+
+
+class TestActiveConversationSignal:
+    """F18: the wrapper reports the conversation id; the server adopts it.
+
+    F18: 래퍼가 대화 id 를 보고하고 서버는 그대로 채택한다.
+    """
+
+    async def test_adopts_reported_id(self, app: AppContext) -> None:
+        handler = _make_wrapper_signal_handler(app)
+        await handler({"action": "active_conversation", "conversation_id": "c1"})
+        assert app.state.get_active_conversation_id() == "c1"
+
+    async def test_none_clears_it(self, app: AppContext) -> None:
+        app.state.set_active_conversation_id("c1")
+        handler = _make_wrapper_signal_handler(app)
+        await handler({"action": "active_conversation", "conversation_id": None})
+        assert app.state.get_active_conversation_id() is None
+
+    async def test_garbage_is_treated_as_unknown(self, app: AppContext) -> None:
+        app.state.set_active_conversation_id("c1")
+        handler = _make_wrapper_signal_handler(app)
+        await handler({"action": "active_conversation", "conversation_id": 42})
+        assert app.state.get_active_conversation_id() is None
+
+    async def test_does_not_touch_current_session(self, app: AppContext) -> None:
+        app.state.set_current_session("frontend")
+        handler = _make_wrapper_signal_handler(app)
+        await handler({"action": "active_conversation", "conversation_id": "c1"})
+        assert app.state.get_current_session() == "frontend"
