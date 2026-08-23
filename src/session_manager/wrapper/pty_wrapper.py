@@ -1744,7 +1744,11 @@ class SessionManagerWrapper:
         # 보정 라벨 (R3-C4) — /back 은 거부다. auto 활성 후에도 auto
         # 전환의 보정 데이터가 갱신되는 경로가 바로 이것이다.
         decision_log.append_label(
-            Path(self.project_path), wrong, decision_log.LABEL_REJECT, source="back"
+            Path(self.project_path),
+            wrong,
+            decision_log.LABEL_REJECT,
+            source="back",
+            kept_in=origin,
         )
         debug_log.log(
             "BACK",

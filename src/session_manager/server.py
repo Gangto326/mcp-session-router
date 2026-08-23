@@ -648,7 +648,11 @@ def session_switch(
     # 제안과의 짝짓기는 읽기 시점에 일어난다 — 제안 없는 자발 전환은
     # 무연고로 남는다.
     decision_log.append_label(
-        app.project_path, target, decision_log.LABEL_ACCEPT, source="session_switch"
+        app.project_path,
+        target,
+        decision_log.LABEL_ACCEPT,
+        source="session_switch",
+        kept_in=current_name,
     )
 
     # Send SWITCH signal to the wrapper.
@@ -860,6 +864,7 @@ def reject_switch(rejected_target: str, prompt_gist: str, ctx: Context) -> dict:
         rejected_target,
         decision_log.LABEL_REJECT,
         source="reject_switch",
+        kept_in=current_name,
     )
 
     record = PrecedentRecord.new(

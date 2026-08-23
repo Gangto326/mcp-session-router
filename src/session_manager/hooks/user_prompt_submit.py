@@ -147,6 +147,68 @@ def _count_active_sessions(root: Path) -> int:
     return count
 
 
+TARGET_STATUS_MISSING = "missing"
+
+
+def _target_status(root: Path, name: str) -> str:
+    """
+    Status of the session named *name*, for the proposal log (R5-C3).
+
+    Same raw-file reading and same "absent status means active" rule as
+    ``_count_active_sessions``. A name no session file carries yields
+    ``"missing"`` — the judge proposed a session that does not exist,
+    which is itself worth counting. Corrupt files are skipped.
+
+    제안 로그용 (R5-C3) *name* 세션의 상태. ``_count_active_sessions``
+    와 같은 원시 파일 읽기·같은 "status 부재 = active" 규칙. 어떤 세션
+    파일도 갖지 않은 이름은 ``"missing"`` — 판정기가 존재하지 않는
+    세션을 제안한 것이며 그 자체가 집계 대상이다. 손상 파일은 건너뛴다.
+    """
+    sessions_dir = root / _SESSIONS_DIRNAME
+    if not sessions_dir.is_dir():
+        return TARGET_STATUS_MISSING
+    for path in sessions_dir.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("name") == name:
+            status = data.get("status", "active")
+            return status if isinstance(status, str) else "active"
+    return TARGET_STATUS_MISSING
+
+
+def _conv_id_of(payload: dict[str, Any]) -> str | None:
+    value = payload.get(FIELD_SESSION_ID)
+    return value if isinstance(value, str) and value else None
+
+
+def _expire_ignored_proposals(payload: dict[str, Any]) -> None:
+    """
+    A prompt arrived in this conversation: close its open proposals.
+
+    Accepting a proposal moves the user to another conversation and
+    rejecting writes a label before any further prompt, so a new prompt
+    in the SAME conversation means the last proposal here was ignored.
+    Closing it keeps a later unrelated session_switch from consuming it
+    as an "accept" (decision_log module docstring).
+
+    이 대화에 프롬프트가 왔다 — 열린 제안을 닫는다. 수용은 다른 대화로
+    이동이고 거부는 다음 프롬프트 전에 라벨을 남기므로, **같은** 대화의
+    새 프롬프트는 직전 제안이 무시됐다는 뜻이다. 닫아 두어야 나중의
+    무관한 session_switch 가 그것을 "수용" 으로 소비하지 못한다
+    (decision_log 모듈 docstring).
+    """
+    cwd = payload.get(FIELD_CWD)
+    conv_id = _conv_id_of(payload)
+    if not isinstance(cwd, str) or not cwd or conv_id is None:
+        return
+    if decision_log.expire_ignored_proposals(Path(cwd), conv_id):
+        debug_log.log(
+            "DECISION_LOG", "SYSTEM", {"op": "expire"}, conv_id=conv_id
+        )
+
+
 _STALE_CONV_TEMPLATE = (
     "[session-manager 라우터] 현재 대화는 세션 {session}의 롤오버된 이전 "
     "대화다 — 이 세션의 최신 대화가 따로 있다. 사용자의 이번 프롬프트에 "
@@ -586,7 +648,12 @@ def _route(payload: dict[str, Any]) -> None:
                 # auto 제안은 수용 라벨을 만들지 않는다 (사용자에게 묻지
                 # 않음) — 이후 /back 만이 거부 라벨을 남긴다.
                 decision_log.append_proposal(
-                    root.parent, target, float(confidence), mode="auto"
+                    root.parent,
+                    target,
+                    float(confidence),
+                    mode="auto",
+                    target_status=_target_status(root, target),
+                    conv_id=_conv_id_of(payload),
                 )
             debug_log.log(
                 "HOOK_ROUTE",
@@ -612,7 +679,12 @@ def _route(payload: dict[str, Any]) -> None:
         # confirm 제안이 보정의 원천이다 — session_switch 가 수용 라벨,
         # reject_switch·/back 이 거부 라벨을 남긴다 (R3-C4).
         decision_log.append_proposal(
-            root.parent, target, float(confidence), mode=mode
+            root.parent,
+            target,
+            float(confidence),
+            mode=mode,
+            target_status=_target_status(root, target),
+            conv_id=_conv_id_of(payload),
         )
     debug_log.log(
         "HOOK_ROUTE",
@@ -646,6 +718,12 @@ def run(stdin_text: str) -> int:
         return 0
 
     try:
+        # Before anything else: this prompt closes any proposal still
+        # open in this conversation (ignored ≠ rejected, but ignored must
+        # not stay consumable either).
+        # 무엇보다 먼저 — 이 프롬프트는 이 대화에 아직 열린 제안을 닫는다
+        # (무시는 거부가 아니지만 소비 가능한 채로 남아서도 안 된다).
+        _expire_ignored_proposals(payload)
         if _deliver_pending_handoff(payload):
             return 0
         if _deliver_pending_notice(payload):

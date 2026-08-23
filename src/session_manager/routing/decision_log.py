@@ -14,23 +14,58 @@ debug_log 를 쓰지 않는 이유: 그 로그는 ``SESSION_MANAGER_DEBUG=1`` �
 
 Event shapes / 이벤트 형태:
 
-- ``{"type": "proposal", "target", "confidence", "mode", "at"}`` —
-  the hook proposed a SWITCH (confirm context emitted, or auto executed).
+- ``{"type": "proposal", "target", "confidence", "mode", "at",
+  "target_status"?, "conv_id"?}`` — the hook proposed a SWITCH (confirm
+  context emitted, or auto executed). ``target_status`` (R5-C3) is the
+  proposed session's status at proposal time (``active`` / ``archived``
+  / ``missing``) so ``ccode --stats`` can count proposals that pointed
+  at an ended session — the unmeasured premise behind dropping
+  ``/retire``. ``conv_id`` is the Claude conversation the prompt was
+  submitted in — the scope of the expiry rule below.
+- ``{"type": "expire", "conv_id", "at"}`` — a later prompt arrived in
+  ``conv_id`` while a proposal made there was still unlabeled: the user
+  neither accepted nor rejected, they moved on. Every open proposal of
+  that conversation is closed as ignored. (Written by the hook only when
+  such an open proposal exists, so the file does not grow per prompt.)
 - ``{"type": "label", "label": "accept"|"reject", "target", "source",
-  "at"}`` — the user's decision arrived: ``session_switch`` = accept,
-  ``reject_switch`` / ``/back`` = reject.
+  "at", "kept_in"?}`` — the user's decision arrived: ``session_switch``
+  = accept, ``reject_switch`` / ``/back`` = reject. ``kept_in`` (R5-C3)
+  is the session the user was in when deciding, so the precedent gate's
+  (current, target) pair effect can be counted.
+
+Both extra keys are optional: files written before R5-C3 lack them and
+every reader treats a missing key as "not recorded".
+
+두 추가 키는 선택이다 — R5-C3 이전에 쓰인 파일에는 없으며 모든 읽기
+쪽은 키 부재를 "기록 안 됨" 으로 다룬다. ``target_status`` 는 제안 시점
+대상 세션의 상태 (끝난 세션 오제안 집계 — ``/retire`` 제거의 미측정
+전제), ``kept_in`` 은 결정 당시 사용자가 있던 세션 (판례 게이트의
+(현재, 대상) 쌍 효과 집계) 이다.
 
 Pairing (rule: label definition, Plan §4 R3-C4): a label consumes the
-most recent unlabeled proposal with the same target. Proposals the user
-ignored stay unlabeled and are EXCLUDED from calibration pairs — ignored
-is not rejected. Auto switches log a proposal but produce no accept
-label (the user was never asked); only a later ``/back`` labels them.
+most recent OPEN proposal with the same target. Proposals the user
+ignored are EXCLUDED from calibration pairs — ignored is not rejected.
+"Ignored" is made deterministic by the ``expire`` event: without it an
+unlabeled proposal would wait forever and be swallowed as "accepted" by
+an unrelated voluntary ``session_switch`` to the same target days later
+(found in the R5-C3 review). Proposals written before ``conv_id``
+existed carry no conversation and are never expired — legacy lines keep
+the old behaviour rather than being silently dropped. Auto switches log
+a proposal but produce no accept label (the user was never asked); only
+a later ``/back`` labels them — ``/back`` runs from the new conversation,
+so the origin conversation's proposal is still open when it arrives.
 
 쌍 구성 (라벨 정의 — Plan §4 R3-C4): 라벨은 같은 target 의 가장 최근
-미라벨 proposal 을 소비한다. 사용자가 무시한 proposal 은 미라벨로 남아
-보정 쌍에서 제외된다 — 무시는 거부가 아니다. auto 전환은 proposal 만
-기록하고 수용 라벨을 만들지 않는다 (사용자에게 묻지 않았으므로) — 이후
-``/back`` 만이 거부 라벨을 남긴다.
+**열린** proposal 을 소비한다. 사용자가 무시한 proposal 은 보정 쌍에서
+제외된다 — 무시는 거부가 아니다. "무시" 는 ``expire`` 이벤트로 결정적이
+된다: 그것이 없으면 미라벨 proposal 이 영원히 대기하다가 며칠 뒤 같은
+target 으로의 무관한 자발 ``session_switch`` 에 "수용" 으로 삼켜진다
+(R5-C3 재검토에서 발견). ``conv_id`` 도입 전에 쓰인 proposal 은 대화
+정보가 없어 만료되지 않는다 — 옛 줄은 조용히 버려지는 대신 옛 동작을
+유지한다. auto 전환은 proposal 만 기록하고 수용 라벨을 만들지 않는다
+(사용자에게 묻지 않았으므로) — 이후 ``/back`` 만이 거부 라벨을 남기며,
+``/back`` 은 새 대화에서 실행되므로 원 대화의 proposal 은 그때까지 열려
+있다.
 
 Writes are single-line ``O_APPEND`` appends from multiple processes
 (hook, MCP server, wrapper) — atomic for lines far below PIPE_BUF.
@@ -80,41 +115,70 @@ def _append(project_path: Path, event: dict[str, Any]) -> None:
 
 
 def append_proposal(
-    project_path: Path, target: str, confidence: float, mode: str
+    project_path: Path,
+    target: str,
+    confidence: float,
+    mode: str,
+    target_status: str | None = None,
+    conv_id: str | None = None,
 ) -> None:
     """Record one SWITCH proposal the router made.
 
-    라우터가 낸 SWITCH 제안 1건을 기록한다.
+    라우터가 낸 SWITCH 제안 1건을 기록한다. *target_status*·*conv_id* 는
+    알 때만 기록한다 (모듈 docstring 참조).
     """
+    event: dict[str, Any] = {
+        "type": "proposal",
+        "target": target,
+        "confidence": confidence,
+        "mode": mode,
+        "at": _utc_now_iso(),
+    }
+    if target_status is not None:
+        event["target_status"] = target_status
+    if conv_id is not None:
+        event["conv_id"] = conv_id
+    _append(project_path, event)
+
+
+def expire_ignored_proposals(project_path: Path, conv_id: str) -> bool:
+    """Close every open proposal of *conv_id* — a new prompt arrived there.
+
+    *conv_id* 의 열린 proposal 을 전부 닫는다 — 그 대화에 새 프롬프트가
+    왔다는 뜻이다. 열린 것이 있을 때만 ``expire`` 줄을 쓰고 True 를
+    돌려준다 (프롬프트마다 파일이 자라지 않도록).
+    """
+    if not _has_open_proposal(load_events(project_path), conv_id):
+        return False
     _append(
         project_path,
-        {
-            "type": "proposal",
-            "target": target,
-            "confidence": confidence,
-            "mode": mode,
-            "at": _utc_now_iso(),
-        },
+        {"type": "expire", "conv_id": conv_id, "at": _utc_now_iso()},
     )
+    return True
 
 
 def append_label(
-    project_path: Path, target: str, label: str, source: str
+    project_path: Path,
+    target: str,
+    label: str,
+    source: str,
+    kept_in: str | None = None,
 ) -> None:
     """Record the user's accept/reject decision for *target*.
 
-    *target* 에 대한 사용자의 수용/거부 결정을 기록한다.
+    *target* 에 대한 사용자의 수용/거부 결정을 기록한다. *kept_in* 은
+    알 때만 기록한다 (모듈 docstring 참조).
     """
-    _append(
-        project_path,
-        {
-            "type": "label",
-            "label": label,
-            "target": target,
-            "source": source,
-            "at": _utc_now_iso(),
-        },
-    )
+    event: dict[str, Any] = {
+        "type": "label",
+        "label": label,
+        "target": target,
+        "source": source,
+        "at": _utc_now_iso(),
+    }
+    if kept_in is not None:
+        event["kept_in"] = kept_in
+    _append(project_path, event)
 
 
 def load_events(project_path: Path) -> list[dict[str, Any]]:
@@ -149,31 +213,84 @@ def labeled_pairs(events: list[dict[str, Any]]) -> list[tuple[float, bool]]:
     규칙은 모듈 docstring 참조 — 미라벨 proposal 과 무연고 label 은
     제외된다.
     """
-    # Per-target stacks of unlabeled proposals, most recent last.
-    # target 별 미라벨 proposal 스택 — 최근 것이 뒤.
-    open_proposals: dict[str, list[float]] = {}
+    return _replay(events)[0]
+
+
+def _replay(
+    events: list[dict[str, Any]],
+) -> tuple[list[tuple[float, bool]], _OpenProposals]:
+    """Walk the events once; return (calibration pairs, proposals still open).
+
+    이벤트를 한 번 훑어 (보정 쌍, 아직 열린 proposal) 을 돌려준다 —
+    "열림" 의 뜻이 라벨 소비 규칙과 정확히 같도록 한 곳에서 재생한다.
+    """
     pairs: list[tuple[float, bool]] = []
+    open_proposals = _OpenProposals()
     for event in events:
+        kind = event.get("type")
+        if kind == "expire":
+            conv_id = event.get("conv_id")
+            if isinstance(conv_id, str):
+                open_proposals.expire(conv_id)
+            continue
         target = event.get("target")
         if not isinstance(target, str) or not target:
             continue
-        if event.get("type") == "proposal":
+        if kind == "proposal":
             confidence = event.get("confidence")
             if isinstance(confidence, int | float):
-                open_proposals.setdefault(target, []).append(float(confidence))
-        elif event.get("type") == "label":
+                conv_id = event.get("conv_id")
+                open_proposals.push(
+                    target,
+                    float(confidence),
+                    conv_id if isinstance(conv_id, str) else None,
+                )
+        elif kind == "label":
             label = event.get("label")
             if label not in (LABEL_ACCEPT, LABEL_REJECT):
                 continue
-            stack = open_proposals.get(target)
-            if not stack:
+            confidence = open_proposals.pop(target)
+            if confidence is None:
                 # Orphan label (e.g. a voluntary session_switch with no
-                # preceding proposal) — not calibration evidence.
-                # 무연고 label (제안 없이 자발 호출된 session_switch 등)
-                # — 보정 증거가 아니다.
+                # preceding open proposal) — not calibration evidence.
+                # 무연고 label (열린 제안 없이 자발 호출된 session_switch
+                # 등) — 보정 증거가 아니다.
                 continue
-            pairs.append((stack.pop(), label == LABEL_ACCEPT))
-    return pairs
+            pairs.append((confidence, label == LABEL_ACCEPT))
+    return pairs, open_proposals
+
+
+class _OpenProposals:
+    """Per-target stacks of open proposals, most recent last.
+
+    target 별 열린 proposal 스택 — 최근 것이 뒤. 항목은 (confidence,
+    conv_id); conv_id 가 None 인 옛 줄은 만료 대상이 아니다.
+    """
+
+    def __init__(self) -> None:
+        self._stacks: dict[str, list[tuple[float, str | None]]] = {}
+
+    def push(self, target: str, confidence: float, conv_id: str | None) -> None:
+        self._stacks.setdefault(target, []).append((confidence, conv_id))
+
+    def pop(self, target: str) -> float | None:
+        stack = self._stacks.get(target)
+        if not stack:
+            return None
+        return stack.pop()[0]
+
+    def expire(self, conv_id: str) -> None:
+        for target, stack in self._stacks.items():
+            self._stacks[target] = [(c, cid) for c, cid in stack if cid != conv_id]
+
+    def has_conv(self, conv_id: str) -> bool:
+        return any(
+            cid == conv_id for stack in self._stacks.values() for _, cid in stack
+        )
+
+
+def _has_open_proposal(events: list[dict[str, Any]], conv_id: str) -> bool:
+    return _replay(events)[1].has_conv(conv_id)
 
 
 def acceptance_stats(project_path: Path) -> dict[str, int]:
