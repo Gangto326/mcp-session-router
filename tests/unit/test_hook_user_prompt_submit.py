@@ -577,6 +577,54 @@ class TestRouteExecution:
         assert events[0]["target"] == "backend"
         assert events[0]["confidence"] == 0.9
         assert events[0]["mode"] == "confirm"
+        # No session file named "backend" exists → status "missing" (R5-C3).
+        # "backend" 세션 파일이 없다 → 상태 "missing" (R5-C3).
+        assert events[0]["target_status"] == "missing"
+
+    def test_proposal_records_target_session_status(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # An archived target is recorded as such — the data behind
+        # "how often is an ended session proposed" (R5-C3).
+        # archived 대상은 그대로 기록된다 — "끝난 세션이 얼마나 자주
+        # 제안되나" 의 데이터 (R5-C3).
+        payload = self._routable_payload(project)
+        sessions = project / ".session-manager" / "sessions"
+        sessions.mkdir()
+        (sessions / "s1.json").write_text(
+            json.dumps({"name": "backend", "status": "archived"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p, _g=None: self._reply(
+                action="SWITCH", target="backend", confidence=0.9, evidence="e"
+            ),
+        )
+        hook._route(payload)
+        capsys.readouterr()
+        events = decision_log.load_events(project)
+        assert events[0]["target_status"] == "archived"
+
+    def test_proposal_records_conversation_id(
+        self,
+        project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            hook,
+            "_request_judgment",
+            lambda _p, _g=None: self._reply(
+                action="SWITCH", target="backend", confidence=0.9, evidence="e"
+            ),
+        )
+        hook._route(self._routable_payload(project))
+        capsys.readouterr()
+        assert decision_log.load_events(project)[0]["conv_id"] == "conv-1"
 
     def test_auto_switch_records_auto_proposal(
         self,
@@ -841,3 +889,87 @@ class TestNoticeDelivery:
         assert hook.run(payload) == 0
         capsys.readouterr()
         assert handoff_store.take_notice(project) is not None
+
+
+class TestTargetStatus:
+    """``_target_status`` — the proposal log's target-session status (R5-C3).
+
+    ``_target_status`` — 제안 로그의 대상 세션 상태 (R5-C3).
+    """
+
+    def _write(self, root: Path, filename: str, text: str) -> None:
+        sessions = root / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / filename).write_text(text, encoding="utf-8")
+
+    def test_absent_status_field_is_active(self, tmp_path: Path) -> None:
+        # Pre-status session files count as active (same rule as the
+        # active-session count).
+        # status 도입 전 세션 파일은 active (활성 세션 집계와 같은 규칙).
+        self._write(tmp_path, "a.json", json.dumps({"name": "backend"}))
+        assert hook._target_status(tmp_path, "backend") == "active"
+
+    def test_archived_reported(self, tmp_path: Path) -> None:
+        self._write(
+            tmp_path, "a.json", json.dumps({"name": "backend", "status": "archived"})
+        )
+        assert hook._target_status(tmp_path, "backend") == "archived"
+
+    def test_unknown_name_is_missing(self, tmp_path: Path) -> None:
+        self._write(tmp_path, "a.json", json.dumps({"name": "frontend"}))
+        assert hook._target_status(tmp_path, "backend") == "missing"
+
+    def test_no_sessions_dir_is_missing(self, tmp_path: Path) -> None:
+        assert hook._target_status(tmp_path, "backend") == "missing"
+
+    def test_corrupt_file_skipped(self, tmp_path: Path) -> None:
+        self._write(tmp_path, "bad.json", "{{{")
+        self._write(tmp_path, "a.json", json.dumps({"name": "backend"}))
+        assert hook._target_status(tmp_path, "backend") == "active"
+
+
+class TestExpireIgnoredProposals:
+    """A new prompt in the same conversation closes its open proposal.
+
+    같은 대화의 새 프롬프트는 열린 제안을 닫는다.
+    """
+
+    def test_next_prompt_in_same_conversation_expires(self, project: Path) -> None:
+        (project / ".session-manager").mkdir()
+        decision_log.append_proposal(
+            project, "backend", 0.9, mode="confirm", conv_id="conv-1"
+        )
+        hook._expire_ignored_proposals(json.loads(_payload(project)))
+        assert [e["type"] for e in decision_log.load_events(project)] == [
+            "proposal",
+            "expire",
+        ]
+        assert decision_log.load_events(project)[1]["conv_id"] == "conv-1"
+
+    def test_prompt_in_other_conversation_does_not_expire(
+        self, project: Path
+    ) -> None:
+        (project / ".session-manager").mkdir()
+        decision_log.append_proposal(
+            project, "backend", 0.9, mode="confirm", conv_id="conv-1"
+        )
+        hook._expire_ignored_proposals(
+            json.loads(_payload(project, session_id="conv-2"))
+        )
+        assert [e["type"] for e in decision_log.load_events(project)] == ["proposal"]
+
+    def test_run_expires_before_prefilter(self, project: Path, capsys) -> None:
+        # Even a prompt the prefilter drops (single session → routing
+        # skipped) is a prompt in this conversation.
+        # 프리필터가 버리는 프롬프트 (세션 1개 → 라우팅 생략) 도 이 대화의
+        # 프롬프트다.
+        (project / ".session-manager").mkdir()
+        decision_log.append_proposal(
+            project, "backend", 0.9, mode="confirm", conv_id="conv-1"
+        )
+        assert hook.run(_payload(project)) == 0
+        capsys.readouterr()
+        assert [e["type"] for e in decision_log.load_events(project)] == [
+            "proposal",
+            "expire",
+        ]

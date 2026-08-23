@@ -266,6 +266,7 @@ class TestSessionSwitch:
         assert events[0]["label"] == "accept"
         assert events[0]["target"] == "dst"
         assert events[0]["source"] == "session_switch"
+        assert events[0]["kept_in"] == "src"
 
     def test_accepted_switch_drops_precedents_for_target_only(
         self, app: AppContext
@@ -620,6 +621,7 @@ class TestRejectSwitch:
         assert labels[0]["label"] == "reject"
         assert labels[0]["target"] == "backend"
         assert labels[0]["source"] == "reject_switch"
+        assert labels[0]["kept_in"] == "frontend"
 
     def test_no_current_session_is_noop(self, app: AppContext) -> None:
         result = reject_switch(

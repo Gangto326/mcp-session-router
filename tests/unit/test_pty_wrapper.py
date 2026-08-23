@@ -2904,9 +2904,9 @@ class TestBackCommand:
             for e in decision_log.load_events(Path(wrapper.project_path))
             if e.get("type") == "label"
         ]
-        assert [(la["label"], la["target"], la["source"]) for la in labels] == [
-            ("reject", "backend", "back")
-        ]
+        assert [
+            (la["label"], la["target"], la["source"], la["kept_in"]) for la in labels
+        ] == [("reject", "backend", "back", "frontend")]
         signals = [c.args[0] for c in send.call_args_list]
         assert {"action": "session_command", "command": "back", "args": ""} in signals
 
