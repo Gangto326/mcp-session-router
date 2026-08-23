@@ -6,6 +6,7 @@ ccode 진입점 단위 테스트.
 
 from __future__ import annotations
 
+import json
 import stat
 import sys
 from pathlib import Path
@@ -163,3 +164,53 @@ class TestNoHooksFlag:
         assert args == ["--model", "opus"]
         assert len(calls) == 1
 
+
+
+class TestStatsFlag:
+    """--stats is a ccode-only read-only report: printed, wrapper never built.
+
+    --stats 는 ccode 전용 읽기 전용 보고 — 출력만 하고 래퍼를 만들지
+    않으며 `claude` 에도 흘러가지 않는다.
+    """
+
+    def _run(
+        self,
+        argv: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> tuple[int, str, bool]:
+        built = {"wrapper": False}
+
+        class _FakeWrapper:
+            def __init__(self, **kwargs: object) -> None:
+                built["wrapper"] = True
+
+            def start(self) -> None:
+                return None
+
+        monkeypatch.setattr("session_manager.wrapper.main.SessionManagerWrapper", _FakeWrapper)
+        monkeypatch.setattr("session_manager.wrapper.main.ensure_hook_registered", lambda p: None)
+        monkeypatch.setattr(
+            "session_manager.wrapper.main.ensure_statusline_registered",
+            lambda p: None,
+        )
+        monkeypatch.setenv("SESSION_MANAGER_LOG_DIR", str(tmp_path / "logs"))
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["ccode", *argv])
+        code = main()
+        return code, capsys.readouterr().out, built["wrapper"]
+
+    def test_prints_table_and_exits(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+    ) -> None:
+        code, out, built = self._run(["--stats"], monkeypatch, tmp_path, capsys)
+        assert code == 0
+        assert out.startswith("라우팅 통계")
+        assert built is False
+
+    def test_json_flag(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
+        code, out, built = self._run(["--stats", "--json"], monkeypatch, tmp_path, capsys)
+        assert code == 0
+        assert json.loads(out)["debug"] is None
+        assert built is False
