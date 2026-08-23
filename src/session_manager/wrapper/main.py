@@ -26,6 +26,7 @@ from session_manager.hooks.registration import (
     ensure_hook_registered,
     ensure_statusline_registered,
 )
+from session_manager.routing import stats as routing_stats
 from session_manager.wrapper.pty_wrapper import SessionManagerWrapper
 
 SOCKET_ENV_VAR = "SESSION_MANAGER_SOCKET"
@@ -68,6 +69,22 @@ def _resolve_socket_path(project_path: str) -> str:
 
 
 def main() -> int:
+    # `ccode --stats [--json]` is a read-only report, handled before any
+    # wrapper machinery: no run id, no socket, no hook check, and the
+    # flag must never reach `claude` (unknown option there).
+    # `ccode --stats [--json]` 은 읽기 전용 보고 — 래퍼 기동 전부 전에
+    # 처리한다: run id·소켓·hook 검사 없음. 이 플래그가 `claude` 에
+    # 흘러가면 unknown option 이므로 여기서 반드시 가로챈다.
+    if routing_stats.STATS_FLAG in sys.argv[1:]:
+        print(
+            routing_stats.run_stats(
+                Path(os.getcwd()),
+                debug_log.get_log_dir(),
+                as_json=routing_stats.JSON_FLAG in sys.argv[1:],
+            )
+        )
+        return 0
+
     # Tag this process and seed the run id BEFORE anything else so the
     # MCP server (grandchild) inherits the same id via env and all events
     # land in one NDJSON file.
