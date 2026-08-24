@@ -120,8 +120,8 @@ class TestFieldStore:
     ) -> None:
         store = FieldStore(project_root)
         loaded = store.load_static()
-        assert loaded.project_context == ""
-        assert loaded.conventions == ""
+        assert loaded.project_context.value == ""
+        assert loaded.conventions.value == ""
         assert loaded.project_map == {}
         assert loaded.variables == {}
         assert loaded.updated_at != ""  # StaticField.new() sets this
@@ -129,15 +129,43 @@ class TestFieldStore:
     def test_save_then_load_roundtrip(self, project_root: Path) -> None:
         store = FieldStore(project_root)
         field = StaticField.new()
-        field.project_context = "React + TypeScript 모노레포"
-        field.project_map = {"src/auth/": "인증 모듈"}
-        field.variables = {
-            "환경변수": ["DATABASE_URL", "OPENAI_API_KEY"],
-            "API 키": {"OpenAI": "sk-..."},
-        }
+        field.set_project_context("React + TypeScript 모노레포", "auto")
+        field.merge_project_map({"src/auth/": "인증 모듈"}, "auto")
+        field.merge_variables(
+            {
+                "환경변수": ["DATABASE_URL", "OPENAI_API_KEY"],
+                "API 키": {"OpenAI": "sk-..."},
+            },
+            "user",
+        )
         store.save_static(field)
 
         assert store.load_static() == field
+
+    def test_mutate_static_saves_only_on_true(self, project_root: Path) -> None:
+        # F15-twin lock path: mutator False → no write at all (no file,
+        # no timestamp churn); True → saved.
+        # F15 쌍둥이 잠금 경로 — mutator False 면 아무것도 쓰지 않고
+        # (파일·타임스탬프 공회전 없음), True 면 저장한다.
+        store = FieldStore(project_root)
+        static_path = project_root / ".session-manager" / "static-field.json"
+
+        store.mutate_static(lambda static: False)
+        assert not static_path.exists()
+
+        def apply(static: StaticField) -> bool:
+            static.set_conventions("ruff", "auto")
+            return True
+
+        result = store.mutate_static(apply)
+        assert static_path.exists()
+        assert result.conventions.value == "ruff"
+        assert store.load_static().conventions.value == "ruff"
+
+    def test_mutate_static_creates_lock_sidecar(self, project_root: Path) -> None:
+        store = FieldStore(project_root)
+        store.mutate_static(lambda static: False)
+        assert (project_root / ".session-manager" / "static-field.json.lock").exists()
 
     def test_save_creates_directory_if_missing(self, project_root: Path) -> None:
         store = FieldStore(project_root)

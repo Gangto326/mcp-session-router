@@ -662,9 +662,11 @@ class TestUpdateStatic:
         result = update_static(ctx=_make_ctx(app), conventions="new conv")
 
         assert "updated_at" in result
+        assert result["changed"] == ["conventions"]
         static = app.field_store.load_static()
-        assert static.project_context == "ctx"
-        assert static.conventions == "new conv"
+        assert static.project_context.value == "ctx"
+        assert static.conventions.value == "new conv"
+        assert static.conventions.prev_value == "conv"
 
     def test_update_variables(self, app: AppContext) -> None:
         update_static(
@@ -672,13 +674,98 @@ class TestUpdateStatic:
             variables={"db_host": "localhost", "port": 5432},
         )
         static = app.field_store.load_static()
-        assert static.variables["db_host"] == "localhost"
-        assert static.variables["port"] == 5432
+        assert static.variables["db_host"].value == "localhost"
+        assert static.variables["port"].value == 5432
 
-    def test_no_args_only_touches_timestamp(self, app: AppContext) -> None:
-        update_static(ctx=_make_ctx(app))
+    def test_dict_fields_merge_per_key(self, app: AppContext) -> None:
+        # Sending only the changed key must not wipe the others (R5-C4
+        # merge semantics — AGENT_GUIDE says "only the changed fields").
+        # 바뀐 키만 보내도 나머지 키가 지워지면 안 된다 (R5-C4 병합
+        # 의미론 — AGENT_GUIDE 의 "바뀐 것만 전달" 지시).
+        update_static(
+            ctx=_make_ctx(app),
+            variables={"db_host": "localhost", "port": 5432},
+        )
+        result = update_static(
+            ctx=_make_ctx(app), variables={"db_host": "db.example.com"}
+        )
+        assert result["changed"] == ["variables.db_host"]
         static = app.field_store.load_static()
-        assert static.updated_at != ""
+        assert static.variables["port"].value == 5432
+        # variables: old value scrubbed, only the overwrite fact kept.
+        # variables — 옛 값 파기, 덮어쓴 사실만 보존.
+        assert static.variables["db_host"].prev_value is None
+        assert static.variables["db_host"].prev_updated_at != ""
+
+    def test_source_recorded_and_defaults_to_auto(self, app: AppContext) -> None:
+        update_static(ctx=_make_ctx(app), conventions="conv")
+        update_static(
+            ctx=_make_ctx(app), variables={"A": "1"}, source="user"
+        )
+        static = app.field_store.load_static()
+        assert static.conventions.source == "auto"
+        assert static.variables["A"].source == "user"
+
+    def test_invalid_source_rejected(self, app: AppContext) -> None:
+        result = update_static(
+            ctx=_make_ctx(app), conventions="conv", source="llm"
+        )
+        assert result["updated"] is False
+        assert result["reason"] == "invalid_source"
+        assert app.field_store.load_static().conventions.value == ""
+
+    def test_legacy_flat_file_migrates_on_update(self, app: AppContext) -> None:
+        # A pre-R5-C4 file on disk gains provenance without losing data.
+        # 디스크의 R5-C4 이전 파일이 데이터 유실 없이 출처를 얻는다.
+        path = app.project_path / ".session-manager" / "static-field.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "project_context": "옛 컨텍스트",
+                    "variables": {"db_host": "localhost"},
+                    "updated_at": "2026-04-13T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = update_static(
+            ctx=_make_ctx(app), variables={"db_host": "db.example.com"}
+        )
+        assert result["changed"] == ["variables.db_host"]
+        static = app.field_store.load_static()
+        assert static.project_context.value == "옛 컨텍스트"
+        assert static.project_context.source == "auto"
+        assert static.variables["db_host"].prev_value is None
+
+    def test_no_change_skips_write(self, app: AppContext) -> None:
+        # updated_at must keep meaning "content changed" — a no-op call
+        # writes nothing (R5-C4 verification).
+        # updated_at 은 "내용이 바뀜" 을 계속 의미해야 한다 — no-op
+        # 호출은 아무것도 쓰지 않는다 (R5-C4 검증).
+        update_static(ctx=_make_ctx(app), conventions="conv")
+        before = app.field_store.load_static().updated_at
+        result = update_static(ctx=_make_ctx(app), conventions="conv")
+        assert result["changed"] == []
+        assert app.field_store.load_static().updated_at == before
+        path = app.project_path / ".session-manager" / "static-field.json"
+        assert not (
+            app.project_path / ".session-manager"
+        ).exists() or path.exists()
+
+    def test_unsupported_schema_leaves_file_untouched(
+        self, app: AppContext
+    ) -> None:
+        # A newer schema marker: refuse the update, keep the file bytes.
+        # 더 새로운 schema 마커 — 갱신을 거부하고 파일을 그대로 둔다.
+        path = app.project_path / ".session-manager" / "static-field.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = json.dumps({"schema": 3, "future_field": "x"})
+        path.write_text(original, encoding="utf-8")
+        result = update_static(ctx=_make_ctx(app), conventions="conv")
+        assert result["updated"] is False
+        assert result["reason"] == "unsupported_schema"
+        assert path.read_text(encoding="utf-8") == original
 
 
 # ----------------------------------------- init_project / reinit / update
