@@ -177,6 +177,41 @@ class FieldStore:
     def save_static(self, static_field: StaticField) -> None:
         _atomic_write_text(self._path, _dump_json(static_field.to_dict()))
 
+    def mutate_static(
+        self, mutator: Callable[[StaticField], bool]
+    ) -> StaticField:
+        """
+        Load-modify-save under an exclusive cross-process lock (F15 twin).
+
+        update_static advertises multi-session writers ("어떤 세션에서든
+        갱신"), which is exactly the lost-update scenario the F15 lock on
+        session files exists for — atomic replace only prevents torn
+        files, not one side's changes silently vanishing. Same sidecar
+        flock pattern as ``SessionStore.mutate_session``. The mutator
+        returns True to save; False skips the write entirely (no
+        timestamp churn on no-op calls).
+
+        배타적 프로세스 간 잠금 아래 load-modify-save (F15 쌍둥이).
+
+        update_static 은 다중 세션 기록자를 광고하는데 ("어떤 세션에서든
+        갱신"), 그것이 정확히 세션 파일 F15 잠금이 막는 갱신 유실
+        시나리오다 — atomic replace 는 파일 깨짐만 막고 한쪽 변경의
+        조용한 소실은 못 막는다. ``SessionStore.mutate_session`` 과 같은
+        사이드카 flock 패턴. mutator 가 True 를 반환하면 저장, False 면
+        쓰기를 통째로 생략한다 (no-op 호출의 타임스탬프 공회전 방지).
+        """
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self._path.with_suffix(".json.lock")
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                static = self.load_static()
+                if mutator(static):
+                    self.save_static(static)
+                return static
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
 
 class ConfigStore:
     def __init__(self, project_path: Path) -> None:

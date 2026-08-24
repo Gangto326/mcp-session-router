@@ -40,6 +40,10 @@ from session_manager.hooks.user_prompt_submit import (
 )
 from session_manager.lifecycle import cleanup_expired_sessions, get_cleanup_period_days
 from session_manager.models.config import ROUTING_MODES
+from session_manager.models.fields import (
+    VALID_SOURCES,
+    UnsupportedStaticSchemaError,
+)
 from session_manager.models.session import (
     PrecedentRecord,
     SessionMetadata,
@@ -1027,13 +1031,18 @@ def update_static(
     conventions: str | None = None,
     project_map: dict[str, str] | None = None,
     variables: dict | None = None,
+    source: str = "auto",
 ) -> dict:
     """
     Partially update the project-wide shared static field.
 
     프로젝트 전역 공유 정보(환경, 컨벤션, 변수 등)를 부분 갱신한다.
-    제공된 필드만 덮어쓰고 나머지는 기존 값을 유지한다. 어떤 세션에서든
-    갱신하면 다른 세션에서 최신 값을 읽을 수 있다.
+    project_map·variables 는 전달된 키만 갱신·추가하는 **키별 병합**이다
+    — 나머지 키는 유지된다 (R5-C4). 항목마다 출처(source)·시각·직전 값이
+    보존된다. source 는 "auto"(LLM 자체 판단, 기본) 또는 "user"(사용자의
+    명시 지시). 어떤 세션에서든 갱신하면 다른 세션에서 최신 값을 읽을 수
+    있다. 반환의 changed 는 실제로 값이 바뀐 항목 목록이다 — 자동 갱신
+    확인 한 줄("static 갱신: ...")의 재료.
     """
     app = _get_app_ctx(ctx)
     event_id = _log_tool_call(
@@ -1046,23 +1055,63 @@ def update_static(
             # variables can hold secrets — log only key names + value lengths.
             # variables 는 비밀이 들어올 수 있으므로 key 이름과 값 길이만 기록.
             "variables": debug_log.mask_dict_keys_only(variables),
+            "source": source,
         },
     )
-    static = app.field_store.load_static()
+    if source not in VALID_SOURCES:
+        return _log_tool_return(
+            "update_static",
+            event_id,
+            app,
+            {"updated": False, "reason": "invalid_source", "valid": VALID_SOURCES},
+        )
 
-    if project_context is not None:
-        static.project_context = project_context
-    if conventions is not None:
-        static.conventions = conventions
-    if project_map is not None:
-        static.project_map = project_map
-    if variables is not None:
-        static.variables = variables
+    changed: list[str] = []
 
-    static.touch()
-    app.field_store.save_static(static)
+    def apply(static) -> bool:
+        if project_context is not None:
+            changed.extend(static.set_project_context(project_context, source))
+        if conventions is not None:
+            changed.extend(static.set_conventions(conventions, source))
+        if project_map is not None:
+            changed.extend(static.merge_project_map(project_map, source))
+        if variables is not None:
+            changed.extend(static.merge_variables(variables, source))
+        if not changed:
+            # Nothing changed — skip the write so updated_at keeps
+            # meaning "content changed" (R5-C4 verification).
+            # 바뀐 것 없음 — 쓰기를 생략해 updated_at 이 "내용이 바뀜"
+            # 을 계속 의미하게 한다 (R5-C4 검증).
+            return False
+        static.touch()
+        return True
+
+    try:
+        # Cross-process lock: two sessions updating concurrently must not
+        # lose one side's keys (F15 twin — see FieldStore.mutate_static).
+        # 프로세스 간 잠금 — 두 세션의 동시 갱신이 한쪽 키를 잃으면 안
+        # 된다 (F15 쌍둥이, FieldStore.mutate_static 참조).
+        static = app.field_store.mutate_static(apply)
+    except UnsupportedStaticSchemaError as exc:
+        # A newer/corrupt schema marker: leave the file untouched rather
+        # than destroy its provenance (fields module docstring).
+        # 더 새롭거나 오염된 schema 마커 — 출처를 파괴하는 대신 파일을
+        # 건드리지 않는다 (fields 모듈 docstring).
+        return _log_tool_return(
+            "update_static",
+            event_id,
+            app,
+            {
+                "updated": False,
+                "reason": "unsupported_schema",
+                "schema": repr(exc.schema),
+            },
+        )
     return _log_tool_return(
-        "update_static", event_id, app, {"updated_at": static.updated_at}
+        "update_static",
+        event_id,
+        app,
+        {"updated_at": static.updated_at, "changed": changed},
     )
 
 
