@@ -12,6 +12,10 @@ import pytest
 
 from session_manager.models import StaticField
 from session_manager.models.fields import (
+    REVERT_NO_HISTORY,
+    REVERT_NOT_FOUND,
+    REVERT_OK,
+    REVERT_SECRET,
     SOURCE_AUTO,
     SOURCE_USER,
     StaticEntry,
@@ -224,3 +228,89 @@ class TestStaticFieldTouch:
         time.sleep(0.001)
         field.touch()
         assert field.updated_at > initial
+
+
+class TestDeleteEntry:
+    def test_delete_dict_key_removes_prev_value_too(self) -> None:
+        # Deleting removes the whole entry — prev_value included (R5-C5).
+        # 삭제는 항목 통째 — prev_value 포함 (R5-C5).
+        field = StaticField.new()
+        field.merge_project_map({"src/": "옛"}, SOURCE_AUTO)
+        field.merge_project_map({"src/": "새"}, SOURCE_AUTO)
+        assert field.delete_entry("project_map", "src/") is True
+        assert "src/" not in field.project_map
+        assert "옛" not in json.dumps(field.to_dict())
+
+    def test_delete_text_field_resets_to_empty(self) -> None:
+        field = StaticField.new()
+        field.set_conventions("ruff", SOURCE_USER)
+        assert field.delete_entry("conventions") is True
+        assert field.conventions == StaticEntry()
+
+    def test_delete_missing_returns_false(self) -> None:
+        field = StaticField.new()
+        assert field.delete_entry("variables", "없는키") is False
+        assert field.delete_entry("conventions") is False  # already empty
+        assert field.delete_entry("잘못된필드") is False
+
+
+class TestRevertEntry:
+    def test_revert_swaps_and_allows_re_revert(self) -> None:
+        field = StaticField.new()
+        field.set_conventions("v1", SOURCE_AUTO)
+        field.set_conventions("v2", SOURCE_AUTO)
+        outcome, _ = field.revert_entry("conventions")
+        assert outcome == REVERT_OK
+        assert field.conventions.value == "v1"
+        assert field.conventions.prev_value == "v2"
+        assert field.conventions.source == SOURCE_USER
+        # Revert is itself a change — reverting again goes back.
+        # 되돌림도 변경 — 다시 되돌리면 원복된다.
+        outcome, _ = field.revert_entry("conventions")
+        assert outcome == REVERT_OK
+        assert field.conventions.value == "v2"
+
+    def test_variables_never_revert(self) -> None:
+        # Secret policy: no value history → no revert (module docstring).
+        # 비밀 정책 — 값 이력이 없으므로 되돌리기 불가.
+        field = StaticField.new()
+        field.merge_variables({"TOKEN": "a"}, SOURCE_AUTO)
+        field.merge_variables({"TOKEN": "b"}, SOURCE_AUTO)
+        outcome, prev_at = field.revert_entry("variables", "TOKEN")
+        assert outcome == REVERT_SECRET
+        # The overwrite timestamp is the only history handed back —
+        # the caller shows it and asks the user to re-enter.
+        # 덮어쓴 시각이 돌려주는 유일한 이력 — 호출 쪽이 이를 보여 주고
+        # 재입력을 유도한다.
+        assert prev_at == field.variables["TOKEN"].prev_updated_at != ""
+        assert field.variables["TOKEN"].value == "b"
+
+    def test_no_history_and_not_found(self) -> None:
+        field = StaticField.new()
+        field.set_conventions("v1", SOURCE_AUTO)
+        # First write: prev_updated_at empty → nothing to revert to.
+        # 첫 기록 — prev_updated_at 이 비어 되돌릴 대상이 없다.
+        assert field.revert_entry("conventions") == (REVERT_NO_HISTORY, "")
+        assert field.revert_entry("project_map", "없음") == (REVERT_NOT_FOUND, "")
+
+
+class TestMaskedDict:
+    def test_variables_values_replaced_by_shape_tags(self) -> None:
+        # Masking is a server-side guarantee, not an LLM instruction
+        # (R5-C5 review).
+        # 마스킹은 LLM 지시가 아니라 서버 측 보장이다 (R5-C5 재검토).
+        field = StaticField.new()
+        field.merge_variables(
+            {"TOKEN": "sk-1234567890", "PORT": 5432, "HOSTS": ["a", "b"]},
+            SOURCE_AUTO,
+        )
+        field.set_conventions("ruff", SOURCE_USER)
+        masked = field.to_masked_dict()
+        assert masked["variables"]["TOKEN"]["value"] == "<str, 13자>"
+        assert masked["variables"]["PORT"]["value"] == "<int>"
+        assert masked["variables"]["HOSTS"]["value"] == "<list>"
+        assert "sk-1234567890" not in json.dumps(masked, ensure_ascii=False)
+        # Non-secret fields stay readable / 비밀 아닌 필드는 그대로.
+        assert masked["conventions"]["value"] == "ruff"
+        # Provenance survives masking / 출처는 마스킹 후에도 남는다.
+        assert masked["variables"]["TOKEN"]["source"] == "auto"

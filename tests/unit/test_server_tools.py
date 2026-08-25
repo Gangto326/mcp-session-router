@@ -25,10 +25,13 @@ from session_manager.server import (
     AppContext,
     _active_conversation_id,
     check_session,
+    delete_static_entry,
     get_routing_status,
+    get_static_all,
     init_project,
     reinit_project,
     reject_switch,
+    revert_static_entry,
     session_create,
     session_end,
     session_register,
@@ -1014,3 +1017,85 @@ class TestActiveConversationSource:
         app.state.set_active_conversation_id("c1")
         result = check_session(_make_ctx(app))
         assert result["active_conversation_id"] == "c1"
+
+
+class TestStaticEntryTools:
+    """get_static_all / delete_static_entry / revert_static_entry (R5-C5)."""
+
+    def test_get_static_all_returns_provenance(self, app: AppContext) -> None:
+        update_static(ctx=_make_ctx(app), conventions="ruff", source="user")
+        result = get_static_all(ctx=_make_ctx(app))
+        assert result["ok"] is True
+        entry = result["static"]["conventions"]
+        assert entry["value"] == "ruff"
+        assert entry["source"] == "user"
+
+    def test_get_static_all_masks_variables(self, app: AppContext) -> None:
+        # Secrets never leave the server as plaintext (R5-C5 review).
+        # 비밀은 평문으로 서버를 떠나지 않는다 (R5-C5 재검토).
+        update_static(ctx=_make_ctx(app), variables={"TOKEN": "sk-secret"})
+        result = get_static_all(ctx=_make_ctx(app))
+        assert result["static"]["variables"]["TOKEN"]["value"] == "<str, 9자>"
+        assert "sk-secret" not in json.dumps(result, ensure_ascii=False)
+
+    def test_delete_removes_key(self, app: AppContext) -> None:
+        update_static(ctx=_make_ctx(app), variables={"A": "1", "B": "2"})
+        result = delete_static_entry(field="variables", key="A", ctx=_make_ctx(app))
+        assert result == {"ok": True, "deleted": True}
+        static = app.field_store.load_static()
+        assert "A" not in static.variables
+        assert static.variables["B"].value == "2"
+
+    def test_delete_missing_reports_false(self, app: AppContext) -> None:
+        result = delete_static_entry(
+            field="variables", key="없음", ctx=_make_ctx(app)
+        )
+        assert result == {"ok": True, "deleted": False}
+
+    def test_address_validation(self, app: AppContext) -> None:
+        assert delete_static_entry(field="비밀", ctx=_make_ctx(app))["reason"] == (
+            "invalid_field"
+        )
+        assert delete_static_entry(field="variables", ctx=_make_ctx(app))[
+            "reason"
+        ] == "key_required"
+        assert revert_static_entry(field="variables", ctx=_make_ctx(app))[
+            "reason"
+        ] == "key_required"
+
+    def test_revert_text_field(self, app: AppContext) -> None:
+        update_static(ctx=_make_ctx(app), conventions="v1")
+        update_static(ctx=_make_ctx(app), conventions="v2")
+        result = revert_static_entry(field="conventions", ctx=_make_ctx(app))
+        assert result == {"ok": True, "result": "reverted"}
+        assert app.field_store.load_static().conventions.value == "v1"
+
+    def test_revert_variables_returns_overwrite_time(
+        self, app: AppContext
+    ) -> None:
+        # Secret policy: no revert — the skill shows WHEN it was
+        # overwritten and asks the user to re-enter (R5-C4 decision).
+        # 비밀 정책 — 되돌리기 대신 덮어쓴 시각을 보여주고 재입력 유도.
+        update_static(ctx=_make_ctx(app), variables={"TOKEN": "a"})
+        update_static(ctx=_make_ctx(app), variables={"TOKEN": "b"})
+        result = revert_static_entry(
+            field="variables", key="TOKEN", ctx=_make_ctx(app)
+        )
+        assert result["result"] == "secret_no_history"
+        assert result["prev_updated_at"] != ""
+        assert app.field_store.load_static().variables["TOKEN"].value == "b"
+
+    def test_unsupported_schema_propagates(self, app: AppContext) -> None:
+        path = app.project_path / ".session-manager" / "static-field.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema": 9}), encoding="utf-8")
+        for call in (
+            lambda: get_static_all(ctx=_make_ctx(app)),
+            lambda: delete_static_entry(
+                field="conventions", ctx=_make_ctx(app)
+            ),
+            lambda: revert_static_entry(field="conventions", ctx=_make_ctx(app)),
+        ):
+            result = call()
+            assert result["ok"] is False
+            assert result["reason"] == "unsupported_schema"
