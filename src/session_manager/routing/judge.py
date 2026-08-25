@@ -21,7 +21,6 @@ subprocess.
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,14 +54,6 @@ JUDGE_TIMEOUT_SECS = 6.2
 WARMUP_TIMEOUT_SECS = 8.4
 HOOK_REPLY_TIMEOUT_SECS = JUDGE_TIMEOUT_SECS + 1.0
 
-# Hook-side reply timeout when an auto gate is attached to the request:
-# the judge host may then run one extra refute round in the same warm
-# process (R3-C4), so the wall time is up to two judgment round-trips.
-# Derivation: 2 × JUDGE_TIMEOUT_SECS + the same 1s IPC margin.
-# auto 게이트가 동봉된 요청의 hook 측 회신 타임아웃 — 판정 호스트가 같은
-# 웜 프로세스에서 반박 라운드 1회를 추가로 돌릴 수 있으므로 (R3-C4) 벽시계
-# 시간은 판정 왕복 최대 2회다. 도출식: 2 × JUDGE_TIMEOUT_SECS + IPC 여유 1s.
-AUTO_HOOK_REPLY_TIMEOUT_SECS = 2 * JUDGE_TIMEOUT_SECS + 1.0
 
 # ---- Actions -------------------------------------------------------------
 # 판정 액션.
@@ -109,22 +100,6 @@ JSON으로만 응답:
 # 새로 spawn 된 판정 프로세스의 웜업 프롬프트. 시스템 프롬프트 캐시를
 # 생성해 실제 판정이 warm 으로 돈다 (실측 cold 5.6s vs warm 1.6~3.1s).
 WARMUP_PROMPT = "OK라고만 답하라."
-
-# Second-pass refutation before an auto switch (R3-C4). Wording is
-# verbatim from Plan.md. Runs as one extra turn in the SAME warm judge
-# process right before its retirement: an independent process would be
-# cold (measured 5.2s+ floor) and the retire/re-warm cycle (3.5-4.2s)
-# makes a separate refute request nearly always hit "unavailable".
-# Trade-off accepted and documented: refuting one's own judgment in the
-# same conversation risks self-consistency bias.
-# 자동 전환 직전의 2차 반박 검증 (R3-C4). 문구는 Plan.md 원문. 은퇴 직전의
-# **같은 웜 프로세스**에 1턴 추가로 돌린다 — 독립 프로세스는 cold (실측
-# 바닥 5.2s+) 이고, 은퇴·재웜업 주기 (3.5~4.2s) 탓에 별도 반박 요청은
-# 거의 항상 unavailable 이 된다. 수용한 트레이드오프: 같은 대화 안에서
-# 자기 판정을 반박하면 자기일관성 편향 위험이 있다 (명시 기록).
-REFUTE_PROMPT_TEMPLATE = """다음 라우팅 판정을 반박하라: {verdict}
-반박에 성공하면 refuted=true. {{"refuted": true|false, "reason": "..."}}"""
-
 
 @dataclass
 class Verdict:
@@ -288,100 +263,3 @@ def parse_verdict(text: str) -> Verdict | None:
         evidence=evidence,
         reason=reason,
     )
-
-
-# ---- Second-pass refutation (R3-C4) --------------------------------------
-# 2차 반박 검증 (R3-C4).
-
-
-def build_refute_prompt(verdict: dict[str, Any]) -> str:
-    """Render the refutation prompt for one verdict (evidence included).
-
-    판정 1건 (evidence 포함) 에 대한 반박 프롬프트를 렌더링한다.
-    """
-    return REFUTE_PROMPT_TEMPLATE.format(
-        verdict=json.dumps(verdict, ensure_ascii=False)
-    )
-
-
-def parse_refute(text: str) -> dict[str, Any] | None:
-    """Parse the refutation answer; None if unusable.
-
-    반박 응답을 파싱한다. 사용 불가면 None — 호출자는 반박 실패를
-    refuted 와 동일하게 (confirm 강등) 다룬다.
-    """
-    body = _strip_fences(text)
-    if not body:
-        return None
-    try:
-        data = json.loads(body)
-    except ValueError:
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("refuted"), bool):
-        return None
-    reason = data.get("reason")
-    return {
-        "refuted": data["refuted"],
-        "reason": reason if isinstance(reason, str) else "",
-    }
-
-
-# ---- Calibrated auto threshold (R3-C4) -----------------------------------
-# 보정 기반 자동 전환 임계 (R3-C4).
-
-# Engineering parameter: normal quantile for a ONE-SIDED 95% Wilson lower
-# bound. We only act on the lower bound (is the acceptance rate provably
-# above target?), so the test is one-sided; 95% is the standard
-# confidence level, giving z = Φ⁻¹(0.95) = 1.645.
-# 공학 파라미터 — **단측** 95% Wilson 하한의 정규 분위수. 우리는 하한만
-# 사용하므로 (수용률이 목표치 위임이 입증되는가) 검정은 단측이고, 95% 는
-# 표준 신뢰수준 → z = Φ⁻¹(0.95) = 1.645.
-WILSON_Z_ONE_SIDED_95 = 1.645
-
-
-def wilson_lower_bound(
-    successes: int, n: int, z: float = WILSON_Z_ONE_SIDED_95
-) -> float:
-    """Wilson score interval lower bound for a binomial proportion.
-
-    이항 비율의 Wilson score 구간 하한. n=0 이면 0.0 (증거 없음).
-    """
-    if n <= 0:
-        return 0.0
-    phat = successes / n
-    denom = 1 + z * z / n
-    centre = phat + z * z / (2 * n)
-    margin = z * math.sqrt((phat * (1 - phat) + z * z / (4 * n)) / n)
-    return max(0.0, (centre - margin) / denom)
-
-
-def calibrated_threshold(
-    pairs: list[tuple[float, bool]], tolerance: float
-) -> float | None:
-    """
-    Smallest confidence whose historical acceptance clears the target.
-
-    From the (confidence, accepted) history, return the smallest
-    candidate threshold t such that among past proposals with
-    confidence >= t, the Wilson lower bound of the acceptance rate is
-    >= 1 - tolerance. Returns None when no candidate qualifies — sample
-    insufficiency is decided by the bound itself, not by an arbitrary
-    minimum count (rule 8): with few samples the lower bound simply
-    cannot reach the target.
-
-    과거 수용률이 목표를 넘는 **최소** confidence 를 산출한다.
-
-    (confidence, 수용) 이력에서, confidence >= t 인 과거 제안들의 수용률
-    Wilson 하한이 1 - tolerance 이상인 최소 후보 t 를 반환한다. 만족하는
-    후보가 없으면 None. 표본 충분성은 임의 최소 개수가 아니라 하한
-    자체가 판정한다 (규칙 8) — 표본이 적으면 하한이 목표에 닿지 못한다.
-    """
-    if not pairs:
-        return None
-    target = 1.0 - tolerance
-    qualifying = []
-    for candidate in sorted({confidence for confidence, _ in pairs}):
-        subset = [accepted for confidence, accepted in pairs if confidence >= candidate]
-        if wilson_lower_bound(sum(subset), len(subset)) >= target:
-            qualifying.append(candidate)
-    return min(qualifying) if qualifying else None

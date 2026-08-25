@@ -32,6 +32,7 @@ from session_manager.server import (
     reinit_project,
     reject_switch,
     revert_static_entry,
+    session_back,
     session_create,
     session_end,
     session_register,
@@ -882,10 +883,10 @@ class TestSetRoutingMode:
             json.dumps({"socket_path": "/tmp/x.sock", "routing_mode": "confirm"}),
             encoding="utf-8",
         )
-        result = set_routing_mode(mode="auto", ctx=_make_ctx(app))
-        assert result == {"ok": True, "mode": "auto"}
+        result = set_routing_mode(mode="off", ctx=_make_ctx(app))
+        assert result == {"ok": True, "mode": "off"}
         data = json.loads(path.read_text(encoding="utf-8"))
-        assert data["routing_mode"] == "auto"
+        assert data["routing_mode"] == "off"
         assert data["socket_path"] == "/tmp/x.sock"
 
     def test_creates_config_when_missing(self, app: AppContext) -> None:
@@ -906,14 +907,17 @@ class TestSetRoutingMode:
         result = set_routing_mode(mode="turbo", ctx=_make_ctx(app))
         assert result["ok"] is False
         assert result["error"] == "invalid_mode"
-        assert "auto" in result["valid"]
+        # auto was removed in R6-C3 — no longer a valid mode.
+        # auto 는 R6-C3 에서 제거 — 더는 유효 모드가 아니다.
+        assert "auto" not in result["valid"]
+        assert "confirm" in result["valid"]
         assert not self._config_path(app).exists()
 
 
 class TestGetRoutingStatus:
-    """get_routing_status: mode + acceptance stats + auto availability.
+    """get_routing_status: mode + acceptance stats.
 
-    get_routing_status — 모드 + 수용률 통계 + auto 가능 여부.
+    get_routing_status — 모드 + 수용률 통계 (auto 필드는 R6-C3 제거).
     """
 
     def _seed(self, app: AppContext, count: int, accept: bool = True) -> None:
@@ -938,22 +942,14 @@ class TestGetRoutingStatus:
         }
         assert status["overall_acceptance_rate"] is None
         assert status["recent_acceptance_rate"] is None
-        assert status["auto_available"] is False
-        assert status["auto_threshold"] is None
-        assert status["auto_error_tolerance"] == 0.05
+        assert "auto_available" not in status
 
-    def test_stats_and_auto_available_with_sufficient_data(
-        self, app: AppContext
-    ) -> None:
-        # 60/60 accepts — beyond the one-sided 95% Wilson bar (52).
-        # 60/60 수용 — 단측 95% Wilson 기준선 (52건) 초과.
+    def test_stats_with_data(self, app: AppContext) -> None:
         self._seed(app, 60)
         status = get_routing_status(ctx=_make_ctx(app))
         assert status["acceptance"]["accepted"] == 60
         assert status["overall_acceptance_rate"] == 1.0
         assert status["recent_acceptance_rate"] == 1.0
-        assert status["auto_available"] is True
-        assert status["auto_threshold"] == 0.9
 
     def test_recent_trend_reflects_latest_half(self, app: AppContext) -> None:
         # Old accepts then recent rejects: overall 0.5, recent 0.0 —
@@ -965,7 +961,6 @@ class TestGetRoutingStatus:
         status = get_routing_status(ctx=_make_ctx(app))
         assert status["overall_acceptance_rate"] == 0.5
         assert status["recent_acceptance_rate"] == 0.0
-        assert status["auto_available"] is False
 
     def test_mode_read_from_config(self, app: AppContext) -> None:
         path = app.project_path / ".session-manager" / "config.json"
@@ -1099,3 +1094,15 @@ class TestStaticEntryTools:
             result = call()
             assert result["ok"] is False
             assert result["reason"] == "unsupported_schema"
+
+
+class TestSessionBack:
+    """session_back: natural-language undo → wrapper signal (R6-C2)."""
+
+    def test_sends_back_signal(self, app: AppContext) -> None:
+        result = session_back(ctx=_make_ctx(app))
+        assert result["requested"] is True
+        signals = [
+            c.args[0] for c in app.socket_client.send_signal.call_args_list
+        ]
+        assert {"action": "back"} in signals

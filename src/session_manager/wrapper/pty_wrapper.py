@@ -71,16 +71,12 @@ from session_manager.transcript_excerpt import (
 from session_manager.wrapper import context_monitor, wrapper_state
 from session_manager.wrapper.command_matcher import (
     InterceptedCommand,
-    match_back_command,
-    match_handoff_command,
     match_intercept_command,
-    match_sessions_command,
 )
 from session_manager.wrapper.judge_host import JudgeHost
 from session_manager.wrapper.notice import (
     NoticeKind,
     format_notice,
-    format_session_list,
 )
 from session_manager.wrapper.socket_server import WrapperSocketServer
 from session_manager.wrapper.virtual_screen import VirtualScreen
@@ -1440,23 +1436,19 @@ class SessionManagerWrapper:
             matched = match_intercept_command(prompt_text)
             if matched is not None:
                 self._observe_session_command(matched)
-            elif match_back_command(prompt_text):
-                # Wrapper-native command: never forward — Claude Code has
-                # no /back and the \r would only submit an unknown command.
-                # 래퍼 자체 명령 — forward 금지. Claude Code 에 /back 은
-                # 없으므로 \r 은 unknown command 제출만 만든다.
-                self._handle_back_command()
-                return
-            elif match_handoff_command(prompt_text):
-                # Wrapper-native manual rollover (R4-C4) — same contract.
-                # 래퍼 자체 수동 롤오버 (R4-C4) — 동일 계약.
-                self._handle_handoff_command()
-                return
-            elif match_sessions_command(prompt_text):
-                # Wrapper-native instant listing (R5-C2) — same contract.
-                # 래퍼 자체 즉시 목록 (R5-C2) — 동일 계약.
-                self._handle_sessions_command()
-                return
+            # Wrapper-native slash commands (/back, /handoff, /sessions)
+            # were removed in R6-C1: intercept-and-draw fought the Ink
+            # renderer (measured UI corruption in real use) and popup
+            # selection bypassed the snapshot match anyway
+            # (docs/poc/R3-back.md, CC 2.1.241). Undo is now the
+            # session_back MCP tool; the observation path below stays
+            # (precedent/pointer invalidation — _observe_session_command).
+            # 래퍼 자체 슬래시 명령 (/back·/handoff·/sessions) 은 R6-C1
+            # 에서 제거 — 가로채고 그리는 방식은 Ink 렌더러와 충돌했고
+            # (실사용 UI 깨짐) 팝업 선택은 스냅샷 매칭을 우회했다
+            # (docs/poc/R3-back.md, CC 2.1.241). 되돌리기는 session_back
+            # MCP 도구가 맡고, 관찰 경로 (판례·포인터 무효화 —
+            # _observe_session_command) 는 존치한다.
             elif prompt_text and CLEAR_COMMAND_RE.match(prompt_text.strip()):
                 # /clear wipes the conversation — summarise it while it's
                 # still there.
@@ -1642,50 +1634,6 @@ class SessionManagerWrapper:
         """
         self._notify_user(format_notice(kind, text))
 
-    def _notify_block(self, lines: list[str]) -> None:
-        """Print a multi-line wrapper block (first line carries the prefix).
-
-        여러 줄 래퍼 블록을 찍는다 (첫 줄에만 접두사).
-        """
-        if self._stdout_fd < 0 or not lines:
-            return
-        body = "\r\n".join(lines)
-        try:
-            os.write(self._stdout_fd, f"\r\n[session-manager] {body}\r\n".encode())
-        except OSError:
-            pass
-
-    def _handle_sessions_command(self) -> None:
-        """``/sessions``: list sessions instantly, no LLM round-trip (R5-C2).
-
-        ``/sessions`` — LLM 왕복 없이 세션 목록을 즉시 찍는다 (R5-C2).
-        Rows are clipped to the terminal width when it is known.
-        터미널 폭을 알면 행을 그 폭에 맞춰 자른다.
-        """
-        try:
-            os.write(self.pty_fd, ERASE_INPUT_LINE)
-        except OSError:
-            pass
-        try:
-            sessions = SessionStore(Path(self.project_path)).list_sessions()
-        except Exception as exc:
-            self._notify_user(f"세션 목록을 읽지 못했습니다: {exc}")
-            return
-        width: int | None = None
-        try:
-            width = os.get_terminal_size(self._stdout_fd).columns
-        except (OSError, ValueError):
-            pass
-        self._notify_block(
-            format_session_list(sessions, self._current_session_name, width)
-        )
-        debug_log.log(
-            "SESSIONS_LIST",
-            "USER",
-            {"count": len(sessions)},
-            session=self._current_session_name,
-        )
-
     def _handle_back_command(self) -> None:
         """Undo the most recent wrapper-executed transition.
 
@@ -1699,18 +1647,15 @@ class SessionManagerWrapper:
         undo record is consumed at respawn (completion), so a crash
         beforehand keeps it for retry.
 
-        타이핑된 ``/back`` 은 \\r 을 forward 하지 않으므로 Ctrl+U 로
-        지운다 (실측, docs/poc/R3-back.md). 거부를 기록 (판례 + 보정
-        라벨) 한 뒤 일반 respawn 경로로 역방향 전환한다 — 잘못 이동했던
-        프롬프트는 pending handoff 파일로 이동한다. undo 기록 소비는
-        respawn (완료) 시점이라 그 전 크래시면 재시도 가능하다.
+        R6-C2 부터 소켓 (session_back MCP 도구) 으로 진입한다 — 입력란
+        에 지울 텍스트가 없으므로 Ctrl+U 를 쓰지 않는다. 거부를 기록
+        (판례 + 보정 라벨) 한 뒤 일반 respawn 경로로 역방향 전환한다 —
+        잘못 이동했던 프롬프트는 pending handoff 파일로 이동한다. undo
+        기록 소비는 respawn (완료) 시점이라 그 전 크래시면 재시도
+        가능하다.
         """
-        try:
-            os.write(self.pty_fd, ERASE_INPUT_LINE)
-        except OSError:
-            pass
         if self._pending_respawn is not None:
-            self._notify_user("세션 전환이 진행 중입니다 — /back 은 무시됩니다")
+            self._notify_user("세션 전환이 진행 중입니다 — 되돌리기는 무시됩니다")
             return
         record = self._last_transition or wrapper_state.load_last_transition(
             Path(self.project_path)
@@ -2515,45 +2460,6 @@ class SessionManagerWrapper:
             session=state["session"],
         )
 
-    def _handle_handoff_command(self) -> None:
-        """Manual rollover: /handoff marks the active conversation now.
-
-        수동 롤오버 — /handoff 가 활성 conversation 을 즉시 마킹한다.
-
-        Same flow as the threshold trigger (R4-C1) from the mark onward;
-        the only difference is who decided. Refused with a notice while
-        another rollover step or transition is in flight.
-
-        마킹 이후는 임계 트리거 (R4-C1) 와 동일 흐름 — 다른 점은 결정
-        주체뿐. 다른 롤오버 단계·전환이 진행 중이면 안내 후 거절한다.
-        """
-        try:
-            os.write(self.pty_fd, ERASE_INPUT_LINE)
-        except OSError:
-            pass
-        if (
-            self._rollover_request_state is not None
-            or self._rollover_swap_state is not None
-            or self._rollover_ready is not None
-            or self._pending_respawn is not None
-        ):
-            self._notify_user("롤오버가 이미 진행 중입니다")
-            return
-        conv_id = self._current_conv_id()
-        if conv_id is None or self._current_session_name is None:
-            self._notify_user("롤오버할 활성 대화가 없습니다")
-            return
-        self._rollover_pending_conv_id = conv_id
-        self._rollover_pending_pct = None
-        debug_log.log(
-            "ROLLOVER_PENDING",
-            "WRAPPER",
-            {"trigger": "manual_handoff_command"},
-            conv_id=conv_id,
-            session=self._current_session_name,
-        )
-        self._advance_rollover()
-
     def _enqueue_stale_summaries(self) -> None:
         """Boot-time recovery: queue sessions whose summary refresh was lost.
 
@@ -2753,40 +2659,17 @@ class SessionManagerWrapper:
                 handoff=handoff,
                 user_prompt=user_prompt,
             )
-        elif action == "route_switch":
-            # Auto-routing path (R2): the hook blocked the prompt and
-            # delegated the switch here. The hook doesn't know session
-            # names, so the departing side comes from the wrapper's own
-            # current-session mirror.
-            # 자동 라우팅 경로 (R2): hook 이 프롬프트를 차단하고 전환을
-            # 여기에 위임했다. hook 은 세션 이름을 모르므로, 떠나는 쪽은
-            # 래퍼 자신의 현재 세션 미러에서 채운다.
-            target = message.get("target")
-            if not isinstance(target, str) or not target:
-                return
-            user_prompt_val = message.get("user_prompt", "")
-            user_prompt = user_prompt_val if isinstance(user_prompt_val, str) else ""
-            verdict = message.get("verdict")
-            origin = self._current_session_name
-            handoff = {"from": origin}
-            if isinstance(verdict, dict):
-                reason = verdict.get("reason")
-                if isinstance(reason, str) and reason:
-                    handoff["router_reason"] = reason
-            self._execute_transition(
-                target=target,
-                resume_conv=self._resolve_resume_conv(target),
-                handoff=handoff,
-                user_prompt=user_prompt,
-            )
-            # Status line for the unattended switch (Plan R3-C4 wording)
-            # — the user must learn about it and how to undo it.
-            # 무인 전환의 상태 줄 (Plan R3-C4 원문) — 사용자는 전환 사실과
-            # 되돌리는 방법을 알아야 한다.
-            self._notify(
-                NoticeKind.SWITCH,
-                f"{target} 세션으로 전환됨 (이전: {origin}) — 되돌리려면 /back",
-            )
+        elif action == "back":
+            # Natural-language undo (R6-C2): the session_back MCP tool
+            # asks the wrapper to reverse the latest transition. Same
+            # handler the /back keystroke path used before R6-C1 —
+            # entry point swapped, properties preserved (re-injection,
+            # crash-safe retry, rejection recording).
+            # 자연어 되돌리기 (R6-C2) — session_back MCP 도구가 래퍼에
+            # 직전 전환의 역방향 실행을 요청한다. R6-C1 이전의 /back
+            # 키 경로가 쓰던 처리기 그대로 — 진입점만 교체, 성질
+            # (재주입·크래시 재시도·거부 기록) 은 보존.
+            self._handle_back_command()
         elif action == "turn_end":
             # Stop hook (contract-based turn end): the PRIMARY turn-end
             # signal. Screen edges / context.json observation remain as

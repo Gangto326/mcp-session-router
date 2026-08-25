@@ -208,8 +208,8 @@ class TestSegmentSources:
         assert statusline._load_routing_mode(tmp_path) == "confirm"
 
     def test_routing_mode_from_config(self, tmp_path: Path) -> None:
-        _write_config(tmp_path, routing_mode="auto")
-        assert statusline._load_routing_mode(tmp_path) == "auto"
+        _write_config(tmp_path, routing_mode="off")
+        assert statusline._load_routing_mode(tmp_path) == "off"
 
     def test_routing_mode_corrupt_is_default(self, tmp_path: Path) -> None:
         root = tmp_path / ".session-manager"
@@ -233,12 +233,12 @@ class TestSegmentSources:
 class TestRender:
     def test_all_sources(self, tmp_path: Path) -> None:
         wrapper_state.save_current_session(tmp_path, "backend")
-        _write_config(tmp_path, routing_mode="auto")
+        _write_config(tmp_path, routing_mode="off")
         _write_session(tmp_path, "backend", "active")
         _write_session(tmp_path, "frontend", "active")
         record = statusline._extract_record(_payload())
         assert statusline.render(tmp_path, record) == (
-            "⎇ backend · auto · ctx 4% · 2 sessions"
+            "⎇ backend · off · ctx 4% · 2 sessions"
         )
 
     def test_no_record_falls_back_to_context_file(self, tmp_path: Path) -> None:
@@ -287,3 +287,17 @@ class TestMainDisplay:
         statusline.main()
         assert not (tmp_path / ".session-manager" / "context.json").exists()
         assert capsys.readouterr().out == "⎇ backend · confirm\n"
+
+
+class TestStaleAutoMode:
+    def test_stale_auto_config_displays_confirm(self, tmp_path: Path) -> None:
+        # auto was removed in R6-C3 — the statusline must show what
+        # actually runs, mirroring the hook loader's degrade rule.
+        # auto 는 R6-C3 에서 제거 — statusline 은 실제 동작(confirm)을
+        # 보여야 한다 (hook 로더의 강등 규칙과 동일).
+        root = tmp_path / ".session-manager"
+        root.mkdir()
+        (root / "config.json").write_text(
+            json.dumps({"routing_mode": "auto"}), encoding="utf-8"
+        )
+        assert statusline._load_routing_mode(tmp_path) == "confirm"

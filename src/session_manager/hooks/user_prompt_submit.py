@@ -35,14 +35,11 @@ from typing import Any
 
 from session_manager import debug_log, handoff_store
 from session_manager.models.config import (
-    DEFAULT_AUTO_ERROR_TOLERANCE,
     DEFAULT_ROUTING_MODE,
 )
 from session_manager.routing import decision_log
 from session_manager.routing.judge import (
-    AUTO_HOOK_REPLY_TIMEOUT_SECS,
     HOOK_REPLY_TIMEOUT_SECS,
-    calibrated_threshold,
 )
 from session_manager.storage.file_store import (
     _CONFIG_FILENAME,
@@ -94,25 +91,13 @@ def _load_routing_mode(root: Path) -> str:
     if not isinstance(data, dict):
         return DEFAULT_ROUTING_MODE
     mode = data.get("routing_mode")
-    return mode if isinstance(mode, str) else DEFAULT_ROUTING_MODE
-
-
-def _load_auto_error_tolerance(root: Path) -> float:
-    """Read the ``auto_error_tolerance`` policy parameter defensively.
-
-    정책 파라미터 ``auto_error_tolerance`` 를 방어적으로 읽는다. 파일·키
-    부재나 이상값 (0~1 범위 밖) 은 기본값으로 폴백.
-    """
-    try:
-        data = json.loads((root / _CONFIG_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return DEFAULT_AUTO_ERROR_TOLERANCE
-    if not isinstance(data, dict):
-        return DEFAULT_AUTO_ERROR_TOLERANCE
-    value = data.get("auto_error_tolerance")
-    if isinstance(value, int | float) and 0.0 < value < 1.0:
-        return float(value)
-    return DEFAULT_AUTO_ERROR_TOLERANCE
+    if not isinstance(mode, str):
+        return DEFAULT_ROUTING_MODE
+    if mode == "auto":
+        # Removed in R6-C3 — a stale config value degrades to confirm.
+        # R6-C3 에서 제거 — 낡은 config 값은 confirm 으로 강등한다.
+        return "confirm"
+    return mode
 
 
 def _count_active_sessions(root: Path) -> int:
@@ -420,20 +405,15 @@ def _socket_round_trip(
 
 
 def _request_judgment(
-    payload: dict[str, Any], auto_gate: dict[str, Any] | None = None
+    payload: dict[str, Any]
 ) -> dict[str, Any] | None:
     """
     Ask the wrapper's judge host for a routing verdict.
 
-    The request is thin — prompt assembly happens wrapper-side. With an
-    *auto_gate* attached, the host may run one extra refute round in the
-    same warm process, so the reply timeout is extended accordingly
-    (deterministic — the hook knows beforehand whether a gate is sent).
+    The request is thin — prompt assembly happens wrapper-side.
 
     래퍼 판정 호스트에 라우팅 판정을 요청한다. 요청은 얇다 — 프롬프트
-    조립은 래퍼 측 담당. *auto_gate* 동봉 시 호스트가 같은 웜 프로세스에
-    반박 라운드 1회를 추가로 돌릴 수 있으므로 회신 타임아웃을 그만큼
-    연장한다 (결정적 — 게이트 동봉 여부는 hook 이 사전에 안다).
+    조립은 래퍼 측 담당.
     """
     request = {
         "client": "hook",
@@ -443,35 +423,7 @@ def _request_judgment(
         "transcript_path": payload.get(FIELD_TRANSCRIPT_PATH),
         "cwd": payload.get(FIELD_CWD),
     }
-    timeout = HOOK_REPLY_TIMEOUT_SECS
-    if auto_gate is not None:
-        request["auto_gate"] = auto_gate
-        timeout = AUTO_HOOK_REPLY_TIMEOUT_SECS
-    return _socket_round_trip(request, timeout=timeout)
-
-
-def _calibrated_auto_threshold(root: Path) -> float | None:
-    """
-    Confidence threshold for auto-switching, computed from the routing
-    decision log's (confidence, accept/reject) history (R3-C4).
-
-    LLM confidence is uncalibrated, so no fixed threshold exists (rule
-    8): the threshold is the smallest confidence whose historical
-    acceptance rate clears 1 - auto_error_tolerance with Wilson-bound
-    sample sufficiency. None (insufficient data) degrades auto mode to
-    the confirm path — auto only truly activates once data accumulates.
-
-    자동 전환용 confidence 임계 — 라우팅 결정 로그의 (confidence,
-    수용/거부) 이력에서 산출한다 (R3-C4).
-
-    LLM confidence 는 보정되지 않은 값이므로 고정 임계는 없다 (규칙 8):
-    임계는 과거 수용률의 Wilson 하한이 1 - auto_error_tolerance 를 넘는
-    최소 confidence 다. None (데이터 부족) 이면 auto 모드는 confirm
-    경로로 완화된다 — auto 는 데이터가 쌓여야 실제로 켜진다.
-    """
-    project = root.parent
-    pairs = decision_log.labeled_pairs(decision_log.load_events(project))
-    return calibrated_threshold(pairs, _load_auto_error_tolerance(root))
+    return _socket_round_trip(request, timeout=HOOK_REPLY_TIMEOUT_SECS)
 
 
 # Confirm-path instruction templates. Wording follows Plan.md R2-C4
@@ -526,59 +478,19 @@ def _emit_confirm_context(verdict: dict[str, Any]) -> None:
     )
 
 
-def _execute_auto_switch(
-    payload: dict[str, Any], verdict: dict[str, Any]
-) -> bool:
-    """
-    Auto path: hand the switch to the wrapper, then block the prompt.
-
-    Order matters — the block is only emitted after the wrapper ack'd
-    the route_switch message. Blocking without a wrapper on the other
-    side would swallow the prompt with nobody left to re-inject it.
-    Returns True iff the block was emitted.
-
-    자동 경로: 전환을 래퍼에 위임한 뒤 프롬프트를 차단한다.
-
-    순서가 중요하다 — block 은 래퍼가 route_switch 메시지를 ack 한
-    뒤에만 낸다. 반대편에 래퍼가 없는 채로 차단하면 재주입할 주체 없이
-    프롬프트만 삼켜진다. block 을 냈을 때만 True 를 반환한다.
-    """
-    reply = _socket_round_trip(
-        {
-            "client": "hook",
-            "action": "route_switch",
-            "target": verdict.get("target"),
-            "user_prompt": payload.get(FIELD_PROMPT),
-            "session_id": payload.get(FIELD_SESSION_ID),
-            "verdict": verdict,
-        }
-    )
-    if reply is None or reply.get("type") != "ack":
-        return False
-    reason = (
-        f"⇄ {verdict.get('target')} 세션으로 전환합니다 "
-        f"(라우터 자동 전환 — 근거: {verdict.get('evidence')})"
-    )
-    print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
-    return True
-
-
 def _route(payload: dict[str, Any]) -> None:
     """
     Judgment stage: ask the resident judge, then act on the verdict.
 
     STAY/ASK pass through. SWITCH/NEW go to the confirm path
-    (additionalContext → the LLM asks the user) by default; the auto
-    path (block + wrapper switch + re-injection) engages only in auto
-    mode once a calibrated threshold exists. Every outcome exits through
-    the caller with code 0.
+    (additionalContext → the LLM asks the user). The auto path was
+    removed in R6-C3. Every outcome exits through the caller with code 0.
 
     판정 단계: 상주 판정기에 물은 뒤 판정에 따라 행동한다.
 
-    STAY/ASK 는 통과. SWITCH/NEW 는 기본적으로 confirm 경로
-    (additionalContext → LLM 이 사용자에게 질문)로 가고, 자동 경로
-    (block + 래퍼 전환 + 재주입)는 auto 모드에서 보정 임계가 존재할
-    때만 발동한다. 모든 결과가 호출자에서 exit 0 으로 끝난다.
+    STAY/ASK 는 통과. SWITCH/NEW 는 confirm 경로 (additionalContext →
+    LLM 이 사용자에게 질문) 로 간다. 자동 경로는 R6-C3 에서 제거됐다.
+    모든 결과가 호출자에서 exit 0 으로 끝난다.
     """
     cwd = payload.get(FIELD_CWD)
     root = (
@@ -588,24 +500,11 @@ def _route(payload: dict[str, Any]) -> None:
     )
     mode = _load_routing_mode(root) if root is not None else DEFAULT_ROUTING_MODE
 
-    # The auto gate is decided BEFORE the judgment request: the judge
-    # host runs the refute round inside the same warm process, so it
-    # must learn the threshold with the request (R3-C4).
-    # auto 게이트는 판정 요청 **전에** 결정한다 — 반박 라운드를 같은 웜
-    # 프로세스에서 돌리려면 판정 호스트가 요청과 함께 임계를 알아야
-    # 한다 (R3-C4).
-    auto_gate: dict[str, Any] | None = None
-    threshold: float | None = None
-    if mode == "auto" and root is not None:
-        threshold = _calibrated_auto_threshold(root)
-        if threshold is not None:
-            auto_gate = {"threshold": threshold}
-
-    reply = _request_judgment(payload, auto_gate)
+    reply = _request_judgment(payload)
     debug_log.log(
         "HOOK_ROUTE",
         "SYSTEM",
-        {"reply": reply, "auto_gate": auto_gate},
+        {"reply": reply},
         conv_id=payload.get(FIELD_SESSION_ID),
     )
     if reply is None or not reply.get("ok"):
@@ -625,43 +524,6 @@ def _route(payload: dict[str, Any]) -> None:
     target = verdict.get("target")
     confidence = verdict.get("confidence")
 
-    if auto_gate is not None and action == "SWITCH":
-        # Auto requires all three: confidence clears the calibrated
-        # threshold, the second-pass refutation explicitly failed to
-        # refute, and the wrapper ack'd the switch. Anything less —
-        # including a missing/unparseable refute — demotes to confirm.
-        # auto 는 셋 모두를 요구한다: confidence 가 보정 임계 이상,
-        # 2차 반박이 명시적으로 반박 실패 (refuted=false), 래퍼의 전환
-        # ack. 하나라도 아니면 — 반박 누락·파싱 불가 포함 — confirm 강등.
-        refute = reply.get("refute")
-        refute_passed = isinstance(refute, dict) and refute.get("refuted") is False
-        if (
-            isinstance(confidence, int | float)
-            and threshold is not None
-            and confidence >= threshold
-            and refute_passed
-            and _execute_auto_switch(payload, verdict)
-        ):
-            if root is not None and isinstance(target, str) and target:
-                # Auto proposals get no accept label (the user was not
-                # asked); only a later /back can label them rejected.
-                # auto 제안은 수용 라벨을 만들지 않는다 (사용자에게 묻지
-                # 않음) — 이후 /back 만이 거부 라벨을 남긴다.
-                decision_log.append_proposal(
-                    root.parent,
-                    target,
-                    float(confidence),
-                    mode="auto",
-                    target_status=_target_status(root, target),
-                    conv_id=_conv_id_of(payload),
-                )
-            debug_log.log(
-                "HOOK_ROUTE",
-                "SYSTEM",
-                {"path": "auto_block", "verdict": verdict, "refute": refute},
-                conv_id=payload.get(FIELD_SESSION_ID),
-            )
-            return
     # NEW never auto-switches: creating a session needs a name decision,
     # which stays with the user/LLM in the confirm flow.
     # NEW 는 자동 전환하지 않는다 — 세션 생성은 이름 결정이 필요하고,

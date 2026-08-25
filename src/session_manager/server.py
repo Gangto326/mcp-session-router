@@ -33,11 +33,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from session_manager import debug_log, summarizer
 from session_manager.claude_conversation import get_active_conversation_id
-from session_manager.hooks.user_prompt_submit import (
-    _calibrated_auto_threshold,
-    _load_auto_error_tolerance,
-    _load_routing_mode,
-)
+from session_manager.hooks.user_prompt_submit import _load_routing_mode
 from session_manager.lifecycle import cleanup_expired_sessions, get_cleanup_period_days
 from session_manager.models.config import ROUTING_MODES
 from session_manager.models.fields import (
@@ -588,7 +584,42 @@ _HANDOFF_INSTRUCTIONS = [
     ".session-manager/static-field.json 읽기 — 다른 세션이 환경/서버 정보를 변경했을 수 있음",
     ".session-manager/project-context.md 읽기"
     " — 다른 세션이 프로젝트 구조/의존성을 변경했을 수 있음",
+    # Natural-language undo (R6-C2): the arriving conversation must know
+    # the escape hatch — the user has no /back command any more.
+    # 자연어 되돌리기 (R6-C2) — 도착한 대화가 탈출구를 알아야 한다.
+    # 사용자에게 /back 명령은 더 이상 없다.
+    "사용자가 이 전환이 잘못됐다는 취지의 말을 하면 (예: '잘못 갔어',"
+    " '이전 세션으로 돌려줘') 즉시 session_back 을 호출하라",
 ]
+
+
+@mcp_server.tool(meta=_ALWAYS_LOAD_META)
+def session_back(ctx: Context) -> dict:
+    """
+    Undo the most recent session transition (natural-language /back).
+
+    가장 최근의 세션 전환을 되돌린다 (R6-C2 — 자연어 되돌리기). 사용자가
+    방금 일어난 전환이 잘못됐다는 취지의 말을 하면 (예: "잘못 갔어",
+    "이전 세션으로 돌려줘", "왜 세션이 바뀌었지?") 호출하라. 래퍼가 직전
+    전환 기록으로 원래 세션의 대화로 되돌아가고, 잘못 옮겨졌던 프롬프트가
+    있으면 원 세션에 다시 주입되며, 거부가 기록되어 같은 제안이 반복되지
+    않는다. 직전 전환 기록이 없으면 래퍼가 안내만 출력한다.
+    """
+    app = _get_app_ctx(ctx)
+    event_id = _log_tool_call("session_back", app, {})
+    app.socket_client.send_signal({"action": "back"})
+    return _log_tool_return(
+        "session_back",
+        event_id,
+        app,
+        {
+            "requested": True,
+            "note": (
+                "래퍼가 직전 전환을 되돌립니다. 이 대화는 곧 교체되므로 "
+                "추가 작업 없이 짧게 답하고 턴을 끝내라."
+            ),
+        },
+    )
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
@@ -957,7 +988,7 @@ def get_routing_status(ctx: Context) -> dict:
 
     라우팅 모드와 수용률 통계를 보고한다 (R3-C5). /router 스킬이 사용자
     에게 보여줄 값들이다: 현재 모드, 전체 수용/거부/미라벨 집계, 전체·
-    최근 추세 수용률, 그리고 auto 권장 여부 (보정 임계 산출 가능 여부).
+    최근 추세 수용률, 
     """
     app = _get_app_ctx(ctx)
     event_id = _log_tool_call("get_routing_status", app, {})
@@ -969,7 +1000,6 @@ def get_routing_status(ctx: Context) -> dict:
     # 고정 N 창 상수 없는 최근 추세 (규칙 8) — 라벨 표본의 시간순 **최근
     # 절반**. 데이터와 함께 커지는 비례 창이다.
     recent_pairs = pairs[len(pairs) // 2 :]
-    threshold = _calibrated_auto_threshold(root)
     return _log_tool_return(
         "get_routing_status",
         event_id,
@@ -979,13 +1009,6 @@ def get_routing_status(ctx: Context) -> dict:
             "acceptance": decision_log.acceptance_stats(app.project_path),
             "overall_acceptance_rate": _acceptance_rate(pairs),
             "recent_acceptance_rate": _acceptance_rate(recent_pairs),
-            # auto is "recommended" exactly when the calibration gate can
-            # produce a threshold — i.e. auto would actually engage.
-            # auto 권장 = 보정 게이트가 임계를 산출할 수 있을 때 — 즉
-            # auto 가 실제로 발동 가능한 상태일 때다.
-            "auto_available": threshold is not None,
-            "auto_threshold": threshold,
-            "auto_error_tolerance": _load_auto_error_tolerance(root),
         },
     )
 
@@ -993,9 +1016,9 @@ def get_routing_status(ctx: Context) -> dict:
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
 def set_routing_mode(mode: str, ctx: Context) -> dict:
     """
-    Switch the routing mode (auto / confirm / off) in config.json.
+    Switch the routing mode (confirm / off) in config.json.
 
-    config.json 의 라우팅 모드를 변경한다 (auto / confirm / off). hook 이
+    config.json 의 라우팅 모드를 변경한다 (confirm / off). hook 이
     매 실행 시 config 를 읽으므로 즉시 반영된다. /router 스킬이 사용자
     선택에 따라 호출한다.
     """

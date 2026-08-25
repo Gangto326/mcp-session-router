@@ -196,7 +196,15 @@ def _load_routing_mode(project_path: Path) -> str:
     if not isinstance(data, dict):
         return DEFAULT_ROUTING_MODE
     mode = data.get("routing_mode")
-    return mode if isinstance(mode, str) and mode else DEFAULT_ROUTING_MODE
+    if not isinstance(mode, str) or not mode:
+        return DEFAULT_ROUTING_MODE
+    if mode == "auto":
+        # Removed in R6-C3 — display what actually runs, not the stale
+        # config value (same degrade rule as the hook's loader).
+        # R6-C3 에서 제거 — 낡은 config 값이 아니라 실제 동작을 표시한다
+        # (hook 로더와 같은 강등 규칙).
+        return "confirm"
+    return mode
 
 
 def _count_active_sessions(project_path: Path) -> int | None:

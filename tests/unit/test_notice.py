@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from session_manager.models import SessionMetadata, SessionStatus
+from session_manager.models import SessionMetadata
 from session_manager.wrapper import notice
 from session_manager.wrapper.notice import NoticeKind
 
@@ -52,36 +52,3 @@ def _session(name: str, summary: str | None, accessed: str) -> SessionMetadata:
     s.summary = summary
     s.last_accessed = accessed
     return s
-
-
-class TestFormatSessionList:
-    def test_empty(self) -> None:
-        assert notice.format_session_list([], None) == ["세션이 없습니다"]
-
-    def test_layout_current_order_and_ended(self) -> None:
-        a = _session("backend", "로그인 API 조사. 그 다음.", "2026-08-20T00:00:00+00:00")
-        b = _session("frontend", None, "2026-08-21T00:00:00+00:00")
-        c = _session("old", "구 결제 모듈 작업.", "2026-08-10T12:00:00+00:00")
-        c.status = SessionStatus.ARCHIVED
-        lines = notice.format_session_list([a, b, c], current="backend")
-        assert lines[0] == "세션 2개 (현재: backend), 끝남 1개"
-        # Most recently accessed active first; current marked ●; ended last.
-        # 최근 접근 활성이 먼저, 현재는 ●, 끝남은 맨 뒤.
-        assert lines[1] == "    frontend"
-        assert lines[2] == "  ● backend   — 로그인 API 조사."
-        assert lines[3] == "  ○ old       — 끝남 2026-08-10 · 구 결제 모듈 작업."
-
-    def test_header_without_current(self) -> None:
-        a = _session("a", None, "2026-08-20T00:00:00+00:00")
-        assert notice.format_session_list([a], current=None)[0] == "세션 1개"
-
-    def test_width_clips_rows_with_ellipsis(self) -> None:
-        a = _session("backend", "가" * 50, "2026-08-20T00:00:00+00:00")
-        lines = notice.format_session_list([a], current=None, width=20)
-        assert len(lines[1]) == 20
-        assert lines[1].endswith("…")
-
-    def test_no_width_keeps_rows_whole(self) -> None:
-        a = _session("backend", "가" * 50, "2026-08-20T00:00:00+00:00")
-        lines = notice.format_session_list([a], current=None, width=None)
-        assert lines[1].endswith("가" * 50)

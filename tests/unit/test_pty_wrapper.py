@@ -2486,58 +2486,6 @@ class TestPollRolloverFinalize:
         assert wrapper._rollover_swap_state is None
 
 
-class TestHandleHandoffCommand:
-    """R4-C4: manual /handoff.
-
-    R4-C4: 수동 /handoff.
-    """
-
-    def test_marks_and_advances(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from session_manager.wrapper import pty_wrapper as pw
-
-        wrapper.pty_fd = -1  # ERASE write fails silently / ERASE 쓰기는 조용히 실패
-        wrapper._current_session_name = "backend"
-        monkeypatch.setattr(
-            pw, "get_active_conversation_id", lambda _p: "conv-1"
-        )
-        advanced: list[None] = []
-        monkeypatch.setattr(
-            wrapper, "_advance_rollover", lambda: advanced.append(None)
-        )
-        notes: list[str] = []
-        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
-        wrapper._handle_handoff_command()
-        assert wrapper._rollover_pending_conv_id == "conv-1"
-        assert advanced == [None]
-        assert notes == []
-
-    def test_refused_while_in_flight(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        wrapper.pty_fd = -1
-        wrapper._rollover_request_state = {"phase": "writing"}
-        notes: list[str] = []
-        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
-        wrapper._handle_handoff_command()
-        assert any("이미 진행" in n for n in notes)
-        assert wrapper._rollover_pending_conv_id is None
-
-    def test_refused_without_active_conversation(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from session_manager.wrapper import pty_wrapper as pw
-
-        wrapper.pty_fd = -1
-        wrapper._current_session_name = "backend"
-        monkeypatch.setattr(pw, "get_active_conversation_id", lambda _p: None)
-        notes: list[str] = []
-        monkeypatch.setattr(wrapper, "_notify_user", notes.append)
-        wrapper._handle_handoff_command()
-        assert any("활성 대화가 없습니다" in n for n in notes)
-
-
 class TestHandleTurnEndSignal:
     """Stop-hook turn-end signal consumption (primary path).
 
@@ -3007,6 +2955,20 @@ class TestMcpSignalRouting:
         assert pending.target == "bar"
         assert pending.resume_conv == "conv-bar"
 
+    def test_back_signal_invokes_back_handler(
+        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # R6-C2: the session_back MCP tool reaches the same handler the
+        # /back keystroke used — entry point swapped, not reimplemented.
+        # R6-C2 — session_back MCP 도구가 /back 키 경로가 쓰던 처리기에
+        # 그대로 닿는다. 진입점 교체이지 재구현이 아니다.
+        called: list[str] = []
+        monkeypatch.setattr(
+            wrapper, "_handle_back_command", lambda: called.append("back")
+        )
+        wrapper._handle_mcp_signal({"action": "back"})
+        assert called == ["back"]
+
     def test_switch_without_conversation_boots_fresh(
         self, wrapper: SessionManagerWrapper
     ) -> None:
@@ -3032,30 +2994,6 @@ class TestMcpSignalRouting:
         assert pending is not None
         assert pending.target == "fresh"
         assert pending.resume_conv is None
-
-    def test_route_switch_notifies_with_back_hint(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        notices: list[str] = []
-        monkeypatch.setattr(wrapper, "_notify_user", notices.append)
-        wrapper._current_session_name = "frontend"
-        wrapper._handle_mcp_signal(
-            {
-                "action": "route_switch",
-                "target": "backend",
-                "user_prompt": "로그인 API 500",
-                "verdict": {"reason": "인증 소관"},
-            }
-        )
-        pending = wrapper._pending_respawn
-        assert pending is not None
-        assert pending.target == "backend"
-        stored = handoff_store.take_pending(Path(wrapper.project_path))
-        assert stored["handoff"]["from"] == "frontend"
-        assert stored["handoff"]["router_reason"] == "인증 소관"
-        assert notices == [
-            "⇄ backend 세션으로 전환됨 (이전: frontend) — 되돌리려면 /back"
-        ]
 
     def test_invalid_message_ignored(self, wrapper: SessionManagerWrapper) -> None:
         wrapper._handle_mcp_signal("not a dict")  # type: ignore[arg-type]
@@ -3251,62 +3189,6 @@ class TestNoticeGrammar:
         notes = self._notes(wrapper, monkeypatch)
         wrapper._handle_back_command()
         assert notes == ["되돌릴 전환이 없습니다"]
-
-
-class TestHandleSessionsCommand:
-    """R5-C2: /sessions prints the listing instantly via the block writer.
-
-    R5-C2: /sessions 가 블록 출력으로 목록을 즉시 찍는다.
-    """
-
-    def test_lists_with_current_marker(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        store = SessionStore(Path(wrapper.project_path))
-        a = SessionMetadata.new(name="backend", title="t")
-        a.summary = "로그인 조사. 계속."
-        store.save_session(a)
-        store.save_session(SessionMetadata.new(name="frontend", title="t"))
-        wrapper.pty_fd = -1
-        wrapper._current_session_name = "backend"
-        blocks: list[list[str]] = []
-        monkeypatch.setattr(wrapper, "_notify_block", blocks.append)
-        wrapper._handle_sessions_command()
-        assert len(blocks) == 1
-        lines = blocks[0]
-        assert lines[0] == "세션 2개 (현재: backend)"
-        assert any(line.startswith("  ● backend") and "로그인 조사." in line for line in lines)
-        assert any(line.startswith("    frontend") for line in lines)
-
-    def test_no_sessions(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        wrapper.pty_fd = -1
-        blocks: list[list[str]] = []
-        monkeypatch.setattr(wrapper, "_notify_block", blocks.append)
-        wrapper._handle_sessions_command()
-        assert blocks == [["세션이 없습니다"]]
-
-    def test_submit_dispatches_and_does_not_forward(
-        self, wrapper: SessionManagerWrapper, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # The \r for /sessions must never reach Claude Code.
-        # /sessions 의 \r 은 Claude Code 에 닿으면 안 된다.
-        wrapper.virtual_screen.feed("❯ /sessions".encode())
-        called: list[str] = []
-        monkeypatch.setattr(
-            wrapper, "_handle_sessions_command", lambda: called.append("x")
-        )
-        writes: list[bytes] = []
-        monkeypatch.setattr("os.read", lambda fd, n: b"\r")
-        monkeypatch.setattr(
-            "os.write", lambda fd, data: writes.append(data) or len(data)
-        )
-        wrapper._stdin_fd = 0
-        wrapper.pty_fd = 1
-        wrapper._handle_stdin_readable()
-        assert called == ["x"]
-        assert b"\r" not in writes
 
 
 class TestConversationIdOwnership:

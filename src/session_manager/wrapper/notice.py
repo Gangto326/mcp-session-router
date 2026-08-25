@@ -1,6 +1,7 @@
-"""Router notice grammar and the ``/sessions`` listing (R5-C2).
+"""Router notice grammar (R5-C2).
 
-라우터 알림 문법과 ``/sessions`` 목록 (R5-C2).
+라우터 알림 문법 (R5-C2). (/sessions 목록 렌더러는 R6-C1 에서 제거 —
+직접 그리기가 Ink 렌더러와 충돌.)
 
 Every router intervention the wrapper prints to the terminal goes
 through one vocabulary so the user learns a handful of glyphs instead of
@@ -21,8 +22,6 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-
-from session_manager.models import SessionMetadata, SessionStatus
 
 
 class NoticeKind(StrEnum):
@@ -83,58 +82,3 @@ def _fit(text: str, width: int | None) -> str:
 _MARK_CURRENT = "●"
 _MARK_ENDED = "○"
 _MARK_OTHER = " "
-
-
-def format_session_list(
-    sessions: list[SessionMetadata],
-    current: str | None,
-    width: int | None = None,
-) -> list[str]:
-    """Render the ``/sessions`` listing: header + one row per session.
-
-    ``/sessions`` 목록을 그린다 — 머리줄 + 세션당 한 행.
-
-    Active sessions first (most recently accessed on top), ended
-    (archived) ones after with their last-accessed date; each row shows
-    the first sentence of the summary. ``width`` (terminal columns)
-    clips rows; None leaves them whole.
-
-    활성 세션 먼저 (최근 접근순), 끝난 (archived) 세션은 마지막 접근
-    날짜와 함께 뒤에; 행마다 요약 첫 문장. ``width`` (터미널 칸 수) 로
-    행을 자르고 None 이면 그대로 둔다.
-    """
-    active = sorted(
-        (s for s in sessions if s.status == SessionStatus.ACTIVE),
-        key=lambda s: s.last_accessed,
-        reverse=True,
-    )
-    ended = sorted(
-        (s for s in sessions if s.status != SessionStatus.ACTIVE),
-        key=lambda s: s.last_accessed,
-        reverse=True,
-    )
-    if not active and not ended:
-        return ["세션이 없습니다"]
-
-    where = f" (현재: {current})" if current else ""
-    header = f"세션 {len(active)}개{where}"
-    if ended:
-        header += f", 끝남 {len(ended)}개"
-    lines = [header]
-
-    name_width = max(len(s.name) for s in active + ended)
-    for s in active:
-        mark = _MARK_CURRENT if s.name == current else _MARK_OTHER
-        gist = first_sentence(s.summary)
-        row = f"  {mark} {s.name.ljust(name_width)}"
-        if gist:
-            row += f"  — {gist}"
-        lines.append(_fit(row, width))
-    for s in ended:
-        when = s.last_accessed[:10]
-        gist = first_sentence(s.summary)
-        row = f"  {_MARK_ENDED} {s.name.ljust(name_width)}  — 끝남 {when}".rstrip()
-        if gist:
-            row += f" · {gist}"
-        lines.append(_fit(row, width))
-    return lines
