@@ -73,6 +73,18 @@ SOURCE_AUTO = "auto"
 SOURCE_USER = "user"
 VALID_SOURCES = (SOURCE_AUTO, SOURCE_USER)
 
+# Field names addressable by the /static entry tools (R5-C5).
+# /static 항목 도구 (R5-C5) 가 지칭할 수 있는 필드 이름들.
+TEXT_FIELDS = ("project_context", "conventions")
+DICT_FIELDS = ("project_map", "variables")
+STATIC_FIELDS = TEXT_FIELDS + DICT_FIELDS
+
+# revert_entry outcomes / revert_entry 결과.
+REVERT_OK = "reverted"
+REVERT_NO_HISTORY = "no_history"
+REVERT_SECRET = "secret_no_history"
+REVERT_NOT_FOUND = "not_found"
+
 _SCHEMA_VERSION = 2
 
 
@@ -90,6 +102,16 @@ class UnsupportedStaticSchemaError(ValueError):
 
 def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat()
+
+
+def _shape_tag(value: Any) -> str:
+    """Type-and-size placeholder for a masked secret value.
+
+    마스킹된 비밀값의 형태 태그 — 문자열은 길이까지, 그 외는 타입만.
+    """
+    if isinstance(value, str):
+        return f"<str, {len(value)}자>"
+    return f"<{type(value).__name__}>"
 
 
 @dataclass
@@ -141,6 +163,18 @@ class StaticEntry:
             prev_value=data.get("prev_value"),
             prev_updated_at=data.get("prev_updated_at", ""),
         )
+
+    def revert(self, source: str) -> None:
+        """Swap value and prev_value (caller checked history exists).
+
+        value 와 prev_value 를 교환한다 (이력 존재는 호출자가 확인).
+        되돌림도 하나의 변경이므로 시각·출처를 갱신하고, 직전 상태
+        (되돌리기 전 값) 를 새 prev 로 남겨 재되돌리기가 가능하게 한다.
+        """
+        self.value, self.prev_value = self.prev_value, self.value
+        self.prev_updated_at = self.updated_at
+        self.updated_at = _utc_now_iso()
+        self.source = source
 
     @classmethod
     def migrated(cls, value: Any, updated_at: str) -> StaticEntry:
@@ -250,6 +284,22 @@ class StaticField:
     def touch(self) -> None:
         self.updated_at = _utc_now_iso()
 
+    def to_masked_dict(self) -> dict[str, Any]:
+        """to_dict with every variables value replaced by a shape tag.
+
+        variables 값을 형태 태그 (예: "<str, 12자>") 로 바꾼 to_dict —
+        /static 목록용. 마스킹이 LLM 지시 순응이 아니라 서버 코드의
+        보장이 되도록 여기서 수행한다 (R5-C5 재검토). 값이 필요한
+        경우는 없다 — 수정 흐름도 옛 값을 보여 주지 않는다 (파일 직접
+        열람이 대안).
+        """
+        data = self.to_dict()
+        data["variables"] = {
+            key: {**entry_dict, "value": _shape_tag(entry_dict["value"])}
+            for key, entry_dict in data["variables"].items()
+        }
+        return data
+
     # ---- Mutators (R5-C4) / 변경자 ----
 
     def set_project_context(self, value: str, source: str) -> list[str]:
@@ -267,6 +317,55 @@ class StaticField:
         return self._merge(
             "variables", self.variables, mapping, source, keep_prev=False
         )
+
+    def _entry_at(self, field_name: str, key: str | None) -> StaticEntry | None:
+        """Resolve one addressable entry; None when absent.
+
+        지칭된 항목 1개를 찾는다. 없으면 None.
+        """
+        if field_name in TEXT_FIELDS:
+            return getattr(self, field_name)
+        if field_name in DICT_FIELDS and key is not None:
+            return getattr(self, field_name).get(key)
+        return None
+
+    def delete_entry(self, field_name: str, key: str | None = None) -> bool:
+        """Remove one entry entirely — prev_value included (R5-C5).
+
+        항목 1개를 통째로 제거한다 — prev_value 까지 함께 (R5-C5: 되돌리기
+        근거로 남은 직전 값도 삭제 의사에 포함된다). 문자열 필드는 빈
+        항목으로 리셋. 지워진 것이 있을 때만 True.
+        """
+        if field_name in TEXT_FIELDS:
+            entry: StaticEntry = getattr(self, field_name)
+            if entry == StaticEntry():
+                return False
+            setattr(self, field_name, StaticEntry())
+            return True
+        if field_name in DICT_FIELDS and key is not None:
+            return getattr(self, field_name).pop(key, None) is not None
+        return False
+
+    def revert_entry(
+        self, field_name: str, key: str | None = None
+    ) -> tuple[str, str]:
+        """Swap one entry back to its previous value where history exists.
+
+        항목 1개를 직전 값으로 되돌린다. (결과, prev_updated_at) 을
+        돌려준다 — variables 는 값 이력을 남기지 않으므로 (모듈
+        docstring — 비밀 정책) 항상 REVERT_SECRET 이며, 이때
+        prev_updated_at (덮어쓴 시각) 이 호출 쪽 (/static 스킬) 이
+        사용자에게 보여 줄 유일한 이력이다.
+        """
+        entry = self._entry_at(field_name, key)
+        if entry is None:
+            return REVERT_NOT_FOUND, ""
+        if field_name == "variables":
+            return REVERT_SECRET, entry.prev_updated_at
+        if not entry.prev_updated_at:
+            return REVERT_NO_HISTORY, ""
+        entry.revert(SOURCE_USER)
+        return REVERT_OK, entry.prev_updated_at
 
     @staticmethod
     def _merge(

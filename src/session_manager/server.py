@@ -41,6 +41,9 @@ from session_manager.hooks.user_prompt_submit import (
 from session_manager.lifecycle import cleanup_expired_sessions, get_cleanup_period_days
 from session_manager.models.config import ROUTING_MODES
 from session_manager.models.fields import (
+    DICT_FIELDS,
+    REVERT_SECRET,
+    STATIC_FIELDS,
     VALID_SOURCES,
     UnsupportedStaticSchemaError,
 )
@@ -1113,6 +1116,134 @@ def update_static(
         app,
         {"updated_at": static.updated_at, "changed": changed},
     )
+
+
+@mcp_server.tool()
+def get_static_all(ctx: Context) -> dict:
+    """
+    Return every static-field entry with provenance, for /static (R5-C5).
+
+    /static 스킬용 (R5-C5) — static 필드 전 항목을 출처(source)·시각·
+    직전 값 포함 그대로 반환한다. variables 값의 표시 방식(목록 마스킹)
+    은 스킬 쪽 규칙이다.
+    """
+    app = _get_app_ctx(ctx)
+    event_id = _log_tool_call("get_static_all", app, {})
+    try:
+        static = app.field_store.load_static()
+    except UnsupportedStaticSchemaError as exc:
+        return _log_tool_return(
+            "get_static_all",
+            event_id,
+            app,
+            {"ok": False, "reason": "unsupported_schema", "schema": repr(exc.schema)},
+        )
+    # Server-side masking: variables values never leave as plaintext —
+    # the /static listing cannot leak a secret even if the LLM ignores
+    # its instructions (R5-C5 review).
+    # 서버 측 마스킹 — variables 값은 평문으로 나가지 않는다. LLM 이
+    # 지시를 무시해도 /static 목록으로 비밀이 새지 않는다 (R5-C5 재검토).
+    return _log_tool_return(
+        "get_static_all",
+        event_id,
+        app,
+        {"ok": True, "static": static.to_masked_dict()},
+    )
+
+
+@mcp_server.tool()
+def delete_static_entry(field: str, ctx: Context, key: str | None = None) -> dict:
+    """
+    Delete one static-field entry, prev_value included (R5-C5).
+
+    static 필드 항목 1개를 prev_value 까지 통째로 삭제한다 (R5-C5).
+    field 는 project_context/conventions/project_map/variables 중 하나,
+    dict 필드는 key 필수. /static 스킬이 사용자의 삭제 선택에 따라
+    호출한다.
+    """
+    app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "delete_static_entry", app, {"field": field, "key": key}
+    )
+    error = _validate_entry_address(field, key)
+    if error is not None:
+        return _log_tool_return("delete_static_entry", event_id, app, error)
+    deleted = False
+
+    def apply(static) -> bool:
+        nonlocal deleted
+        deleted = static.delete_entry(field, key)
+        if deleted:
+            static.touch()
+        return deleted
+
+    try:
+        app.field_store.mutate_static(apply)
+    except UnsupportedStaticSchemaError as exc:
+        return _log_tool_return(
+            "delete_static_entry",
+            event_id,
+            app,
+            {"ok": False, "reason": "unsupported_schema", "schema": repr(exc.schema)},
+        )
+    return _log_tool_return(
+        "delete_static_entry", event_id, app, {"ok": True, "deleted": deleted}
+    )
+
+
+@mcp_server.tool()
+def revert_static_entry(field: str, ctx: Context, key: str | None = None) -> dict:
+    """
+    Revert one static-field entry to its previous value (R5-C5).
+
+    static 필드 항목 1개를 직전 값으로 되돌린다 (R5-C5). variables 는 값
+    이력을 남기지 않으므로 (비밀 정책) 되돌릴 수 없다 — 그 경우 결과가
+    secret_no_history 이며 prev_updated_at (덮어쓴 시각) 을 함께 주므로,
+    /static 스킬은 그 시각을 보여 주고 사용자에게 새 값 재입력을 권한다.
+    """
+    app = _get_app_ctx(ctx)
+    event_id = _log_tool_call(
+        "revert_static_entry", app, {"field": field, "key": key}
+    )
+    error = _validate_entry_address(field, key)
+    if error is not None:
+        return _log_tool_return("revert_static_entry", event_id, app, error)
+    outcome = ""
+    prev_updated_at = ""
+
+    def apply(static) -> bool:
+        nonlocal outcome, prev_updated_at
+        outcome, prev_updated_at = static.revert_entry(field, key)
+        if outcome != "reverted":
+            return False
+        static.touch()
+        return True
+
+    try:
+        app.field_store.mutate_static(apply)
+    except UnsupportedStaticSchemaError as exc:
+        return _log_tool_return(
+            "revert_static_entry",
+            event_id,
+            app,
+            {"ok": False, "reason": "unsupported_schema", "schema": repr(exc.schema)},
+        )
+    result: dict[str, Any] = {"ok": True, "result": outcome}
+    if outcome == REVERT_SECRET:
+        result["prev_updated_at"] = prev_updated_at
+    return _log_tool_return("revert_static_entry", event_id, app, result)
+
+
+def _validate_entry_address(field: str, key: str | None) -> dict | None:
+    """Shared address check for the /static entry tools.
+
+    /static 항목 도구 공용 주소 검증 — 통과 시 None, 실패 시 오류 dict.
+    """
+    if field not in STATIC_FIELDS:
+        return {"ok": False, "reason": "invalid_field", "valid": STATIC_FIELDS}
+    if field in DICT_FIELDS and not key:
+        return {"ok": False, "reason": "key_required"}
+    return None
 
 
 @mcp_server.tool(meta=_ALWAYS_LOAD_META)
