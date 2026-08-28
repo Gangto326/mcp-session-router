@@ -2697,6 +2697,113 @@ class TestMcpConfigFlag:
         assert args[-1] == handoff_store.TRIGGER_PROMPT
 
 
+class TestGoalRelay:
+    """R6.5: consecutive switches relay a multi-domain goal hop by hop.
+
+    R6.5 — 연쇄 전환이 다중 도메인 goal 을 홉 단위로 릴레이한다. 홉마다
+    바통 (user_prompt) 이 pending handoff 로 이동하고, respawn 완료가
+    직전 홉의 부기를 마친 뒤 다음 홉이 시작될 수 있어야 한다.
+    """
+
+    def _spawn(self, wrapper: SessionManagerWrapper, monkeypatch) -> list:
+        spawned: list[list[str]] = []
+
+        class FakeChild:
+            pid = 7
+
+            def fileno(self) -> int:
+                return 0
+
+        import pexpect
+
+        monkeypatch.setattr(
+            pexpect, "spawn", lambda cmd, args, **kw: spawned.append(args) or FakeChild()
+        )
+        wrapper._spawn_child()
+        return spawned
+
+    def test_two_hop_chain_keeps_baton_per_hop(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        _seed_resumable_session(
+            wrapper, monkeypatch, tmp_path / "home", name="frontend", conv="conv-f"
+        )
+        _seed_resumable_session(
+            wrapper, monkeypatch, tmp_path / "home", name="infra", conv="conv-i"
+        )
+        wrapper._current_session_name = "backend"
+
+        # Hop 1: backend → frontend, baton = remaining goal.
+        # 홉 1 — backend → frontend, 바통 = 남은 goal.
+        baton1 = "[goal: 전체 검증] 완료: backend. 남은: frontend, infra."
+        wrapper._handle_mcp_signal(
+            {
+                "action": "switch",
+                "target": "frontend",
+                "handoff": {"from": "backend", "message": "backend 몫 완료"},
+                "user_prompt": baton1,
+            }
+        )
+        assert wrapper._pending_respawn is not None
+        assert wrapper._pending_respawn.resume_conv == "conv-f"
+        stored = handoff_store.take_pending(Path(wrapper.project_path))
+        assert stored["user_prompt"] == baton1
+
+        # Respawn completes hop 1 — bookkeeping consumed, chain clear.
+        # respawn 이 홉 1 을 완료 — 부기 소비, 연쇄 준비.
+        self._spawn(wrapper, monkeypatch)
+        assert wrapper._pending_respawn is None
+        assert wrapper._last_transition["to"] == "frontend"
+        wrapper._current_session_name = "frontend"
+
+        # Hop 2: frontend → infra with the shrunk baton.
+        # 홉 2 — frontend → infra, 줄어든 바통.
+        baton2 = "[goal: 전체 검증] 완료: backend, frontend. 남은: infra."
+        wrapper._handle_mcp_signal(
+            {
+                "action": "switch",
+                "target": "infra",
+                "handoff": {"from": "frontend", "message": "frontend 몫 완료"},
+                "user_prompt": baton2,
+            }
+        )
+        assert wrapper._pending_respawn.resume_conv == "conv-i"
+        stored = handoff_store.take_pending(Path(wrapper.project_path))
+        assert stored["user_prompt"] == baton2
+        assert stored["handoff"]["from"] == "frontend"
+        self._spawn(wrapper, monkeypatch)
+        assert wrapper._last_transition["to"] == "infra"
+
+    def test_respawn_preserves_permission_mode_flag(
+        self,
+        wrapper: SessionManagerWrapper,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # Flag-based auto-accept must survive hops — an autonomous relay
+        # dies mid-goal if the mode resets on respawn (R6.5).
+        # 플래그 기반 auto-accept 는 홉을 넘어 살아야 한다 — respawn 에서
+        # 모드가 풀리면 자율 릴레이가 goal 중간에 죽는다 (R6.5).
+        wrapper.claude_args = ["--permission-mode=acceptEdits", "--model", "opus"]
+        _seed_resumable_session(
+            wrapper, monkeypatch, tmp_path / "home", name="frontend", conv="conv-f"
+        )
+        wrapper._handle_mcp_signal(
+            {
+                "action": "switch",
+                "target": "frontend",
+                "handoff": {"from": "backend"},
+                "user_prompt": "바통",
+            }
+        )
+        args = wrapper._build_child_args()
+        assert "--permission-mode=acceptEdits" in args
+        assert "--resume=conv-f" in args
+
+
 class TestStripResumeArgs:
     def test_strips_all_resume_variants(self) -> None:
         args = [
